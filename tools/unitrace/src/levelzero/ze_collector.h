@@ -9,7 +9,11 @@
 
 #include <chrono>
 #include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <thread>
 #include <cstdlib>
+#include <thread>
 #include <ctime>
 #include <iomanip>
 #include <iostream>
@@ -21,6 +25,7 @@
 #include <string>
 #include <vector>
 #include <cmath>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 
@@ -772,6 +777,7 @@ struct ZeCommand {
   ze_event_handle_t timestamp_event_;
   ze_event_handle_t in_order_counter_event_;
   ze_device_handle_t device_;
+  ze_context_handle_t context_;  // T6'/E6: owning context (graph replay clones carry it for the batched timestamp read)
   uint64_t host_time_origin_;   // in ns
   uint64_t device_timer_frequency_;
   uint64_t device_timer_mask_;
@@ -797,9 +803,56 @@ struct ZeCommand {
   std::vector<int> *index_timestamps_on_commands_completion_;  // indices to timestamps_on_commands_completion_
   std::vector<int> *index_timestamps_on_event_reset_;  // indices to timestamps_on_event_reset_
   uint64_t signal_gen_;  // signal generation of event_ expected by this command (TSLOG2)
+  // E6-v4b: kernel-timestamp packet read at the staging drain, whose emit is
+  // deferred to a later sweep (see BatchQktArmDeferredEmit). Non-null means
+  // the packet is already safely buffered and this command must not be
+  // re-collected, re-queried or reset until its emit ran.
+  const ze_kernel_timestamp_result_t *deferred_ts_;
   bool implicit_scaling_;
   bool immediate_;
   bool graph_command_;  // true if this command is part of a graph execution (event is owned by graph)
+};
+
+// T6' (plan E6): per-replay batched kernel-timestamp read for graph replay
+// clones (UNITRACE_GRAPH_BATCH_QKT=1). One graph replay shares ONE completion
+// event across all of its clones, so once that event is signaled the packets of
+// every clone can be read with a single device-side batch query instead of one
+// ioctl per clone. The sweep collects the ready clones in list order, reads all
+// packets in one shot, and the loop then consumes them in the same order via a
+// cursor match (no per-command state), so emit order, TSBAD handling and the
+// pending-clone event reset stay byte-for-byte on the legacy pipeline.
+struct ZeBatchQkt {
+  bool ok = false;      // packets read; cmds[i] is consumed from ts[i]
+  size_t cursor = 0;    // next batched command the sweep loop expects to see
+  std::vector<ZeCommand *> cmds;                  // sweep (list) order
+  std::vector<ze_kernel_timestamp_result_t> ts;   // one packet per command
+};
+
+
+// E6-v4c (UNITRACE_GRAPH_QKT_AT_POLL=1): a poll sweep arms the step's batch
+// read EARLY — one zeCommandListAppendQueryKernelTimestamps on a
+// collector-owned immediate list whose numWaitEvents is the SAME event set it
+// reads — and the staging drain finishes it (one HostSynchronize + memcpy +
+// the unchanged v4b arm). Because the read is issued while the replay is
+// still executing and gated device-side on its own events, the packets are
+// captured the moment the last kernel of the step signals, i.e. during
+// device-busy time, and the drain's exposed serial no longer contains the
+// ~6.4ms append+sync (gq4: max_batch_us 7042 inside a 6.42ms graph ioctl).
+// The descriptor is deliberately STATELESS with respect to the clones: arming
+// writes no ZeCommand field, releases no event, consumes no pending counter
+// and touches no packet, so a failed or skipped arm degrades to the exact v4b
+// drain read with nothing to unwind. One slot only (uni_batchqkt_read_pending_
+// guards it); guarded by the submission locks like the drain's own batch.
+struct ZeBatchQktPollRead {
+  bool live = false;                              // append succeeded, sync pending
+  ze_context_handle_t context = nullptr;
+  ze_device_handle_t device = nullptr;
+  ze_command_list_handle_t list = nullptr;        // collector-owned poll imm list
+  void *dst = nullptr;                            // collector-owned packet buffer
+  size_t n = 0;                                   // == cmds.size() == events.size()
+  uint64_t append_us = 0;                         // THIS batch's append host cost (v4b max_batch_us pairing)
+  std::vector<ZeCommand *> cmds;                  // sweep (list) order
+  std::vector<ze_event_handle_t> events;          // read set == wait set
 };
 
 
@@ -883,6 +936,7 @@ struct ZeDeviceSubmissions {
     command->event_ = nullptr;
     command->in_order_counter_event_ = nullptr;
     command->device_ = nullptr;
+    command->context_ = nullptr;
     command->append_time_ = 0;
     command->submit_time_ = 0;
     command->submit_time_device_ = 0;
@@ -898,6 +952,7 @@ struct ZeDeviceSubmissions {
     command->index_timestamps_on_commands_completion_ = nullptr;   // indices to timestamps_on_commands_completion_
     command->index_timestamps_on_event_reset_ = nullptr;
     command->signal_gen_ = 0;
+    command->deferred_ts_ = nullptr;  // E6-v4b: never inherit a recycled emit slot
     command->graph_command_ = false;
 
     return command;
@@ -1426,6 +1481,11 @@ class ZeCollector {
   ZeCollector& operator=(const ZeCollector& that) = delete;
 
   void FlushData() {
+    // Fix B: stop the background completer first — it drains and joins, so the
+    // final drain below runs entirely on the original inline path and no
+    // completer thread outlives the collector teardown.
+    StopDeferredCompleter();
+    PrintBatchQktDiag();  // T6'/E6: batch counters (env UNITRACE_DEBUG_BATCHQKT)
     ProcessAllCommandsSubmitted(nullptr);
 
     global_device_submissions_mutex_.lock();
@@ -1484,6 +1544,11 @@ class ZeCollector {
       }
       metric_contexts_.clear();
     }
+
+    // T6'/E6: release the collector-owned immediate command list and staging
+    // buffer. Runs after the tracer is destroyed and all submissions are
+    // finalized, so these L0 calls cannot re-enter a live sweep.
+    ReleaseBatchQktResources();
   }
 
   uint64_t CalculateTotalKernelTime() const {
@@ -1752,49 +1817,201 @@ class ZeCollector {
 
   void ProcessCommandsSubmitted(std::vector<uint64_t> *kids) {
 
+    if (uni_batchqkt_in_batch_) {
+      return;  // T6'/E6: re-entry from the batch's own L0 calls (no-op, same pattern as Fix B)
+    }
+
     if (local_device_submissions_.IsFinalized()) {
       return;
     }
 
     global_device_submissions_mutex_.lock_shared();
+
+    // T6'/E6 (v3): this drain runs at command list reset/destroy and at graph
+    // release — exactly the places that would strand or free a pending
+    // clone's event — so it is a flush point: the accumulated clones whose
+    // events are already signaled are batch-read here (per-distinct-event
+    // readiness gate), and a failed batch hands the graph clones back to the
+    // legacy path for this sweep only.
+    ZeBatchQkt batch;
+    const bool batchqkt = BatchQktActive();
+    bool batchqkt_legacy = false;
+    if (batchqkt) {
+      // v3: guard the whole flush window (collect + execute + consume) — see
+      // the note on uni_batchqkt_in_batch_ above.
+      uni_batchqkt_in_batch_ = true;
+      // E6-v4b: emit a batch the drain deferred before collecting fresh clones
+      // (teardown must not leave a deferred clone behind its released events).
+      BatchQktConsumeDeferredEmit(kids, /*at_drain=*/false);
+      // E6-v4c: a poll sweep may have armed this step's read. Resolve it here
+      // — the graph's events are released right after this sweep, and a live
+      // device op must never outlive them. The clones are then consumed inline
+      // from the held packets (same tail the readiness-gated batch below
+      // uses). Returns false — nothing armed, or the sync failed and the slot
+      // was released — in which case the exact v3/v4b collect+execute runs.
+      if (!BatchQktCompletePollRead(batch)) {
+        BatchQktCollectReady(local_device_submissions_.commands_submitted_, nullptr, batch);
+        if (!batch.cmds.empty() && !BatchQktExecute(batch)) {
+          batchqkt_legacy = true;
+        }
+      }
+    }
+
     auto it = local_device_submissions_.commands_submitted_.begin();
     while (it != local_device_submissions_.commands_submitted_.end()) {
       ZeCommand *command = *it;
 
       bool processed = false;
-      if ((command->device_global_timestamps_ != nullptr) || (command->timestamps_on_event_reset_!= nullptr)) {
+      bool deferred = false;
+      const ze_kernel_timestamp_result_t *pre_ts = BatchQktTake(batch, command);
+      if (pre_ts != nullptr) {
+        // T6'/E6: batch-read packet; inline consumption on the legacy tail.
+        if (kids != nullptr) {
+          kids->push_back(command->instance_id_);
+        }
+        ProcessCommandSubmittedTail(local_device_submissions_, command, true, pre_ts);
+        processed = true;
+      }
+      else if (BatchQktAccumulate(command, batchqkt && !batchqkt_legacy)) {
+        // T6'/E6 (v3): stays queued for the next flush.
+      }
+      else if ((command->device_global_timestamps_ != nullptr) || (command->timestamps_on_event_reset_!= nullptr)) {
         if (ZE_FUNC(zeEventQueryStatus)(command->timestamp_event_) == ZE_RESULT_SUCCESS) {
+          // Fix B: legacy host-buffer timestamps stay on the inline path.
           ProcessCommandSubmitted(local_device_submissions_, command, kids, false);
           processed = true;
         }
       }
       else {
         if (ZE_FUNC(zeEventQueryStatus)(command->event_) == ZE_RESULT_SUCCESS) {
-          ProcessCommandSubmitted(local_device_submissions_, command, kids, true);
+          deferred = HandleCommandSubmitted(local_device_submissions_, command, kids, true);
           processed = true;
         }
       }
       if (processed) {
         // event_cache_.ReleaseEvent(command->event_) or event_cache_.ResetEvent(command->event_) is already called inside ProcessCommandSubmitted()
-        local_device_submissions_.commands_free_pool_.push_back(command);
+        // Fix B: a deferred command belongs to the completer thread — no recycling.
+        if (!deferred) {
+          local_device_submissions_.commands_free_pool_.push_back(command);
+        }
         it = local_device_submissions_.commands_submitted_.erase(it);
         continue;
       }
       ++it;
+    }
+    if (batchqkt) {
+      uni_batchqkt_in_batch_ = false;  // end of the flush window
     }
     if (options_.metric_query) {
       ProcessCommandMetricQueriesSubmitted();
     }
     global_device_submissions_mutex_.unlock_shared();
     FlushGraphEventResets();  // Graph replay fix: end-of-sweep deferred resets
+    // Fix B barrier: callers of this path destroy/reset command lists right
+    // after the sweep; the completer thread must be done with every queued
+    // command before those handles go away.
+    FlushDeferredTimestamps();
   }
 
   void ProcessAllCommandsSubmitted(std::vector<uint64_t> *kids) {
+    if (uni_batchqkt_in_batch_) {
+      return;  // T6'/E6: re-entry from the batch's own L0 calls (no-op, same pattern as Fix B)
+    }
+
     if (local_device_submissions_.IsFinalized()) {
       return;
     }
 
+    // Fix B barrier (entry): already-queued commands must be fully processed
+    // before this drain runs, so the completion state this sweep observes is
+    // final (graph replay staging relies on that).
+    FlushDeferredTimestamps();
     global_device_submissions_mutex_.lock();
+
+    // T6'/E6 (v3): THE per-replay flush point. Graph replay staging runs this
+    // drain after host-synchronizing every list with in-flight clones of the
+    // graph, so the previous replay's accumulated clones are all complete
+    // here and leave in ONE device-side batch (~500us per step) instead of
+    // the ~800 per-event queries the app's poll used to pay. Clones whose
+    // event is not yet signaled stay queued for the next flush (per-distinct
+    // -event readiness gate keeps the not-ready hot spin out); a failed batch
+    // hands the graph clones back to the legacy path for this sweep only.
+    ZeBatchQkt batch;
+    const bool batchqkt = BatchQktActive();
+    bool batchqkt_legacy = false;
+    if (batchqkt) {
+      // v3: guard the whole flush window — the tail resets inside the
+      // consuming loop below must not re-enter a sweep while this thread
+      // holds the exclusive submission lock (see uni_batchqkt_in_batch_).
+      uni_batchqkt_in_batch_ = true;
+      // E6-v4b backstop: emit whatever the previous drain deferred before this
+      // one arms a new batch (the emit buffer would be overwritten) or stages
+      // the next replay. This is what bounds a deferred clone's life when the
+      // app never polls between steps: the emit then simply happens here, on
+      // the v4 path, and nothing is lost — only the overlap is missed.
+      BatchQktConsumeDeferredEmit(kids, /*at_drain=*/true);
+      // E6-v4c: prefer finishing a poll-armed read. Its device-side wait
+      // resolved when the step's last kernel signaled, and the list
+      // host-synchronize in PrepareGraphExecution above already proved the
+      // step complete, so the synchronize here returns immediately and the
+      // drain's exposed serial no longer contains the append+sync of the read
+      // (gq4: max_batch_us 7042). What it produces is exactly the batch a v4b
+      // BatchQktExecute would have, so the arm below — and everything after it
+      // — is the unchanged v4b code. With the gate off, or when no sweep armed
+      // a read (app never polled mid-step, arm skipped, or the sync failed),
+      // this is the untouched v4b drain read.
+      if (!BatchQktCompletePollRead(batch)) {
+        BatchQktCollectStatusGated(batch);
+        if (!batch.cmds.empty()) {
+          if (BatchQktExecute(batch)) {
+            // E6-v4b: the packets are read and safely buffered — park the emit
+            // for the first sweep after this drain (the app's poll of the
+            // replayed graph, which fires while the device executes the new
+            // step) instead of emitting ~770 records here against an idle
+            // device. The readiness gate plus the host-synchronize above proved
+            // every clone in the batch complete, so the read is the last moment
+            // the packets are guaranteed to still be this generation's.
+            if (BatchQktAtPollActive()) {
+              uni_batchqkt_qkt_at_drain_.fetch_add(batch.cmds.size(),
+                                                   std::memory_order_relaxed);
+            }
+            BatchQktArmDeferredEmit(batch);
+          }
+          else {
+            batchqkt_legacy = true;  // unchanged v3 fallback chain
+          }
+        }
+      }
+      else {
+        // The armed set is emitted at the next poll, exactly like a v4b batch.
+        BatchQktArmDeferredEmit(batch);
+        // E6-v4c: this drain may run while OTHER threads' lists still hold
+        // pending clones the armed read (which covers only the arming sweep's
+        // own list) never saw. They must not outlive this drain: the clone
+        // loop below re-signals their physical events, which would overwrite
+        // packets that are still unread (silent cross-generation records, no
+        // TSBAD). Collect what is left — the just-armed clones are invisible
+        // to the collect (deferred_ts_), so this is exactly the residue — and
+        // let the loop below consume it INLINE (the v3 shape: read + emit here
+        // instead of a second deferred arm, which the single emit buffer of
+        // the v4b split does not have a slot for). Leftovers only exist in
+        // multi-threaded graph replay; the single-replay app pays one empty
+        // collect walk here.
+        BatchQktCollectStatusGated(batch);
+        if (!batch.cmds.empty()) {
+          if (BatchQktExecute(batch)) {
+            if (BatchQktAtPollActive()) {
+              uni_batchqkt_qkt_at_drain_.fetch_add(batch.cmds.size(),
+                                                   std::memory_order_relaxed);
+            }
+          }
+          else {
+            batchqkt_legacy = true;  // unchanged v3 fallback chain for the residue
+          }
+        }
+      }
+    }
+
     if (global_device_submissions_) {
       for (auto s : *global_device_submissions_) {
         auto& local_submissions = *s;
@@ -1803,21 +2020,40 @@ class ZeCollector {
           ZeCommand *command = *it;
 
           bool processed = false;
-          if ((command->device_global_timestamps_ != nullptr) || (command->timestamps_on_event_reset_ != nullptr)) {
+          bool deferred = false;
+          const ze_kernel_timestamp_result_t *pre_ts = BatchQktTake(batch, command);
+          if (pre_ts != nullptr) {
+            // T6'/E6: readiness was proven by the collection pass and the
+            // packet is already read; inline consumption on the legacy tail.
+            if (kids != nullptr) {
+              kids->push_back(command->instance_id_);
+            }
+            ProcessCommandSubmittedTail(local_submissions, command, true, pre_ts);
+            processed = true;
+          }
+          else if (BatchQktAccumulate(command, batchqkt && !batchqkt_legacy)) {
+            // T6'/E6 (v3): not ready (or not part of) this flush — stays
+            // queued for the next one instead of being consumed here.
+          }
+          else if ((command->device_global_timestamps_ != nullptr) || (command->timestamps_on_event_reset_ != nullptr)) {
             if (ZE_FUNC(zeEventQueryStatus)(command->timestamp_event_) == ZE_RESULT_SUCCESS) {
+              // Fix B: legacy host-buffer timestamps stay on the inline path.
               ProcessCommandSubmitted(local_submissions, command, kids, false);
               processed = true;
             }
           }
           else {
             if (ZE_FUNC(zeEventQueryStatus)(command->event_) == ZE_RESULT_SUCCESS) {
-              ProcessCommandSubmitted(local_submissions, command, kids, true);
+              deferred = HandleCommandSubmitted(local_submissions, command, kids, true);
               processed = true;
             }
           }
           if (processed) {
             // event_cache_.ReleaseEvent(command->event_) or event_cache_.ResetEvent(command->event_) is already called inside ProcessCommandSubmitted()
-            local_submissions.commands_free_pool_.push_back(command);
+            // Fix B: a deferred command belongs to the completer thread — no recycling.
+            if (!deferred) {
+              local_submissions.commands_free_pool_.push_back(command);
+            }
             it = local_submissions.commands_submitted_.erase(it);
             continue;
           }
@@ -1828,8 +2064,15 @@ class ZeCollector {
         }
       }
     }
+    if (batchqkt) {
+      uni_batchqkt_in_batch_ = false;  // end of the flush window
+    }
     global_device_submissions_mutex_.unlock();
     FlushGraphEventResets();  // Graph replay fix: end-of-sweep deferred resets
+    // Fix B barrier (exit): this drain may just have handed commands to the
+    // completer thread; callers (context/list teardown, graph replay staging,
+    // final flush) assume everything is done when this returns.
+    FlushDeferredTimestamps();
   }
 
   void FinalizeDeviceSubmissions(std::vector<uint64_t> *kids) {
@@ -1840,21 +2083,39 @@ class ZeCollector {
       ZeCommand *command = *it;
 
       bool processed = false;
-      if ((command->device_global_timestamps_ != nullptr) || (command->timestamps_on_event_reset_ != nullptr)) {
+      bool deferred = false;
+      // E6-v4b: a clone whose packet the drain already read emits from the
+      // held packet here too — never a fresh query, never a second event
+      // release (the event was released at arm time).
+      const ze_kernel_timestamp_result_t *held_ts = command->deferred_ts_;
+      command->deferred_ts_ = nullptr;
+      if (held_ts != nullptr) {
+        if (kids != nullptr) {
+          kids->push_back(command->instance_id_);
+        }
+        ProcessCommandSubmittedTail(local_device_submissions_, command, true, held_ts,
+                                    /*deferred_emit=*/true);
+        processed = true;
+      }
+      else if ((command->device_global_timestamps_ != nullptr) || (command->timestamps_on_event_reset_ != nullptr)) {
         if (ZE_FUNC(zeEventQueryStatus)(command->timestamp_event_) == ZE_RESULT_SUCCESS) {
+          // Fix B: legacy host-buffer timestamps stay on the inline path.
           ProcessCommandSubmitted(local_device_submissions_, command, kids, false);
           processed = true;
         }
       }
       else {
         if (ZE_FUNC(zeEventQueryStatus)(command->event_) == ZE_RESULT_SUCCESS) {
-          ProcessCommandSubmitted(local_device_submissions_, command, kids, true);
+          deferred = HandleCommandSubmitted(local_device_submissions_, command, kids, true);
           processed = true;
         }
       }
       if (processed) {
         // event_cache_.ReleaseEvent(command->event_) or event_cache_.ResetEvent(command->event_) is already called inside ProcessCommandSubmitted()
-        local_device_submissions_.commands_free_pool_.push_back(command);
+        // Fix B: a deferred command belongs to the completer thread — no recycling.
+        if (!deferred) {
+          local_device_submissions_.commands_free_pool_.push_back(command);
+        }
         it = local_device_submissions_.commands_submitted_.erase(it);
         continue;
       }
@@ -1864,6 +2125,7 @@ class ZeCollector {
       ProcessCommandMetricQueriesSubmitted();
     }
     FlushGraphEventResets();  // Graph replay fix: end-of-sweep deferred resets
+    FlushDeferredTimestamps();  // Fix B barrier: this is a final per-thread drain
   }
 
  private: // Implementation
@@ -1884,7 +2146,9 @@ class ZeCollector {
         reset_event_on_device_(reset_event_on_device),
         event_cache_(ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP),
         include_kernels_(include_kernels),
-        exclude_kernels_(exclude_kernels) {
+        exclude_kernels_(exclude_kernels),
+        uni_defer_ts_enabled_(DeferredTsEnvEnabled()),
+        uni_batchqkt_enabled_(BatchQktEnvEnabled()) {
     data_dir_name_ = data_dir_name;
     // Create loggers using the factory
     if (options_.call_logging) {
@@ -2664,37 +2928,126 @@ class ZeCollector {
   }
 
   void ProcessCommandsSubmittedOnSignaledEvent(ze_event_handle_t event, std::vector<uint64_t> *kids) {
+    if (uni_batchqkt_in_batch_) {
+      return;  // T6'/E6: re-entry from the batch's own L0 calls (no-op, same pattern as Fix B)
+    }
+
     if (local_device_submissions_.IsFinalized()) {
       return;
     }
     global_device_submissions_mutex_.lock_shared();
+
+    // T6'/E6 (v3): accumulate-only here. No batch is executed from a poll
+    // sweep: with the clones' shared events latched until the batch resets
+    // them, a matched-event trigger would re-fire on every subsequent poll
+    // and re-fragment the batch, and the polled event does not prove the
+    // whole replay complete (gq1b: only ~40 of ~770 clones were ready at the
+    // one poll sweep per step). Instead every pending clone seen here is
+    // skipped by the legacy branches below — no status call, no query, no
+    // Fix B handoff — and stays queued for the ONE flush per replay at the
+    // staging drain (PrepareGraphExecution host-synchronizes the lists
+    // before its pre-staging ProcessAllCommandsSubmitted, which executes the
+    // batch). Fence and teardown drains keep readiness-gated flushes as the
+    // backstop. This is also what removes the ~51ms per-step sweep giant: the
+    // poll loop no longer walks ~800 clones with per-event queries.
+    const bool batchqkt = BatchQktActive();
+
+    // E6-v4b: THIS is where the drain's batch is meant to be emitted. The
+    // packets were read at the drain, while they were still this generation's
+    // (before the new replay's clones re-signaled the same physical events),
+    // and their completeness was proven by that drain's list host-synchronize
+    // — so the emit pass below needs no readiness gate and cannot read a
+    // packet twice. Running it here puts the ~58ms of record machinery under
+    // the new step's device execution instead of serializing it against an
+    // idle device at the drain (gq3: that placement alone was the +65ms ITL).
+    // No-op unless a drain armed a batch since the last emit pass.
+    if (batchqkt) {
+      BatchQktConsumeDeferredEmit(kids, /*at_drain=*/false);
+      // E6-v4c: THIS is also where the step's read is issued, when
+      // UNITRACE_GRAPH_QKT_AT_POLL=1. Same anchor as the emit above (the first
+      // sweep after the previous drain, device busy running the new step): the
+      // append parks device-side on the step's own events, so the packets are
+      // captured the moment the step's last kernel signals and the staging
+      // drain only synchronizes + copies. Stateless w.r.t. the clones — a skip
+      // or a failure here leaves the exact v4b shape in place.
+      BatchQktArmPollRead();
+    }
+
+    // v3.1: parallel prefetch of the timestamps of commands bound to the waited
+    // event (skipped when TSLOG2 debug is active so the diagnosis path keeps its
+    // exact inline ordering; the fence twin below mirrors this).
+    // T6'/E6: also skipped when the batch gate is on — pending clones are not
+    // consumed from poll sweeps anymore, and those helper-thread per-event
+    // queries are the tax the batch replaces (their results were never
+    // consumed here anyway).
+    size_t prefetch_used = 0;
+    std::vector<ZeCommand *> prefetch_cmds;
+    std::vector<ZePrefetchedTs> prefetch_ts;
+    if (!batchqkt && Tslog2Mode() == 0) {
+      size_t bound = 0;
+      for (auto &command : local_device_submissions_.commands_submitted_) {
+        if (command->event_ == event && command->in_order_counter_event_ == nullptr) bound++;
+      }
+      if (bound >= kTsPrefetchMinCommands) {
+        prefetch_cmds.reserve(bound);
+        for (auto &command : local_device_submissions_.commands_submitted_) {
+          if (command->event_ == event && command->in_order_counter_event_ == nullptr) {
+            prefetch_cmds.push_back(command);
+          }
+        }
+        PrefetchTimestampsParallel(prefetch_cmds, prefetch_ts);
+      }
+    }
+
     for (auto it = local_device_submissions_.commands_submitted_.begin(); it != local_device_submissions_.commands_submitted_.end();) {
       ZeCommand *command = *it;
 
       if (command->event_ == event || command->in_order_counter_event_ == event) {
-        ProcessCommandSubmitted(local_device_submissions_, command, kids, true);
-        // event_cache_.ReleaseEvent(command->event_) or event_cache_.ResetEvent(command->event_) is already called inside ProcessCommandSubmitted()
-        local_device_submissions_.commands_free_pool_.push_back(command);
+        // T6'/E6 (v3): a pending graph clone stays queued for the staging
+        // -drain flush even when its event is the one this sweep was polled
+        // for — the batch reads and resets it, in list order, at the drain.
+        if (BatchQktAccumulate(command, batchqkt)) {
+          it++;
+          continue;
+        }
+        // Fix B: kids (host-API flow arrows) stay synchronous; the timestamp
+        // read + emit + reset may be handed to the background completer thread.
+        // Merge note: v3.1 prefetch consumption dropped here (proven inert for
+        // counter-based events; the prefetch snapshot block above is harmless).
+        if (HandleCommandSubmitted(local_device_submissions_, command, kids, true)) {
+          // deferred: the command object is owned by the completer thread now
+        }
+        else {
+          local_device_submissions_.commands_free_pool_.push_back(command);
+        }
         it = local_device_submissions_.commands_submitted_.erase(it);
         continue;
       }
       else {
         bool processed = false;
-        if ((command->device_global_timestamps_ != nullptr) || (command->timestamps_on_event_reset_ != nullptr)) {
+        bool deferred = false;
+        if (BatchQktAccumulate(command, batchqkt)) {
+          // T6'/E6 (v3): stays queued for the next flush.
+        }
+        else if ((command->device_global_timestamps_ != nullptr) || (command->timestamps_on_event_reset_ != nullptr)) {
           if (ZE_FUNC(zeEventQueryStatus)(command->timestamp_event_) == ZE_RESULT_SUCCESS) {
+            // Fix B: legacy host-buffer timestamps stay on the inline path.
             ProcessCommandSubmitted(local_device_submissions_, command, nullptr, false);
             processed = true;
           }
         }
         else {
           if (ZE_FUNC(zeEventQueryStatus)(command->event_) == ZE_RESULT_SUCCESS) {
-            ProcessCommandSubmitted(local_device_submissions_, command, nullptr, true);
+            deferred = HandleCommandSubmitted(local_device_submissions_, command, nullptr, true);
             processed = true;
           }
         }
         if (processed) {
           // event_cache_.ReleaseEvent(command->event_) or event_cache_.ResetEvent(command->event_) is already called inside ProcessCommandSubmitted()
-          local_device_submissions_.commands_free_pool_.push_back(command);
+          // Fix B: a deferred command belongs to the completer thread — no recycling.
+          if (!deferred) {
+            local_device_submissions_.commands_free_pool_.push_back(command);
+          }
           it = local_device_submissions_.commands_submitted_.erase(it);
           continue;
         }
@@ -2711,42 +3064,141 @@ class ZeCollector {
 
   void ProcessCommandsSubmittedOnFenceSynchronization(ze_fence_handle_t fence, std::vector<uint64_t> *kids) {
 
+    if (uni_batchqkt_in_batch_) {
+      return;  // T6'/E6: re-entry from the batch's own L0 calls (no-op, same pattern as Fix B)
+    }
+
     if (local_device_submissions_.IsFinalized()) {
       return;
     }
 
     global_device_submissions_mutex_.lock_shared();
+
+    // T6'/E6 (v3): backstop flush. The fence this sweep was triggered for may
+    // not be the clones' completion object, so the accumulated clones whose
+    // events are already signaled are batch-read here (per-distinct-event
+    // readiness gate); the rest stay queued for the staging drain. A failed
+    // batch hands the graph clones back to the legacy path for this sweep.
+    ZeBatchQkt batch;
+    const bool batchqkt = BatchQktActive();
+    bool batchqkt_legacy = false;
+    if (batchqkt) {
+      // v3: guard the whole flush window — see uni_batchqkt_in_batch_.
+      uni_batchqkt_in_batch_ = true;
+      // E6-v4b: emit a batch the drain deferred before collecting fresh clones,
+      // so a deferred clone is never re-read and never outlives this sweep.
+      BatchQktConsumeDeferredEmit(kids, /*at_drain=*/false);
+      // E6-v4c: resolve a poll-armed read here too (its wait resolved when the
+      // step ended; a mid-step fence sync would block on it for the step's
+      // remainder, which in an in-order queue the app was going to wait out
+      // anyway). Consumed inline like the batch below; on skip/failure the
+      // unchanged v3/v4b collect+execute runs.
+      if (!BatchQktCompletePollRead(batch)) {
+        BatchQktCollectReady(local_device_submissions_.commands_submitted_, nullptr, batch);
+        if (!batch.cmds.empty() && !BatchQktExecute(batch)) {
+          batchqkt_legacy = true;
+        }
+      }
+    }
+
+    // v3.1: parallel prefetch for fence-bound commands (see the event twin above).
+    // T6'/E6: skipped when the batched read handled this sweep.
+    size_t prefetch_used = 0;
+    std::vector<ZeCommand *> prefetch_cmds;
+    std::vector<ZePrefetchedTs> prefetch_ts;
+    if (!batchqkt && Tslog2Mode() == 0) {
+      size_t bound = 0;
+      for (auto &command : local_device_submissions_.commands_submitted_) {
+        if ((command->fence_ != nullptr) && (command->fence_ == fence) &&
+            command->event_ != nullptr && command->in_order_counter_event_ == nullptr) bound++;
+      }
+      if (bound >= kTsPrefetchMinCommands) {
+        prefetch_cmds.reserve(bound);
+        for (auto &command : local_device_submissions_.commands_submitted_) {
+          if ((command->fence_ != nullptr) && (command->fence_ == fence) &&
+              command->event_ != nullptr && command->in_order_counter_event_ == nullptr) {
+            prefetch_cmds.push_back(command);
+          }
+        }
+        PrefetchTimestampsParallel(prefetch_cmds, prefetch_ts);
+      }
+    }
+
     for (auto it = local_device_submissions_.commands_submitted_.begin(); it != local_device_submissions_.commands_submitted_.end();) {
       ZeCommand *command = *it;
       if ((command->fence_ != nullptr) && (command->fence_ == fence)) {
-        ProcessCommandSubmitted(local_device_submissions_, command, kids, true);
-        // event_cache_.ReleaseEvent(command->event_) or event_cache_.ResetEvent(command->event_) is already called inside ProcessCommandSubmitted()
-        local_device_submissions_.commands_free_pool_.push_back(command);
+        // T6'/E6 (v3): a pending graph clone bound to this fence either
+        // consumes its batch-read packet or stays queued for the staging
+        // drain — it is never re-read per event here.
+        const ze_kernel_timestamp_result_t *pre_ts = BatchQktTake(batch, command);
+        if (pre_ts != nullptr) {
+          if (kids != nullptr) {
+            kids->push_back(command->instance_id_);
+          }
+          ProcessCommandSubmittedTail(local_device_submissions_, command, true, pre_ts);
+          local_device_submissions_.commands_free_pool_.push_back(command);
+          it = local_device_submissions_.commands_submitted_.erase(it);
+          continue;
+        }
+        if (BatchQktAccumulate(command, batchqkt && !batchqkt_legacy)) {
+          it++;
+          continue;
+        }
+        // Fix B: same handoff rule as the event-matched branch above.
+        if (HandleCommandSubmitted(local_device_submissions_, command, kids, true)) {
+        // Merge note: v3.1 prefetch consumption dropped here (proven inert for
+        // counter-based events; the prefetch snapshot block above is harmless).
+          // deferred: the command object is owned by the completer thread now
+        }
+        else {
+          local_device_submissions_.commands_free_pool_.push_back(command);
+        }
         it = local_device_submissions_.commands_submitted_.erase(it);
         continue;
       }
       else {
         bool processed = false;
-        if ((command->device_global_timestamps_ != nullptr) || (command->timestamps_on_event_reset_ != nullptr)) {
+        bool deferred = false;
+        // T6'/E6 (v3): a pending clone either consumes its batch-read packet
+        // or stays queued for the staging drain.
+        const ze_kernel_timestamp_result_t *pre_ts = BatchQktTake(batch, command);
+        if (pre_ts != nullptr) {
+          if (kids != nullptr) {
+            kids->push_back(command->instance_id_);
+          }
+          ProcessCommandSubmittedTail(local_device_submissions_, command, true, pre_ts);
+          processed = true;
+        }
+        else if (BatchQktAccumulate(command, batchqkt && !batchqkt_legacy)) {
+          // stays queued for the next flush
+        }
+        else if ((command->device_global_timestamps_ != nullptr) || (command->timestamps_on_event_reset_ != nullptr)) {
           if (ZE_FUNC(zeEventQueryStatus)(command->timestamp_event_) == ZE_RESULT_SUCCESS) {
+            // Fix B: legacy host-buffer timestamps stay on the inline path.
             ProcessCommandSubmitted(local_device_submissions_, command, nullptr, false);
             processed = true;
           }
         }
         else {
           if (ZE_FUNC(zeEventQueryStatus)(command->event_) == ZE_RESULT_SUCCESS) {
-            ProcessCommandSubmitted(local_device_submissions_, command, nullptr, true);
+            deferred = HandleCommandSubmitted(local_device_submissions_, command, nullptr, true);
             processed = true;
           }
         }
         if (processed) {
           // event_cache_.ReleaseEvent(command->event_) or event_cache_.ResetEvent(command->event_) is already called inside ProcessCommandSubmitted()
-          local_device_submissions_.commands_free_pool_.push_back(command);
+          // Fix B: a deferred command belongs to the completer thread — no recycling.
+          if (!deferred) {
+            local_device_submissions_.commands_free_pool_.push_back(command);
+          }
           it = local_device_submissions_.commands_submitted_.erase(it);
           continue;
         }
       }
       it++;
+    }
+    if (batchqkt) {
+      uni_batchqkt_in_batch_ = false;  // end of the flush window
     }
     if (options_.metric_query) {
       ProcessCommandMetricQueriesSubmitted();
@@ -2810,7 +3262,8 @@ class ZeCollector {
       std::to_string(command->append_time_) + " (append) " +
       std::to_string(command->submit_time_) + " (submit) " +
       std::to_string(kernel_start) + " (start) " +
-      std::to_string(kernel_end) + " (end)\n";
+      std::to_string(kernel_end) + " (end)" +
+      " engine=" + std::to_string(command->engine_ordinal_) + "." + std::to_string(command->engine_index_) + "\n";
     logger_device_timeline_->Log(str);
   }
 
@@ -2917,6 +3370,23 @@ class ZeCollector {
     return reset_now;
   }
 
+  // E6-v4: parks a shared event whose last pending clone has just been read,
+  // so the reset is issued as one device-side batch at the end of the sweep
+  // (FlushGraphEventResets -> BatchQktResetEvents) instead of one
+  // zeEventHostReset ioctl per consumed clone. Only graph clones with the
+  // batch gate on park here: their events live as long as the graph, the
+  // parked set is drained by the flush every sweep ends with, and the
+  // pending-clone counter above already proved no clone needs the packet
+  // anymore — so deferring the reset cannot strand or resurrect a packet.
+  void EventHistoryDeferGraphEventReset(ze_context_handle_t context, ze_event_handle_t event) {
+    if (event == nullptr) {
+      return;
+    }
+    events_mutex_.lock();
+    graph_events_pending_reset_[context].insert(event);
+    events_mutex_.unlock();
+  }
+
   bool EventHistoryHasPending(ze_event_handle_t event) {
     if (event == nullptr) {
       return false;
@@ -2931,24 +3401,286 @@ class ZeCollector {
   // Graph replay fix: erase the kernel-timestamp packets of graph events whose
   // clones were all processed in this sweep. Called at the end of every command
   // sweep so the deferred reset never spans beyond one sweep.
+  //
+  // E6-v4: with the batch gate on the sweeps no longer pay a zeEventHostReset
+  // ioctl per consumed clone (EventHistoryDeferGraphEventReset parks the
+  // handle above instead). This flush is where they are executed, as ONE
+  // device-side batch per context: one zeCommandListAppendEventReset per event
+  // on the collector's persistent immediate command list + a single
+  // zeCommandListHostSynchronize (appends are queue writes, the synchronize is
+  // the only wait). That takes the staging drain from O(clones) driver ioctls
+  // down to O(1) waits. The synchronize completes INSIDE this call, i.e.
+  // inside the sweep, so the events are really un-signaled before
+  // PrepareGraphExecution's clone loop re-bumps/re-signals them for the next
+  // replay — a reset that merely raced the next replay would drop that
+  // replay's timestamps. Everything that cannot ride the immediate list (gate
+  // off, unknown context, no immediate list, append/synchronize failure, event
+  // no longer owned by the cache) falls back to the legacy per-event host
+  // reset, so each parked event is reset exactly once either way.
   void FlushGraphEventResets(void) {
-    std::vector<ze_event_handle_t> events;
+    std::map<ze_context_handle_t, std::set<ze_event_handle_t>> pending;
     events_mutex_.lock();
-    events.assign(graph_events_pending_reset_.begin(), graph_events_pending_reset_.end());
-    graph_events_pending_reset_.clear();
+    pending.swap(graph_events_pending_reset_);
     events_mutex_.unlock();
-    for (auto event : events) {
-      event_cache_.ResetEvent(event);
+    for (auto &ctx : pending) {
+      BatchQktResetEvents(ctx.first, ctx.second);
     }
+  }
+
+  // ================= Fix B: deferred timestamp completion =================
+  // UNITRACE_DEFERRED_TS=1 moves the expensive half of command completion
+  // (zeEventQueryKernelTimestamp, timeline/chrome emit, ConsumePending /
+  // ResetEvent) off the application thread onto one background completer
+  // thread. The intercepting sweep keeps only the cheap zeEventQueryStatus
+  // completion polls, records the host-API flow ids (kids) synchronously, and
+  // hands the command over. Because the completer touches events after the
+  // app thread moved on, every path that reuses/resets/destroys an event or
+  // fully drains submissions must first call FlushDeferredTimestamps().
+  struct DeferredTsItem {
+    ZeCommand *command_;
+    bool on_event_;
+  };
+
+  // Reentrancy guard. The completer thread runs the tail of the original
+  // inline path, which calls L0 entry points (zeEventDestroy inside
+  // ZeEventCache::ReleaseEvent, zeEventHostReset inside ResetEvent, ...) that
+  // go through the tracing layer and therefore fire the collector's own
+  // callbacks on the completer thread. Those callbacks must never wait on the
+  // completer queue (the worker would wait for itself, deadlocking against
+  // FlushData's join) and must never hand new commands back to it.
+  static inline thread_local bool uni_defer_on_completer_thread_ = false;
+
+  static bool DeferredTsEnvEnabled(void) {
+    static const bool enabled = []() {
+      const char *e = std::getenv("UNITRACE_DEFERRED_TS");
+      return (e != nullptr && e[0] == '1' && e[1] == '\0');
+    }();
+    return enabled;
+  }
+
+  static bool DeferredTsDiagEnabled(void) {
+    static const bool enabled = (std::getenv("UNITRACE_DEBUG_DEFER") != nullptr);
+    return enabled;
+  }
+
+  // Whether this completed command may be handed to the completer thread.
+  // Only commands whose timestamps come from querying an event are eligible:
+  // the legacy host-buffer timestamp paths (device_global_timestamps_ /
+  // timestamps_on_event_reset_) keep the original inline behaviour because
+  // those buffers belong to the command list and may be freed while the item
+  // is queued. TSLOG2 diagnosis modes force the original path to keep their
+  // exact inline ordering.
+  bool ShouldDeferCommand(const ZeCommand *command) const {
+    if (uni_defer_on_completer_thread_) {
+      return false;  // nested sweep on the completer thread: never re-defer
+    }
+    if (!uni_defer_ts_enabled_.load(std::memory_order_relaxed)) {
+      return false;
+    }
+    if (Tslog2Mode() != 0) {
+      return false;
+    }
+    if (options_.metric_query || options_.metric_stream) {
+      return false;  // metric completion keeps its own submission-thread path
+    }
+    if (command->graph_command_ && uni_batchqkt_enabled_.load(std::memory_order_relaxed)) {
+      // T6'/E6: graph replay clones are consumed inline by the intercepting
+      // sweep (their shared completion event is batch-read there). Handing
+      // them to the completer would only relocate the per-event query tax onto
+      // the worker thread and delay the shared event's reset — the batch read
+      // removes the tax instead, so graph clones never take the deferred path
+      // while the batch gate is on. With the gate off this predicate is
+      // untouched and clones keep deferring as before.
+      return false;
+    }
+    if (command->event_ == nullptr) {
+      return false;
+    }
+    if (command->device_global_timestamps_ != nullptr ||
+        command->timestamps_on_event_reset_ != nullptr) {
+      return false;
+    }
+    if (uni_defer_worker_stop_.load(std::memory_order_acquire)) {
+      return false;
+    }
+    return UniController::IsCollectionEnabled(/*defer_callback=*/true);
+  }
+
+  // Returns true when the command was handed to the completer thread (caller
+  // must NOT recycle it into commands_free_pool_), false when it was fully
+  // processed inline (original behaviour; caller recycles as before).
+  // kids are recorded synchronously in both cases: the host-API flow arrows
+  // are only valid inside the intercepted call.
+  bool HandleCommandSubmitted(ZeDeviceSubmissions& submissions, ZeCommand *command,
+                              std::vector<uint64_t> *kids, bool on_event) {
+    if (ShouldDeferCommand(command)) {
+      if (kids != nullptr) {
+        kids->push_back(command->instance_id_);
+      }
+      QueueDeferredCommand(command, on_event);
+      return true;
+    }
+    ProcessCommandSubmitted(submissions, command, kids, on_event);
+    return false;
+  }
+
+  void EnsureDeferredCompleter(void) {
+    if (uni_defer_worker_started_.load(std::memory_order_acquire)) {
+      return;
+    }
+    std::lock_guard<std::mutex> lk(uni_defer_q_mutex_);
+    if (uni_defer_worker_started_.load(std::memory_order_relaxed)) {
+      return;
+    }
+    uni_defer_worker_started_.store(true, std::memory_order_release);
+    uni_defer_worker_ = std::thread(&ZeCollector::DeferredCompleterMain, this);
+    if (DeferredTsDiagEnabled()) {
+      std::cerr << "[DEFER] completer thread started (UNITRACE_DEFERRED_TS=1)" << std::endl;
+    }
+  }
+
+  void QueueDeferredCommand(ZeCommand *command, bool on_event) {
+    EnsureDeferredCompleter();
+    std::unique_lock<std::mutex> lk(uni_defer_q_mutex_);
+    if (uni_defer_worker_stop_.load(std::memory_order_acquire)) {
+      // Shutdown won the race: finish this command inline so nothing is ever
+      // queued behind the joined completer thread.
+      lk.unlock();
+      uni_defer_inline_fallback_count_.fetch_add(1, std::memory_order_relaxed);
+      ProcessCommandSubmittedTail(local_device_submissions_, command, on_event);
+      delete command;
+      return;
+    }
+    uni_defer_queue_.push_back({command, on_event});
+    uni_defer_handoff_count_.fetch_add(1, std::memory_order_relaxed);
+    lk.unlock();
+    uni_defer_q_cv_.notify_one();
+  }
+
+  void DeferredCompleterMain(void) {
+    uni_defer_on_completer_thread_ = true;
+    std::deque<DeferredTsItem> batch;
+    std::unique_lock<std::mutex> lk(uni_defer_q_mutex_);
+    for (;;) {
+      uni_defer_q_cv_.wait(lk, [&] {
+        return uni_defer_worker_stop_.load(std::memory_order_acquire) ||
+               !uni_defer_queue_.empty();
+      });
+      if (uni_defer_queue_.empty()) {
+        // stop requested and everything handed over has been processed
+        uni_defer_q_cv_.notify_all();
+        break;
+      }
+      batch.swap(uni_defer_queue_);
+      uni_defer_worker_busy_ = true;
+      uint64_t batch_size = batch.size();
+      uni_defer_batch_count_.fetch_add(1, std::memory_order_relaxed);
+      uint64_t prev_max = uni_defer_max_batch_.load(std::memory_order_relaxed);
+      while (batch_size > prev_max &&
+             !uni_defer_max_batch_.compare_exchange_weak(prev_max, batch_size, std::memory_order_relaxed)) {
+      }
+      lk.unlock();
+      for (DeferredTsItem &item : batch) {
+        ProcessCommandSubmittedTail(local_device_submissions_, item.command_, item.on_event_);
+        delete item.command_;
+        uni_defer_processed_count_.fetch_add(1, std::memory_order_relaxed);
+      }
+      batch.clear();
+      lk.lock();
+      uni_defer_worker_busy_ = false;
+      uni_defer_q_cv_.notify_all();
+    }
+  }
+
+  // Barrier: block until every command handed to the completer thread so far
+  // has been fully processed (timestamp read, emit, event release/reset).
+  // Must run before any event/pool/context/command-list teardown, and before
+  // graph replay staging re-signals shared events. Near-zero cost once the
+  // queue has drained (steady state: the completer digests during the device
+  // busy window).
+  void FlushDeferredTimestamps(void) {
+    if (uni_defer_on_completer_thread_) {
+      return;  // reentrant call from the worker's own L0 call: never self-wait
+    }
+    if (!uni_defer_ts_enabled_.load(std::memory_order_relaxed)) {
+      return;
+    }
+    if (!uni_defer_worker_started_.load(std::memory_order_acquire) ||
+        uni_defer_worker_joined_.load(std::memory_order_acquire)) {
+      return;
+    }
+    auto t0 = std::chrono::steady_clock::now();
+    {
+      std::unique_lock<std::mutex> lk(uni_defer_q_mutex_);
+      if (uni_defer_worker_joined_.load(std::memory_order_relaxed)) {
+        return;
+      }
+      uni_defer_flush_count_.fetch_add(1, std::memory_order_relaxed);
+      uni_defer_q_cv_.notify_all();
+      uni_defer_q_cv_.wait(lk, [&] {
+        return !uni_defer_worker_busy_ && uni_defer_queue_.empty();
+      });
+    }
+    uint64_t wait_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - t0).count());
+    uint64_t prev_max = uni_defer_flush_max_wait_us_.load(std::memory_order_relaxed);
+    while (wait_us > prev_max &&
+           !uni_defer_flush_max_wait_us_.compare_exchange_weak(prev_max, wait_us, std::memory_order_relaxed)) {
+    }
+    if (DeferredTsDiagEnabled() && wait_us > 5000) {
+      std::cerr << "[DEFER] flush waited " << wait_us << "us (barrier drain)" << std::endl;
+    }
+  }
+
+  // Final stop: no more handoffs (ShouldDeferCommand checks the stop flag),
+  // the worker drains the queue before exiting, then we join it.
+  void StopDeferredCompleter(void) {
+    if (!uni_defer_worker_started_.load(std::memory_order_acquire) ||
+        uni_defer_worker_joined_.load(std::memory_order_acquire)) {
+      return;
+    }
+    uni_defer_worker_stop_.store(true, std::memory_order_release);
+    {
+      std::lock_guard<std::mutex> lk(uni_defer_q_mutex_);
+      uni_defer_q_cv_.notify_all();
+    }
+    if (uni_defer_worker_.joinable()) {
+      uni_defer_worker_.join();
+    }
+    uni_defer_worker_joined_.store(true, std::memory_order_release);
+    PrintDeferredTsDiag();
+  }
+
+  void PrintDeferredTsDiag(void) {
+    if (!DeferredTsDiagEnabled()) {
+      return;
+    }
+    std::cerr << "[DEFER] summary: enabled=" << uni_defer_ts_enabled_.load(std::memory_order_relaxed)
+              << " handoff=" << uni_defer_handoff_count_.load(std::memory_order_relaxed)
+              << " worker_processed=" << uni_defer_processed_count_.load(std::memory_order_relaxed)
+              << " inline_fallback=" << uni_defer_inline_fallback_count_.load(std::memory_order_relaxed)
+              << " flush_calls=" << uni_defer_flush_count_.load(std::memory_order_relaxed)
+              << " flush_max_wait_us=" << uni_defer_flush_max_wait_us_.load(std::memory_order_relaxed)
+              << " batches=" << uni_defer_batch_count_.load(std::memory_order_relaxed)
+              << " max_batch=" << uni_defer_max_batch_.load(std::memory_order_relaxed)
+              << std::endl;
   }
 
   // Graph replay fix v3: a graph clone that leaves the processing pipeline
   // without emitting a record (timestamp query failure) must still be accounted
   // for, or the shared event never reaches its reset point and stays latched.
+  // E6-v4: the reset itself goes through the same gate as the tail — batched
+  // at the sweep end with the gate on, inline host reset otherwise.
   void ReleaseGraphCommandEvent(ZeCommand *command) {
     if (command->graph_command_ && command->event_ != nullptr &&
         EventHistoryConsumePending(command->event_)) {
-      event_cache_.ResetEvent(command->event_);
+      if (BatchQktResetBatchActive()) {
+        EventHistoryDeferGraphEventReset(command->context_, command->event_);
+      }
+      else {
+        event_cache_.ResetEvent(command->event_);
+      }
     }
   }
 
@@ -3080,6 +3812,57 @@ class ZeCollector {
               << std::endl;
   }
 
+  // -----------------------------------------------------------------------
+  // Fix D (collection tax): read the latest timestamp packet through
+  // zeEventQueryKernelTimestampsExt instead of the legacy per-call ioctl
+  // path. Micro-bench on the affected driver (idle device): legacy
+  // zeEventQueryKernelTimestamp p50 ~2.7us (an ioctl; ~9us under load, ~50us
+  // at default CPU power), Ext p50 ~0.04us (mapped-packet read) with
+  // bit-identical packets (0/2048 events mismatched). Ext returns ONLY the
+  // latest packet per event — exactly the generation every consumer here
+  // already assumes (v3 sweep reads the current generation). Resolved once
+  // via dlsym (zeDriverGetExtensionFunctionAddress is broken on this
+  // loader/driver pair); falls back to the legacy query on any mismatch or
+  // error. Enabled with UNITRACE_TS_EXT=1.
+  // -----------------------------------------------------------------------
+  static bool UseExtKernelTimestamps() {
+    static const bool use = [] {
+      const char *e = getenv("UNITRACE_TS_EXT");
+      return e != nullptr && e[0] == '1';
+    }();
+    return use;
+  }
+
+  static ze_result_t QueryLatestTimestamp(ze_event_handle_t event,
+                                          ze_kernel_timestamp_result_t *ts) {
+    if (UseExtKernelTimestamps()) {
+      using pfn_t = ze_result_t (*)(ze_event_handle_t, ze_device_handle_t, uint32_t *,
+                                    ze_event_query_kernel_timestamps_results_ext_properties_t *);
+      static pfn_t pfn = []() -> pfn_t {
+        return reinterpret_cast<pfn_t>(dlsym(RTLD_DEFAULT, "zeEventQueryKernelTimestampsExt"));
+      }();
+      static ze_device_handle_t cached_dev = []() -> ze_device_handle_t {
+        ze_device_handle_t d = nullptr;
+        devices_mutex_.lock_shared();
+        if (devices_ != nullptr && !devices_->empty()) d = devices_->begin()->first;
+        devices_mutex_.unlock_shared();
+        return d;
+      }();
+      if (pfn != nullptr && cached_dev != nullptr) {
+        uint32_t cnt = 0;
+        ze_event_query_kernel_timestamps_results_ext_properties_t res{};
+        res.stype = ZE_STRUCTURE_TYPE_EVENT_QUERY_KERNEL_TIMESTAMPS_RESULTS_EXT_PROPERTIES;
+        if (pfn(event, cached_dev, &cnt, NULL) == ZE_RESULT_SUCCESS && cnt > 0) {
+          res.pKernelTimestampsBuffer = ts;
+          if (pfn(event, cached_dev, &cnt, &res) == ZE_RESULT_SUCCESS) {
+            return ZE_RESULT_SUCCESS;
+          }
+        }
+      }
+    }
+    return ZE_FUNC(zeEventQueryKernelTimestamp)(event, ts);
+  }
+
   // Graph replay fix: a kernel-timestamp packet read that cannot belong to this
   // command's own execution — low-32 sentinel (erased start), end<start (torn
   // read across packet writes), or end far before this replay's submit tick
@@ -3096,11 +3879,1273 @@ class ZeCollector {
            timestamp.global.kernelEnd + 1000000ull < command->submit_time_device_;
   }
 
-  inline void ProcessCommandSubmitted(ZeDeviceSubmissions& submissions, ZeCommand *command, std::vector<uint64_t> *kids, bool on_event) {
+  // -----------------------------------------------------------------------
+  // Graph replay fix v3.1 (collection tax): a step-boundary sweep used to run
+  // one zeEventQueryKernelTimestamp ioctl per replayed command serially inside
+  // the app's sync call (measured 40-60ms per decode step on vLLM XPU-graph
+  // replay). The commands bound to the event the app waited on are
+  // known-complete, so their timestamps are prefetched with helper threads;
+  // consumption below stays serial and in list order, preserving the v3
+  // pending-clone semantics. Read-only on collector state.
+  // -----------------------------------------------------------------------
+  static constexpr size_t kTsPrefetchMinCommands = 32;  // only bother past this many bound commands
+  static constexpr size_t kTsPrefetchChunk = 32;        // min commands per helper thread
+  static constexpr unsigned kTsPrefetchThreads = 8;     // workers incl. the caller
+
+  struct ZePrefetchedTs {
+    bool valid = false;
+    ze_result_t status = ZE_RESULT_NOT_READY;
+    ze_kernel_timestamp_result_t ts{};
+    TsSnapshotV2 snap{};
+  };
+
+  void PrefetchTimestampsParallel(const std::vector<ZeCommand *> &cmds,
+                                  std::vector<ZePrefetchedTs> &out) {
+    const size_t n = cmds.size();
+    out.assign(n, ZePrefetchedTs{});
+    unsigned hw = std::thread::hardware_concurrency();
+    unsigned nthreads = std::min<unsigned>(kTsPrefetchThreads, hw ? hw : 1u);
+    nthreads = std::min<unsigned>(static_cast<unsigned>((n + kTsPrefetchChunk - 1) / kTsPrefetchChunk), nthreads);
+    if (nthreads < 1) nthreads = 1;
+    std::atomic<size_t> next(0);
+    auto worker = [&]() {
+      for (;;) {
+        size_t i = next.fetch_add(1);
+        if (i >= n) break;
+        out[i].status = QueryLatestTimestamp(cmds[i]->event_, &out[i].ts);
+        out[i].valid = (out[i].status == ZE_RESULT_SUCCESS);
+      }
+    };
+    std::vector<std::thread> threads;
+    threads.reserve(nthreads - 1);
+    for (unsigned t = 1; t < nthreads; t++) threads.emplace_back(worker);
+    worker();
+    for (auto &th : threads) th.join();
+  }
+
+  // -----------------------------------------------------------------------
+  // T6' (plan E6, collection tax): per-replay batched kernel-timestamp read
+  // for graph replay commands. Enabled with UNITRACE_GRAPH_BATCH_QKT=1
+  // (default OFF = byte-identical legacy behaviour). Diagnostics with
+  // UNITRACE_DEBUG_BATCHQKT=1 ([BATCHQKT] lines, Fix B [DEFER] style).
+  //
+  // Graph replay clones all captured commands onto ONE shared completion
+  // event, so a step-boundary sweep used to run one
+  // zeEventQueryKernelTimestamp ioctl per clone (~60us each -> ~51ms per
+  // decode step at ~800 commands). Because every sweep that participates here
+  // only processes a clone after its event is proven signaled, all clones of
+  // the replay are complete at that point and their packets can be read with a
+  // single device-side batch: zeCommandListAppendQueryKernelTimestamps (QA
+  // form: no signal event) on a collector-owned persistent immediate command
+  // list + one zeCommandListHostSynchronize. The driver allocates ~2MB of
+  // internal staging per call — acceptable at per-replay frequency (per-kernel
+  // frequency is what killed Fix C). Verified against the per-event path in
+  // the T3 e2 micro bench: 828 events, p50 488us, packets byte-identical,
+  // 1000-iteration longrun without hang. That signaled-first ordering is also
+  // the protection against the driver's not-ready hot spin.
+  //
+  // Scope: only clones with graph_command_ set. Eager / immediate commands
+  // keep the Fix B / inline paths untouched.
+  //
+  // v3 — accumulate early, consume late. The gq1b run showed why per-sweep
+  // collect+execute cannot reach the micro-proven shape: the batch armed at
+  // whichever sweep happened to run mid-step and only the ~40 clones complete
+  // at that instant joined it (n=37..55, ~88us/event once the ~2-4ms fixed
+  // staging cost per append is amortized over so few), while the loop then
+  // paid the full legacy per-event tax for the remaining ~95%. v3 inverts the
+  // flow: in EVERY sweep a pending graph clone is skipped by the legacy
+  // branches (no status call, no query — it simply stays queued) and the
+  // accumulated clones are flushed as ONE batch per replay at the point where
+  // the whole step is provably complete: the graph replay staging drain.
+  // PrepareGraphExecution host-synchronizes every list holding in-flight
+  // clones of this graph BEFORE its pre-staging
+  // ProcessAllCommandsSubmitted(nullptr), so at that drain every pending
+  // clone's shared event is signaled and one numEvents=pending batch replaces
+  // the step's ~800 ioctls (~500us, micro T3_e2micro). OnSignaledEvent sweeps
+  // deliberately do NOT execute the batch: with events latched until the
+  // batch resets them, a matched-event trigger would re-fire on every poll
+  // and fragment the batch again, and the polled event is not proven to gate
+  // the whole step. Fence/teardown drains keep a readiness-gated flush as the
+  // backstop so pending clones never outlive a destroy (see
+  // ReleaseGraphResources). Pending is naturally bounded: a staging drain
+  // always precedes the next replay's staging, so at most one replay's clones
+  // (<= ~800) can be queued at a time — v4b relaxes this to at most two
+  // replays (the drain-deferred emit of replay N + the live clones of N+1),
+  // still bounded, see the v4b note below. Emit order is list order (cursor
+  // match); TSBAD, kids, the pending-clone event reset and the Fix B
+  // interaction are unchanged — only WHEN the packet is read moved.
+  //
+  // v4 — batch the resets too. The QKT read is ~4ms per replay, but the
+  // consume loop that follows it still reset every clone's shared event with
+  // its own zeEventHostReset ioctl (~770 of them, ~82us each): at the staging
+  // drain the device is idle, so those ioctls are fully serial on the app's
+  // critical path — ~63ms per step, i.e. the whole +65ms ITL the gate was
+  // measured to cost. Legacy mode pays the same ioctls but spreads them over
+  // poll sweeps where they overlap device execution, which is why only the
+  // batched shape exposes them. v4 parks the handle in
+  // graph_events_pending_reset_ when the last pending clone of an event has
+  // read it (EventHistoryDeferGraphEventReset) and resets the whole parked set
+  // at the sweep end with N zeCommandListAppendEventReset appends on the SAME
+  // collector-owned immediate list the QKT batch uses + ONE
+  // zeCommandListHostSynchronize (FlushGraphEventResets -> BatchQktResetEvents).
+  // Ordering is what makes that safe: the flush runs before the sweep returns,
+  // so the events are un-signaled before PrepareGraphExecution's clone loop
+  // re-signals them, and it runs after the packet read, so no clone of a
+  // parked event can lose its packet. Everything that cannot be batched falls
+  // back to the exact v3 host reset. UNITRACE_GRAPH_BATCH_QKT_RESET=0 puts
+  // the resets back on the v3 per-event path (A/B knob, default on).
+  //
+  // v4b — split the flush: read at the drain, emit at the next poll. gq3
+  // (v4 in, reset batching verified: reset_batched == cmds, fallback=0,
+  // reset_max_us=1313) DISPROVED the reset-dominance theory: ITL stayed at
+  // ~149 with the drain window still ~68ms and 100% device-idle. The drain's
+  // cost decomposes into ~7ms batch read + ~1.3ms batched resets + ~58ms
+  // consume+emit (~770 clones x ~75us of record machinery; FLOW=0 did not
+  // move it, so it is the base record path, not flow arrows). That emit is
+  // the OUTPUT — irreducible, only relocateable — and legacy's only advantage
+  // was that poll sweeps happen while the device is busy, so the same host
+  // work overlapped instead of serializing. v4b keeps the READ at the drain,
+  // because that is the last moment the packets are provably still this
+  // generation's: the captured commands reuse the same physical events, so
+  // once the next replay is staged and submitted the device overwrites them
+  // (a read taken at a later sweep would silently attach the new generation's
+  // ticks to the previous one's instances — no TSBAD, just wrong records).
+  // The drain's list host-synchronize proves the whole replay complete before
+  // that read, and that proof travels with the batch: the armed packets are
+  // final, so the emit pass needs no readiness gate and cannot read a packet
+  // twice. The EMIT then runs at the top of the first sweep after the drain —
+  // the app's poll of the replayed graph, which fires while the device
+  // executes the new step — i.e. in legacy's hiding spot, without v2's
+  // fragmentation (the v3 skip-legacy still keeps intermediate sweeps from
+  // consuming clones; only the armed, already-read batch is emitted). If the
+  // app never polls between steps, the next drain's backstop pass emits the
+  // armed batch itself: same cost as v4, nothing lost but the overlap.
+  // See BatchQktArmDeferredEmit / BatchQktConsumeDeferredEmit.
+  //
+  // v4c — move the READ's wait off the drain too (UNITRACE_GRAPH_QKT_AT_POLL,
+  // default OFF = byte-identical v4b). New IFWI made the device faster
+  // (bare-graph ITL 82.0 -> 73.46) while v4b's absolute cost stayed put, so
+  // the drain's ~6.4ms QKT read became the tax body (q14l/q14t: +15.6% > the
+  // 10% line, vs +3.1% before). The naive shape — read step N's events at a
+  // later sweep, after step N+1 is staged — is WRONG for the same reason v4b
+  // kept the read at the drain: the captured commands reuse the same physical
+  // events, so a later read returns the NEXT generation's ticks (or a
+  // not-ready event), with no TSBAD to catch it. What CAN move is the wait:
+  // the batch append is issued at a device-busy poll sweep while the replay
+  // it belongs to is still executing, with numWaitEvents = the very event set
+  // it reads, so the DEVICE parks the query until the step's last kernel
+  // signals and then reads the packets — still this generation's, because
+  // nothing has reset or re-signaled them yet. The drain then only pays one
+  // HostSynchronize (the wait resolved when the step ended) + the memcpy and
+  // runs the UNCHANGED v4b arm. Ordering proof is the same chain as v4b, now
+  // host-sequenced: sync(poll read) -> memcpy -> arm/release ->
+  // FlushGraphEventResets (append + sync on the regular imm list) -> clone
+  // loop re-signals -> next graph submit. The read can never overlap a reset
+  // or a re-signal, because the host does not append the reset until the read
+  // completed. Armed clones are NOT touched by the arm (no deferred_ts_, no
+  // event release, no pending-counter change, no readiness status call), so
+  // every skip/failure path falls back to the exact v4b drain read with
+  // nothing to unwind; liveness of the handles comes from the event cache
+  // (the same QueryEvent gate BatchQktResetEvents uses). See
+  // BatchQktArmPollRead / BatchQktCompletePollRead.
+  // -----------------------------------------------------------------------
+  static constexpr size_t kBatchQktMinCommands = 2;  // below this the append+sync round trip is not worth it
+  // Stack budget for per-sweep readiness memoization over DISTINCT events
+  // (one status call per event, not per clone). Beyond it the check degrades
+  // to per-clone — never unsound.
+  static constexpr size_t kBatchQktMaxDistinctEvents = 64;
+
+  // Reentrancy guard for the collector's own L0 calls made inside the batch
+  // (the collection pass' zeEventQueryStatus and the immediate-list
+  // append/synchronize): their tracing callbacks re-enter these sweeps, which
+  // would deadlock on the submission lock the batch already holds. Same
+  // pattern as Fix B's uni_defer_on_completer_thread_.
+  //
+  // v3: the flush sweeps hold this guard across their WHOLE collect+execute
+  // +consume window, not just the batch's own L0 calls. Inside that window a
+  // tail's inline event reset (or eager ReleaseEvent) comes back through the
+  // tracing layer (zeEventHostResetOnEnter / zeEventDestroyOnEnter) and used
+  // to re-enter a sweep here; under the exclusive-locked drain that nested
+  // sweep takes lock_shared on a mutex this thread holds exclusively
+  // (deadlock), and under the shared-locked sweeps it can re-match the
+  // command that is mid-consumption in the outer loop (double tail, iterator
+  // erase twice). The pending-clone counter already guarantees nothing else
+  // needs consuming when the last clone's reset fires, so the nested rescan
+  // is pure hazard; suppressing it changes no observable output. The helpers
+  // save/restore the flag so the window composes with their own inner guard.
+  static inline thread_local bool uni_batchqkt_in_batch_ = false;
+
+  static bool BatchQktEnvEnabled(void) {
+    static const bool enabled = []() {
+      const char *e = std::getenv("UNITRACE_GRAPH_BATCH_QKT");
+      return (e != nullptr && e[0] == '1' && e[1] == '\0');
+    }();
+    return enabled;
+  }
+
+  static bool BatchQktDiagEnabled(void) {
+    static const bool enabled = (std::getenv("UNITRACE_DEBUG_BATCHQKT") != nullptr);
+    return enabled;
+  }
+
+  // E6-v4c A/B knob: arm the step's batch read at a device-busy poll sweep
+  // (device-side wait on the step's own events) instead of appending +
+  // synchronizing it at the staging drain. Absent (or anything but exactly
+  // "1") keeps the v4b shape byte-for-byte.
+  static bool QktAtPollEnvEnabled(void) {
+    static const bool enabled = []() {
+      const char *e = std::getenv("UNITRACE_GRAPH_QKT_AT_POLL");
+      return (e != nullptr && e[0] == '1' && e[1] == '\0');
+    }();
+    return enabled;
+  }
+
+  // Master gate of the poll-armed read. Inherits the batch gate's TSLOG2
+  // force-off (diagnosis modes keep their exact inline ordering) and is false
+  // whenever UNITRACE_GRAPH_BATCH_QKT is unset.
+  inline bool BatchQktAtPollActive(void) {
+    return BatchQktActive() && QktAtPollEnvEnabled();
+  }
+
+  // Master gate. TSLOG2 diagnosis modes force the legacy per-event query path
+  // so their exact inline-ordering guarantees hold (one notice line).
+  inline bool BatchQktActive(void) {
+    if (!uni_batchqkt_enabled_.load(std::memory_order_relaxed)) {
+      return false;
+    }
+    if (Tslog2Mode() != 0) {
+      if (!uni_batchqkt_ts2_notice_.exchange(true, std::memory_order_relaxed)) {
+        std::cerr << "[BATCHQKT] UNITRACE_GRAPH_BATCH_QKT ignored: UNITRACE_DEBUG_TS2="
+                  << Tslog2Mode() << " active, keeping the legacy per-event query path" << std::endl;
+      }
+      return false;
+    }
+    return true;
+  }
+
+  // Readiness of one clone's shared event, memoized per sweep over DISTINCT
+  // events: a graph whose clones share one step event costs ONE status call
+  // for the whole pending set no matter how many clones carry it, while
+  // multi-event graphs still get every event checked (and only clones whose
+  // event is proven signaled join the batch — that ordering stays the
+  // not-ready hot-spin protection). Past the set capacity the memoization
+  // degrades to per-clone calls, which is slower but never unsound.
+  bool BatchQktEventReady(ze_event_handle_t event, ze_event_handle_t known_signaled,
+                          ze_event_handle_t (&seen)[kBatchQktMaxDistinctEvents],
+                          bool (&ready)[kBatchQktMaxDistinctEvents],
+                          size_t &seen_count) {
+    if (event == known_signaled) {
+      return true;
+    }
+    for (size_t i = 0; i < seen_count; i++) {
+      if (seen[i] == event) {
+        return ready[i];
+      }
+    }
+    const bool is_ready = (ZE_FUNC(zeEventQueryStatus)(event) == ZE_RESULT_SUCCESS);
+    if (seen_count < kBatchQktMaxDistinctEvents) {
+      seen[seen_count] = event;
+      ready[seen_count] = is_ready;
+      seen_count++;
+    }
+    return is_ready;
+  }
+
+  // Collects graph replay clones from one submission list, in list order,
+  // whose shared events are proven signaled (per-distinct-event gate, see
+  // BatchQktEventReady). `known_signaled` is the event whose signal the sweep
+  // caller already proved (the polled event); clones bound to it join without
+  // a status call. Eager commands are never collected. The reentrancy guard
+  // keeps the status calls' tracing callbacks from re-entering a sweep while
+  // the submission lock is held.
+  void BatchQktCollectReady(std::list<ZeCommand *> &commands_submitted,
+                            ze_event_handle_t known_signaled, ZeBatchQkt &batch) {
+    batch.ok = false;
+    batch.cursor = 0;
+    batch.cmds.clear();
+    batch.ts.clear();
+    size_t seen = 0;
+    ze_event_handle_t seen_events[kBatchQktMaxDistinctEvents] = {};
+    bool seen_ready[kBatchQktMaxDistinctEvents] = {};
+    size_t seen_count = 0;
+    const bool prev_guard = uni_batchqkt_in_batch_;
+    uni_batchqkt_in_batch_ = true;
+    for (ZeCommand *command : commands_submitted) {
+      if (!command->graph_command_ || command->event_ == nullptr ||
+          command->device_global_timestamps_ != nullptr ||
+          command->timestamps_on_event_reset_ != nullptr ||
+          command->deferred_ts_ != nullptr) {  // E6-v4b: packet read, emit pending
+        continue;
+      }
+      seen++;
+      if (BatchQktEventReady(command->event_, known_signaled, seen_events, seen_ready, seen_count)) {
+        batch.cmds.push_back(command);
+      }
+    }
+    uni_batchqkt_in_batch_ = prev_guard;
+    BatchQktAccountSweep(seen, batch.cmds.size());
+  }
+
+  // All-submissions variant of BatchQktCollectReady for the generic drain
+  // (same per-distinct-event readiness gate, no known-signaled shortcut).
+  // Called with the sweep's exclusive submission lock held.
+  void BatchQktCollectStatusGated(ZeBatchQkt &batch) {
+    batch.ok = false;
+    batch.cursor = 0;
+    batch.cmds.clear();
+    batch.ts.clear();
+    size_t seen = 0;
+    ze_event_handle_t seen_events[kBatchQktMaxDistinctEvents] = {};
+    bool seen_ready[kBatchQktMaxDistinctEvents] = {};
+    size_t seen_count = 0;
+    const bool prev_guard = uni_batchqkt_in_batch_;
+    uni_batchqkt_in_batch_ = true;
+    if (global_device_submissions_ != nullptr) {
+      for (auto s : *global_device_submissions_) {
+        for (ZeCommand *command : s->commands_submitted_) {
+          if (!command->graph_command_ || command->event_ == nullptr ||
+              command->device_global_timestamps_ != nullptr ||
+              command->timestamps_on_event_reset_ != nullptr ||
+              command->deferred_ts_ != nullptr) {  // E6-v4b: packet read, emit pending
+            continue;
+          }
+          seen++;
+          if (BatchQktEventReady(command->event_, nullptr, seen_events, seen_ready, seen_count)) {
+            batch.cmds.push_back(command);
+          }
+        }
+      }
+    }
+    uni_batchqkt_in_batch_ = prev_guard;
+    BatchQktAccountSweep(seen, batch.cmds.size());
+  }
+
+  // Diagnostics: how many batch-enabled sweeps saw graph clones, how many
+  // clones were seen in total and how many actually joined a batch. With the
+  // gq1 zero-batch signature these three counters localize the failing stage:
+  // sweeps=0 -> the gate never armed; seen>0 collected=0 -> clones present but
+  // never ready at sweep time; collected>0 batches=0 -> BatchQktExecute bailed
+  // (its one-shot [BATCHQKT] skip lines name the reason).
+  void BatchQktAccountSweep(size_t seen, size_t collected) {
+    if (seen == 0) {
+      return;
+    }
+    uni_batchqkt_sweeps_.fetch_add(1, std::memory_order_relaxed);
+    uni_batchqkt_seen_.fetch_add(seen, std::memory_order_relaxed);
+    uni_batchqkt_collected_.fetch_add(collected, std::memory_order_relaxed);
+    if (collected == 0 &&
+        !uni_batchqkt_notice_notsig_.exchange(true, std::memory_order_relaxed) &&
+        BatchQktDiagEnabled()) {
+      // v3: expected for mid-step accumulate sweeps — the clones flush at the
+      // next staging drain, so this only names a sweep where nothing was
+      // ready to join a flush that ran.
+      std::cerr << "[BATCHQKT] seen=" << seen
+                << " graph clones, none signaled at this sweep (accumulate mode: flush at the next drain)" << std::endl;
+    }
+  }
+
+  // Cursor match: returns the batched packet when `command` is the next
+  // batched command in sweep order, nullptr otherwise (O(1) per command; the
+  // collection and the consuming loop walk the same lists in the same order).
+  inline const ze_kernel_timestamp_result_t *BatchQktTake(ZeBatchQkt &batch, ZeCommand *command) {
+    if (!batch.ok || batch.cursor >= batch.cmds.size() || batch.cmds[batch.cursor] != command) {
+      return nullptr;
+    }
+    return &batch.ts[batch.cursor++];
+  }
+
+  // v3 accumulate predicate: this clone's packet belongs to the pending batch
+  // and is consumed at the next flush (staging drain or a fence/teardown
+  // backstop), so the sweep must NOT touch it — no status call, no query, no
+  // legacy consumption. Passing `armed=false` (gate off, TS2 force-off, or a
+  // batch that just failed) keeps the clone on the legacy inline path, which
+  // is the whole fallback chain. Clones reading host buffers never accumulate
+  // (they were never batchable).
+  // E6-v4b: a clone whose packet is already read and whose emit is deferred
+  // (deferred_ts_) accumulates regardless of `armed` — its packet must come
+  // from the held buffer, never from a fresh query, and it must stay queued
+  // until its emit runs. deferred_ts_ is only ever set with the gate on, so
+  // the gate-off path is unchanged.
+  inline bool BatchQktAccumulate(const ZeCommand *command, bool armed) const {
+    return (armed || command->deferred_ts_ != nullptr) &&
+           command->graph_command_ && command->event_ != nullptr &&
+           command->device_global_timestamps_ == nullptr &&
+           command->timestamps_on_event_reset_ == nullptr;
+  }
+
+  // E6-v4c: the clone set a poll-armed read may cover. Same batchable shape
+  // as BatchQktAccumulate, but a clone whose packet is already read and whose
+  // emit is deferred (deferred_ts_) is EXCLUDED here — it is waiting for its
+  // emit pass, not for a read, and re-arming over it would double-consume its
+  // pending counter and overwrite the emit slot the emit pass is about to
+  // read. Unlike the drain's collect there is NO readiness gate: the device
+  // waits for the events (numWaitEvents == numEvents), which is the whole
+  // point — the read is issued while the step is still running. The protection
+  // a readiness gate used to give a dead handle is replaced by the event-cache
+  // ownership check (same gate BatchQktResetEvents applies before appending a
+  // parked handle), so a clone stranded by a destroyed graph can never reach
+  // the poll list.
+  bool BatchQktPollBatchable(ZeCommand *command) {
+    if (command->deferred_ts_ != nullptr) {
+      return false;  // E6-v4b: packet read, emit pending — not ours to read
+    }
+    if (!command->graph_command_ || command->event_ == nullptr ||
+        command->device_global_timestamps_ != nullptr ||
+        command->timestamps_on_event_reset_ != nullptr) {
+      return false;
+    }
+    return event_cache_.QueryEvent(command->event_);
+  }
+
+  // One compute-capable queue ordinal per device, for the immediate list. The
+  // bool says whether one was found; 0 is a valid ordinal, hence the wrapper.
+  bool BatchQktComputeOrdinal(ze_device_handle_t device, uint32_t &ordinal) {
+    auto it = uni_batchqkt_ordinals_.find(device);
+    if (it != uni_batchqkt_ordinals_.end()) {
+      ordinal = it->second.first;
+      return it->second.second;
+    }
+    uint32_t count = 0;
+    bool found = false;
+    uint32_t pick = 0;
+    ze_result_t status = ZE_FUNC(zeDeviceGetCommandQueueGroupProperties)(device, &count, nullptr);
+    if (status == ZE_RESULT_SUCCESS && count > 0) {
+      std::vector<ze_command_queue_group_properties_t> props(count);
+      status = ZE_FUNC(zeDeviceGetCommandQueueGroupProperties)(device, &count, props.data());
+      if (status == ZE_RESULT_SUCCESS) {
+        for (uint32_t i = 0; i < count; i++) {
+          if (props[i].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COMPUTE) {
+            pick = i;
+            found = true;
+            break;
+          }
+        }
+      }
+    }
+    if (!found) {
+      std::cerr << "[BATCHQKT] no compute queue ordinal found, graph replay timestamps stay on the per-event path" << std::endl;
+    }
+    uni_batchqkt_ordinals_[device] = {pick, found};
+    ordinal = pick;
+    return found;
+  }
+
+  // Collector-owned persistent immediate command list, lazily created per
+  // context. A nullptr entry means creation failed: permanently fall back to
+  // the legacy per-event path for that context (no retry storm, one line).
+  ze_command_list_handle_t BatchQktEnsureImmList(ze_context_handle_t context, ze_device_handle_t device) {
+    auto it = uni_batchqkt_imm_lists_.find(context);
+    if (it != uni_batchqkt_imm_lists_.end()) {
+      return it->second;
+    }
+    uint32_t ordinal = 0;
+    ze_command_list_handle_t imm = nullptr;
+    if (BatchQktComputeOrdinal(device, ordinal)) {
+      ze_command_queue_desc_t qdesc = {};
+      qdesc.stype = ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC;
+      qdesc.ordinal = ordinal;
+      qdesc.index = 0;
+      qdesc.mode = ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS;
+      qdesc.priority = ZE_COMMAND_QUEUE_PRIORITY_NORMAL;
+      ze_result_t status = ZE_FUNC(zeCommandListCreateImmediate)(context, device, &qdesc, &imm);
+      if (status != ZE_RESULT_SUCCESS) {
+        imm = nullptr;
+      }
+    }
+    if (imm == nullptr) {
+      std::cerr << "[BATCHQKT] immediate command list creation failed, graph replay timestamps stay on the per-event path" << std::endl;
+    }
+    uni_batchqkt_imm_lists_[context] = imm;
+    return imm;
+  }
+
+  // E6-v4c: a SECOND collector-owned immediate list per context, used only by
+  // the poll-armed read. Keeping it off the drain/reset list means nothing
+  // else the collector appends (reset batches, a fallback BatchQktExecute) can
+  // ever end up behind a waiting read — only this list ever hosts a
+  // device-side wait, and only the drain that owns the arm synchronizes it.
+  ze_command_list_handle_t BatchQktEnsurePollList(ze_context_handle_t context,
+                                                  ze_device_handle_t device) {
+    auto it = uni_batchqkt_poll_lists_.find(context);
+    if (it != uni_batchqkt_poll_lists_.end()) {
+      return it->second;
+    }
+    uint32_t ordinal = 0;
+    ze_command_list_handle_t imm = nullptr;
+    if (BatchQktComputeOrdinal(device, ordinal)) {
+      ze_command_queue_desc_t qdesc = {};
+      qdesc.stype = ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC;
+      qdesc.ordinal = ordinal;
+      qdesc.index = 0;
+      qdesc.mode = ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS;
+      qdesc.priority = ZE_COMMAND_QUEUE_PRIORITY_NORMAL;
+      ze_result_t status = ZE_FUNC(zeCommandListCreateImmediate)(context, device, &qdesc, &imm);
+      if (status != ZE_RESULT_SUCCESS) {
+        imm = nullptr;
+      }
+    }
+    if (imm == nullptr) {
+      if (!uni_batchqkt_notice_polllist_.exchange(true, std::memory_order_relaxed) &&
+          BatchQktDiagEnabled()) {
+        std::cerr << "[BATCHQKT] poll immediate command list creation failed, "
+                  << "QKT_AT_POLL stays on the drain read for this context" << std::endl;
+      }
+    }
+    uni_batchqkt_poll_lists_[context] = imm;
+    return imm;
+  }
+
+  // Persistent host staging buffer for the batch packets, grown on demand and
+  // reused across replays. At most one batch is ever in flight: the next
+  // append is only issued after the previous zeCommandListHostSynchronize
+  // returned, and the packets are copied out before this returns.
+  // E6-v4c: the core is shared with the poll read's own buffer map, so a poll
+  // read's packets can never be clobbered by a drain-side execute (they live
+  // in different allocations for the whole life of an arm).
+  void *BatchQktEnsureBufferIn(std::map<ze_context_handle_t, void *> &bufs,
+                               std::map<ze_context_handle_t, size_t> &caps,
+                               ze_context_handle_t context, size_t bytes) {
+    void *&buf = bufs[context];
+    size_t &cap = caps[context];
+    if (buf != nullptr && cap >= bytes) {
+      return buf;
+    }
+    size_t want = ((bytes + 4095) / 4096) * 4096;  // page-granular, cache-line safe
+    if (buf != nullptr) {
+      ZE_FUNC(zeMemFree)(context, buf);
+      buf = nullptr;
+      cap = 0;
+    }
+    ze_host_mem_alloc_desc_t host_desc = {};
+    host_desc.stype = ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC;
+    ze_result_t status = ZE_FUNC(zeMemAllocHost)(context, &host_desc, want, 64, &buf);
+    if (status != ZE_RESULT_SUCCESS) {
+      buf = nullptr;
+      cap = 0;
+      return nullptr;
+    }
+    cap = want;
+    return buf;
+  }
+
+  void *BatchQktEnsureBuffer(ze_context_handle_t context, size_t bytes) {
+    return BatchQktEnsureBufferIn(uni_batchqkt_bufs_, uni_batchqkt_buf_caps_, context, bytes);
+  }
+
+  // Reads the packets of all collected commands in one device-side batch, then
+  // copies them out. Returns true on success (batch.ok set, consume via
+  // BatchQktTake); false = this step falls back to the legacy per-event path
+  // (the batch is emptied so the cursor never matches).
+  bool BatchQktExecute(ZeBatchQkt &batch) {
+    batch.ok = false;
+    const size_t n = batch.cmds.size();
+    if (n < kBatchQktMinCommands) {
+      // v2: no longer silent — a persistent below-min batch on a graph ladder
+      // means the replay step is fragmented into tiny clone groups.
+      if (!uni_batchqkt_notice_min_.exchange(true, std::memory_order_relaxed) &&
+          BatchQktDiagEnabled()) {
+        std::cerr << "[BATCHQKT] skip: n=" << n << " below min=" << kBatchQktMinCommands << std::endl;
+      }
+      batch.cmds.clear();
+      return false;
+    }
+    if (!ZE_HAVE_FUNC(zeCommandListCreateImmediate) ||
+        !ZE_HAVE_FUNC(zeCommandListAppendQueryKernelTimestamps) ||
+        !ZE_HAVE_FUNC(zeCommandListHostSynchronize) ||
+        !ZE_HAVE_FUNC(zeMemAllocHost) || !ZE_HAVE_FUNC(zeMemFree)) {
+      if (!uni_batchqkt_notice_syms_.exchange(true, std::memory_order_relaxed) &&
+          BatchQktDiagEnabled()) {
+        std::cerr << "[BATCHQKT] skip: loader symbols missing" << std::endl;
+      }
+      batch.cmds.clear();
+      return false;
+    }
+    // All batched clones must share one context/device: they come from one
+    // graph replay, so this only bails out for exotic mixed-graph sweeps.
+    ze_context_handle_t context = batch.cmds.front()->context_;
+    ze_device_handle_t device = batch.cmds.front()->device_;
+    if (context == nullptr || device == nullptr) {
+      if (!uni_batchqkt_notice_ctx_.exchange(true, std::memory_order_relaxed) &&
+          BatchQktDiagEnabled()) {
+        std::cerr << "[BATCHQKT] skip: clone context/device unresolved (context_=0 on staged clones)"
+                  << std::endl;
+      }
+      batch.cmds.clear();
+      return false;
+    }
+    std::vector<ze_event_handle_t> events(n);
+    for (size_t i = 0; i < n; i++) {
+      if (batch.cmds[i]->context_ != context || batch.cmds[i]->device_ != device) {
+        if (!uni_batchqkt_notice_mixed_.exchange(true, std::memory_order_relaxed) &&
+            BatchQktDiagEnabled()) {
+          std::cerr << "[BATCHQKT] skip: mixed context/device in one sweep" << std::endl;
+        }
+        batch.cmds.clear();
+        return false;
+      }
+      events[i] = batch.cmds[i]->event_;
+    }
+
+    std::lock_guard<std::mutex> lk(uni_batchqkt_mutex_);
+    ze_command_list_handle_t imm = BatchQktEnsureImmList(context, device);
+    void *dst = (imm != nullptr) ? BatchQktEnsureBuffer(context, n * sizeof(ze_kernel_timestamp_result_t)) : nullptr;
+    if (imm == nullptr || dst == nullptr) {
+      batch.cmds.clear();
+      uni_batchqkt_fallback_count_.fetch_add(1, std::memory_order_relaxed);
+      return false;
+    }
+
+    const bool prev_guard = uni_batchqkt_in_batch_;
+    uni_batchqkt_in_batch_ = true;  // our L0 calls must not re-enter the sweeps
+    auto t0 = std::chrono::steady_clock::now();
+    ze_result_t status = ZE_FUNC(zeCommandListAppendQueryKernelTimestamps)(
+        imm, static_cast<uint32_t>(n), events.data(), dst,
+        /*pOffsets=*/nullptr, /*hSignalEvent=*/nullptr, /*numWaitEvents=*/0, /*phWaitEvents=*/nullptr);
+    if (status == ZE_RESULT_SUCCESS) {
+      status = ZE_FUNC(zeCommandListHostSynchronize)(imm, UINT64_MAX);
+    }
+    auto t1 = std::chrono::steady_clock::now();
+    uni_batchqkt_in_batch_ = prev_guard;
+    if (status != ZE_RESULT_SUCCESS) {
+      // Append may have succeeded and the sync failed (device-lost class of
+      // errors): nothing was consumed from dst, the next batch re-appends.
+      uni_batchqkt_fallback_count_.fetch_add(1, std::memory_order_relaxed);
+      if (BatchQktDiagEnabled()) {
+        std::cerr << "[BATCHQKT] append/synchronize failed (status=0x" << std::hex << status << std::dec
+                  << "), this step falls back to the per-event path" << std::endl;
+      }
+      batch.cmds.clear();
+      return false;
+    }
+
+    batch.ts.resize(n);
+    std::memcpy(batch.ts.data(), dst, n * sizeof(ze_kernel_timestamp_result_t));
+    uint64_t batch_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
+    uint64_t prev = uni_batchqkt_max_batch_us_.load(std::memory_order_relaxed);
+    while (batch_us > prev &&
+           !uni_batchqkt_max_batch_us_.compare_exchange_weak(prev, batch_us, std::memory_order_relaxed)) {
+    }
+    prev = uni_batchqkt_max_n_.load(std::memory_order_relaxed);
+    while (n > prev && !uni_batchqkt_max_n_.compare_exchange_weak(prev, n, std::memory_order_relaxed)) {
+    }
+    uni_batchqkt_batch_count_.fetch_add(1, std::memory_order_relaxed);
+    uni_batchqkt_cmd_count_.fetch_add(n, std::memory_order_relaxed);
+    batch.ok = true;
+    if (BatchQktDiagEnabled()) {
+      std::cerr << "[BATCHQKT] n=" << n << " batch_us=" << batch_us << std::endl;
+    }
+    return true;
+  }
+
+  // -----------------------------------------------------------------------
+  // E6-v4c (UNITRACE_GRAPH_QKT_AT_POLL=1): arm the step's batch read at a
+  // device-busy sweep instead of at the staging drain. The append is issued
+  // with numWaitEvents == numEvents (the SAME event set the query reads), so
+  // the device parks the query until every event of the running replay has
+  // signaled and only then captures the packets into the poll buffer. The
+  // packets are therefore read exactly once, at the same generation boundary
+  // v4b reads them (all events signaled, nothing reset, nothing re-signaled
+  // yet) — only the WAIT of that read is spent while the device is busy
+  // instead of serially at the drain.
+  //
+  // Deliberately stateless for the clones: no ZeCommand field is written, no
+  // event is released, no pending counter is consumed and no packet is copied
+  // here. Every skip and every failure below simply leaves the clones queued
+  // for the exact v4b drain read, so the fallback chain has nothing to
+  // unwind. Called with the sweep's shared submission lock held (the drain
+  // takes it exclusive, which is what serializes this against
+  // BatchQktCompletePollRead); uni_batchqkt_read_pending_ is exchanged FIRST,
+  // so two sweeps on two lists can never both arm.
+  //
+  // No readiness gate on purpose: gating would re-create v2's fragmentation
+  // (only the clones ready at the one early poll sweep would join, ~2-6% of
+  // the step). The not-ready hot spin the v3 gate protects against cannot
+  // happen here — the wait is device-side (semaphore), not a host status poll.
+  // -----------------------------------------------------------------------
+  void BatchQktArmPollRead(void) {
+    if (!BatchQktAtPollActive() || uni_batchqkt_in_batch_) {
+      return;
+    }
+    if (uni_batchqkt_read_pending_.load(std::memory_order_acquire)) {
+      return;  // this or another thread's step already has its read armed
+    }
+    ZeBatchQktPollRead pr;
+    for (ZeCommand *command : local_device_submissions_.commands_submitted_) {
+      if (!BatchQktPollBatchable(command)) {
+        continue;
+      }
+      if (pr.cmds.empty()) {
+        pr.context = command->context_;
+        pr.device = command->device_;
+      }
+      else if (command->context_ != pr.context || command->device_ != pr.device) {
+        // Mixed pending set (another graph's stranded clones): leave the whole
+        // step to the drain's readiness-gated collect, which handles that.
+        if (!uni_batchqkt_notice_pollmixed_.exchange(true, std::memory_order_relaxed) &&
+            BatchQktDiagEnabled()) {
+          std::cerr << "[BATCHQKT] skip poll arm: mixed context/device in one list" << std::endl;
+        }
+        return;
+      }
+      pr.cmds.push_back(command);
+      pr.events.push_back(command->event_);
+    }
+    const size_t n = pr.cmds.size();
+    if (n < kBatchQktMinCommands) {
+      return;  // nothing worth a batch — the drain path handles it as usual
+    }
+    if (!ZE_HAVE_FUNC(zeCommandListCreateImmediate) ||
+        !ZE_HAVE_FUNC(zeCommandListAppendQueryKernelTimestamps) ||
+        !ZE_HAVE_FUNC(zeCommandListHostSynchronize) ||
+        !ZE_HAVE_FUNC(zeMemAllocHost) || !ZE_HAVE_FUNC(zeMemFree)) {
+      if (!uni_batchqkt_notice_syms_.exchange(true, std::memory_order_relaxed) &&
+          BatchQktDiagEnabled()) {
+        std::cerr << "[BATCHQKT] skip: loader symbols missing" << std::endl;
+      }
+      return;
+    }
+    std::lock_guard<std::mutex> lk(uni_batchqkt_mutex_);
+    // The guard covers the list/buffer creation too (first-time zeMemAllocHost
+    // / zeCommandListCreateImmediate also come back through the tracing layer),
+    // so no nested sweep can observe the half-published arm: the slot flag is
+    // still false until the very end of this function.
+    const bool prev_guard = uni_batchqkt_in_batch_;
+    uni_batchqkt_in_batch_ = true;
+    ze_command_list_handle_t imm = BatchQktEnsurePollList(pr.context, pr.device);
+    void *dst = (imm != nullptr)
+        ? BatchQktEnsureBufferIn(uni_batchqkt_poll_bufs_, uni_batchqkt_poll_buf_caps_,
+                                 pr.context, n * sizeof(ze_kernel_timestamp_result_t))
+        : nullptr;
+    if (imm == nullptr || dst == nullptr) {
+      uni_batchqkt_in_batch_ = prev_guard;
+      return;  // sticky per-context fallback, counted at the drain if it happens
+    }
+    auto t0 = std::chrono::steady_clock::now();
+    ze_result_t status = ZE_FUNC(zeCommandListAppendQueryKernelTimestamps)(
+        imm, static_cast<uint32_t>(n), pr.events.data(), dst,
+        /*pOffsets=*/nullptr, /*hSignalEvent=*/nullptr,
+        /*numWaitEvents=*/static_cast<uint32_t>(n), /*phWaitEvents=*/pr.events.data());
+    auto t1 = std::chrono::steady_clock::now();
+    uni_batchqkt_in_batch_ = prev_guard;
+    if (status != ZE_RESULT_SUCCESS) {
+      // Driver refused the wait-events form (or the list): nothing was
+      // consumed, the events are untouched, the drain does the v4b read.
+      uni_batchqkt_fallback_count_.fetch_add(1, std::memory_order_relaxed);
+      if (!uni_batchqkt_notice_pollappend_.exchange(true, std::memory_order_relaxed) &&
+          BatchQktDiagEnabled()) {
+        std::cerr << "[BATCHQKT] poll append failed (status=0x" << std::hex << status << std::dec
+                  << "), this and later steps stay on the drain read" << std::endl;
+      }
+      return;
+    }
+    pr.list = imm;
+    pr.dst = dst;
+    pr.n = n;
+    pr.append_us =
+        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
+    pr.live = true;
+    // E6-v4c: this sweep is the one that "saw" and collected the step's clones
+    // now (the drain's BatchQktCollectStatusGated is skipped for an armed
+    // read), so the seen/collected/sweeps funnel is accounted here — that is
+    // what keeps seen == collected == cmds comparable with v4b. A failed
+    // append does NOT account: those clones fall through to the drain's own
+    // collect, which counts them exactly once.
+    BatchQktAccountSweep(n, n);
+    uni_batchqkt_poll_read_ = std::move(pr);
+    uni_batchqkt_qkt_append_us_.fetch_add(
+        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count()),
+        std::memory_order_relaxed);
+    // Published last: the flag is what a completing sweep checks (release/acquire).
+    uni_batchqkt_read_pending_.store(true, std::memory_order_release);
+  }
+
+  // Drain-side half of the v4c split: synchronize the armed read (the device
+  // resolved its wait when the step's last kernel signaled, and the drain only
+  // runs after PrepareGraphExecution host-synchronized the graph's lists, so
+  // this returns immediately in the healthy case), copy the packets out and
+  // hand the caller a batch that is byte-for-byte what a v4b BatchQktExecute
+  // would have produced. Returns false (having released the slot) when nothing
+  // was armed or the sync failed — the caller then runs the unchanged v4b
+  // collect + execute, which is safe because an armed read never touched any
+  // clone state. Called with the exclusive submission lock held.
+  bool BatchQktCompletePollRead(ZeBatchQkt &batch) {
+    if (!BatchQktAtPollActive() || !uni_batchqkt_read_pending_.load(std::memory_order_acquire)) {
+      return false;
+    }
+    batch.ok = false;
+    batch.cursor = 0;
+    batch.ts.clear();
+    batch.cmds.clear();
+    // The descriptor's single slot is owned under uni_batchqkt_mutex_ (the
+    // arm writes it under the same mutex), so a fence/teardown sweep on
+    // another thread — which holds only the SHARED submission lock — can
+    // never race the drain's completion here: the second taker finds the flag
+    // cleared and runs the caller's normal path.
+    std::lock_guard<std::mutex> lk(uni_batchqkt_mutex_);
+    if (!uni_batchqkt_read_pending_.load(std::memory_order_acquire)) {
+      return false;
+    }
+    ZeBatchQktPollRead pr = std::move(uni_batchqkt_poll_read_);
+    uni_batchqkt_poll_read_ = ZeBatchQktPollRead();
+    uni_batchqkt_read_pending_.store(false, std::memory_order_release);
+    if (!pr.live || pr.list == nullptr || pr.dst == nullptr || pr.cmds.empty()) {
+      return false;
+    }
+    if (pr.n != pr.cmds.size() || pr.n != pr.events.size()) {
+      // Cannot happen by construction; never let a desynchronized descriptor
+      // reach the memcpy or the cursor match.
+      uni_batchqkt_poll_read_ = ZeBatchQktPollRead();
+      return false;
+    }
+    const size_t n = pr.n;
+    batch.cmds = std::move(pr.cmds);
+    batch.ts.resize(n);
+    const bool prev_guard = uni_batchqkt_in_batch_;
+    uni_batchqkt_in_batch_ = true;  // our L0 calls must not re-enter the sweeps
+    auto t0 = std::chrono::steady_clock::now();
+    ze_result_t status = ZE_FUNC(zeCommandListHostSynchronize)(pr.list, UINT64_MAX);
+    auto t1 = std::chrono::steady_clock::now();
+    uni_batchqkt_in_batch_ = prev_guard;
+    if (status != ZE_RESULT_SUCCESS) {
+      // Nothing was consumed from dst and no clone state changed: the drain
+      // falls through to the v4b collect + execute for these same clones.
+      batch.cmds.clear();
+      batch.ts.clear();
+      uni_batchqkt_fallback_count_.fetch_add(1, std::memory_order_relaxed);
+      if (BatchQktDiagEnabled()) {
+        std::cerr << "[BATCHQKT] poll read synchronize failed (status=0x" << std::hex << status
+                  << std::dec << "), this step falls back to the drain read" << std::endl;
+      }
+      return false;
+    }
+    std::memcpy(batch.ts.data(), pr.dst, n * sizeof(ze_kernel_timestamp_result_t));
+    const uint64_t batch_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
+    uni_batchqkt_qkt_sync_us_.fetch_add(batch_us, std::memory_order_relaxed);
+    // max_batch_us keeps its v4b semantic: the SLOWEST SINGLE batch's
+    // append+sync. The append half was measured at the arm and travels in the
+    // descriptor — do NOT feed the run-cumulative qkt_batch_us here (the
+    // first node3 run reported max_batch_us=136499 exactly because the
+    // cumulative total leaked into this max).
+    const uint64_t one_batch_us = pr.append_us + batch_us;
+    uint64_t prev = uni_batchqkt_max_batch_us_.load(std::memory_order_relaxed);
+    while (one_batch_us > prev &&
+           !uni_batchqkt_max_batch_us_.compare_exchange_weak(prev, one_batch_us,
+                                                             std::memory_order_relaxed)) {
+    }
+    // qkt_batch_us stays the run TOTAL (cost that left the drain).
+    uint64_t total = uni_batchqkt_qkt_append_us_.load(std::memory_order_relaxed) +
+                     uni_batchqkt_qkt_sync_us_.load(std::memory_order_relaxed);
+    uni_batchqkt_qkt_batch_us_.store(total, std::memory_order_relaxed);
+    prev = uni_batchqkt_max_n_.load(std::memory_order_relaxed);
+    while (n > prev && !uni_batchqkt_max_n_.compare_exchange_weak(prev, n, std::memory_order_relaxed)) {
+    }
+    uni_batchqkt_batch_count_.fetch_add(1, std::memory_order_relaxed);
+    uni_batchqkt_cmd_count_.fetch_add(n, std::memory_order_relaxed);
+    uni_batchqkt_qkt_at_poll_.fetch_add(n, std::memory_order_relaxed);
+    batch.ok = true;
+    if (BatchQktDiagEnabled()) {
+      std::cerr << "[BATCHQKT] n=" << n << " poll_read_us=" << batch_us << std::endl;
+    }
+    return true;
+  }
+
+  // -----------------------------------------------------------------------
+  // E6-v4b: split the flush. gq3 (reset batching already in, TSBAD=0,
+  // fallback=0) showed the drain's ~66ms is NOT the resets (1.3ms) and mostly
+  // not the batch read (~7ms) but the consume+emit of ~770 clones (~75us each
+  // of record machinery: call/itt/kernel records + args + fwrite). Legacy hid
+  // that host work inside poll sweeps where the device was busy; v3/v4 run it
+  // at the staging drain, where the device is idle, so it lands on the app's
+  // critical path a second time (+65ms ITL).
+  //
+  // The split point is dictated by packet integrity, not by preference: the
+  // captured commands reuse the SAME physical events on every replay, so once
+  // the next replay is staged/submitted the device overwrites those packets
+  // with the new generation. The READ must therefore happen while the packets
+  // are still this generation's — i.e. at the staging drain, right after the
+  // list host-synchronize proved the whole replay complete and before the
+  // clone loop re-signals the events. The EMIT is pure host work on the
+  // already-copied packets and can run anywhere: it is deferred to the first
+  // sweep after the drain (the app's poll of the replayed graph, which fires
+  // while the device executes the new step), so it overlaps device execution
+  // instead of serializing against an idle device.
+  //
+  // Mechanism: BatchQktArmDeferredEmit copies the batch packets into
+  // uni_batchqkt_emit_buf_ and hangs each command's slot on deferred_ts_
+  // (cleared by GetKernelCommand on recycle, so a recycled command can never
+  // inherit a stale slot). BatchQktConsumeDeferredEmit is the emit pass; it
+  // runs at the top of a sweep, walks the submission lists in the same order
+  // the drain collected them, and consumes exactly the deferred_ts_ commands
+  // through the pre_ts tail — emit order, TSBAD semantics, pending-clone
+  // accounting and the v4 batched resets are unchanged, only WHEN the emit
+  // runs moved. uni_batchqkt_flush_pending_ is the fast-path hint that a sweep
+  // has something to find; the drain's backstop pass ignores it and always
+  // scans, so clones deferred by another thread's staging are never stranded.
+  // Only one arm can be live at a time: arming happens only at the drain,
+  // right after its backstop pass consumed the previous arm, and the
+  // submission lock (shared for a poll pass, exclusive for a drain pass)
+  // serializes arming against consuming.
+  // -----------------------------------------------------------------------
+
+  // Parks a just-executed batch for a later sweep's emit. Called with the
+  // exclusive submission lock held, immediately after BatchQktExecute
+  // succeeded and after the backstop pass consumed any previous arm (so
+  // overwriting uni_batchqkt_emit_buf_ cannot invalidate a live slot).
+  //
+  // This is also where the clone's EVENT is released, not at the emit: the
+  // packets are buffered, so no clone needs the event anymore, and releasing
+  // here keeps the v3/v4 reset timing exactly (the batched reset runs at the
+  // end of THIS drain sweep, before PrepareGraphExecution's clone loop
+  // re-signals the events for the next replay). Releasing at the emit instead
+  // would (a) leave the events latched across the staging — the readiness gate
+  // of the next drain would then collect clones whose packets the device has
+  // already overwritten — and (b) ratchet the per-event pending counter up by
+  // one per generation, so it would never reach zero and never reset.
+  void BatchQktArmDeferredEmit(ZeBatchQkt &batch) {
+    const size_t n = batch.cmds.size();
+    uni_batchqkt_emit_buf_ = batch.ts;  // packets must outlive this sweep
+    for (size_t i = 0; i < n; i++) {
+      ZeCommand *command = batch.cmds[i];
+      command->deferred_ts_ = &uni_batchqkt_emit_buf_[i];
+      BatchQktReleaseArmedEvent(command);
+    }
+    batch.ok = false;  // the drain's own loop must not consume them (BatchQktTake)
+    batch.cursor = 0;
+    batch.cmds.clear();
+    batch.ts.clear();
+    uni_batchqkt_flush_pending_.store(true, std::memory_order_release);
+  }
+
+  // The tail's event-release block, run at arm time for a clone whose emit is
+  // deferred. Identical semantics to the inline path — MarkReset, pending-clone
+  // accounting, and the v4 park-or-host-reset gate — just earlier: the emit
+  // reads the buffered packet, so the event is free the moment the batch read
+  // returned. ProcessCommandSubmittedTail skips this block for a deferred emit
+  // (deferred_emit=true).
+  void BatchQktReleaseArmedEvent(ZeCommand *command) {
+    if (command->event_ == nullptr) {
+      return;
+    }
+    EventHistoryMarkReset(command->event_);  // TSLOG v2: signal state zeroed before packet reset
+    bool reset_now = EventHistoryConsumePending(command->event_);
+    if (!reset_now && !EventHistoryHasPending(command->event_)) {
+      // No pending clones tracked (eager command or untracked event) —
+      // original immediate reset.
+      reset_now = true;
+    }
+    if (reset_now) {
+      if (BatchQktResetBatchActive()) {
+        EventHistoryDeferGraphEventReset(command->context_, command->event_);
+      }
+      else {
+        event_cache_.ResetEvent(command->event_);
+      }
+    }
+    // else: clones of this event are still queued — they must read their
+    // packet; the last one to be armed performs the reset.
+  }
+
+  // Emit pass for the deferred clones: consumes every deferred_ts_ command of
+  // the lists this pass may touch, in list order, through the pre_ts tail.
+  // Callers hold the submission lock (shared for a poll/fence/teardown sweep —
+  // which then only touches its own thread-local list — and exclusive for the
+  // drain backstop, which touches every list). `at_drain` only selects the
+  // counter and whether the pending hint is trusted: the drain never trusts it
+  // (it must reclaim clones no matter which thread deferred them), a poll
+  // sweep does (it is the hot path and its list is usually the only one with
+  // deferred clones).
+  void BatchQktConsumeDeferredEmit(std::vector<uint64_t> *kids, bool at_drain) {
+    if (at_drain) {
+      uni_batchqkt_flush_pending_.store(false, std::memory_order_release);
+    }
+    else if (!uni_batchqkt_flush_pending_.exchange(false, std::memory_order_acq_rel)) {
+      return;  // nothing armed, or another sweep won this flush
+    }
+    const bool prev_guard = uni_batchqkt_in_batch_;
+    uni_batchqkt_in_batch_ = true;  // the tails below must not re-enter a sweep
+    uint64_t consumed = 0;
+    auto consume_list = [&](ZeDeviceSubmissions &submissions) {
+      auto it = submissions.commands_submitted_.begin();
+      while (it != submissions.commands_submitted_.end()) {
+        ZeCommand *command = *it;
+        if (command->deferred_ts_ == nullptr) {
+          ++it;
+          continue;
+        }
+        const ze_kernel_timestamp_result_t *pre_ts = command->deferred_ts_;
+        command->deferred_ts_ = nullptr;
+        if (kids != nullptr) {
+          kids->push_back(command->instance_id_);
+        }
+        // Same tail the drain ran inline in v3/v4: emit from the held packet
+        // (no query), same TSBAD semantics. deferred_emit=true skips the
+        // event-release block — BatchQktReleaseArmedEvent already ran it at
+        // the drain, and the event has been re-signaled by the next replay
+        // since.
+        ProcessCommandSubmittedTail(submissions, command, true, pre_ts, /*deferred_emit=*/true);
+        submissions.commands_free_pool_.push_back(command);
+        it = submissions.commands_submitted_.erase(it);
+        consumed++;
+      }
+    };
+    if (at_drain) {
+      if (global_device_submissions_ != nullptr) {
+        for (auto s : *global_device_submissions_) {
+          consume_list(*s);
+        }
+      }
+    }
+    else {
+      consume_list(local_device_submissions_);
+    }
+    uni_batchqkt_in_batch_ = prev_guard;
+    if (consumed > 0) {
+      if (at_drain) {
+        uni_batchqkt_flush_at_drain_.fetch_add(consumed, std::memory_order_relaxed);
+      }
+      else {
+        uni_batchqkt_flush_at_poll_.fetch_add(consumed, std::memory_order_relaxed);
+      }
+    }
+  }
+
+  void PrintBatchQktDiag(void) {
+    if (!BatchQktDiagEnabled()) {
+      return;
+    }
+    std::cerr << "[BATCHQKT] summary: enabled=" << uni_batchqkt_enabled_.load(std::memory_order_relaxed)
+              << " batches=" << uni_batchqkt_batch_count_.load(std::memory_order_relaxed)
+              << " cmds=" << uni_batchqkt_cmd_count_.load(std::memory_order_relaxed)
+              << " fallback=" << uni_batchqkt_fallback_count_.load(std::memory_order_relaxed)
+              << " max_n=" << uni_batchqkt_max_n_.load(std::memory_order_relaxed)
+              << " max_batch_us=" << uni_batchqkt_max_batch_us_.load(std::memory_order_relaxed)
+              << " sweeps=" << uni_batchqkt_sweeps_.load(std::memory_order_relaxed)
+              << " seen=" << uni_batchqkt_seen_.load(std::memory_order_relaxed)
+              << " collected=" << uni_batchqkt_collected_.load(std::memory_order_relaxed)
+              // E6-v4 (appended at the end so existing greps keep matching):
+              // device-side reset batches, events reset through them, largest
+              // one, its append+sync cost, and events that fell back to the
+              // legacy per-event host reset.
+              << " reset_batches=" << uni_batchqkt_reset_batch_count_.load(std::memory_order_relaxed)
+              << " reset_batched=" << uni_batchqkt_reset_batched_.load(std::memory_order_relaxed)
+              << " reset_max=" << uni_batchqkt_reset_max_.load(std::memory_order_relaxed)
+              << " reset_max_us=" << uni_batchqkt_reset_max_us_.load(std::memory_order_relaxed)
+              << " reset_fallback=" << uni_batchqkt_reset_fallback_.load(std::memory_order_relaxed)
+              // E6-v4b: where the emit of a drain-read batch ran (clones, not
+              // flushes). poll = the overlapped path working as designed;
+              // drain = the backstop (app skipped polling between steps).
+              << " flush_at_poll=" << uni_batchqkt_flush_at_poll_.load(std::memory_order_relaxed)
+              << " flush_at_drain=" << uni_batchqkt_flush_at_drain_.load(std::memory_order_relaxed)
+              // E6-v4c (all zero unless UNITRACE_GRAPH_QKT_AT_POLL=1): where
+              // the READ of a batch ran (clones), and the cost that moved off
+              // the staging drain — TOTAL us across the run of the poll-armed
+              // read's append+sync, plus the two halves separately. Healthy
+              // v4c: qkt_at_poll == cmds, qkt_at_drain == 0, qkt_sync_us tiny
+              // (the wait resolved during the step), qkt_append_us ~= the old
+              // in-drain append cost, now spent inside device-busy sweeps.
+              << " qkt_at_poll=" << uni_batchqkt_qkt_at_poll_.load(std::memory_order_relaxed)
+              << " qkt_at_drain=" << uni_batchqkt_qkt_at_drain_.load(std::memory_order_relaxed)
+              << " qkt_batch_us=" << uni_batchqkt_qkt_batch_us_.load(std::memory_order_relaxed)
+              << " qkt_append_us=" << uni_batchqkt_qkt_append_us_.load(std::memory_order_relaxed)
+              << " qkt_sync_us=" << uni_batchqkt_qkt_sync_us_.load(std::memory_order_relaxed)
+              << std::endl;
+  }
+
+  // -----------------------------------------------------------------------
+  // E6-v4: batched reset of the graph clones' shared events. See the v4 note
+  // in the T6'/E6 design comment above for the why; the mechanism:
+  // EventHistoryDeferGraphEventReset parks the handle (only for graph clones,
+  // only with the batch gate on), FlushGraphEventResets drains the parked set
+  // at the end of EVERY sweep, and BatchQktResetEvents resets one context's
+  // set as one device-side batch on the persistent immediate list.
+  // -----------------------------------------------------------------------
+
+  // A/B knob so a gate-on run can be split into "v3 resets" / "v4 resets"
+  // without a rebuild. Absent (or anything but exactly "0") keeps the batch.
+  static bool BatchQktResetBatchEnvEnabled(void) {
+    static const bool enabled = []() {
+      const char *e = std::getenv("UNITRACE_GRAPH_BATCH_QKT_RESET");
+      return (e == nullptr || !(e[0] == '0' && e[1] == '\0'));
+    }();
+    return enabled;
+  }
+
+  // Master gate of the deferred reset path. Inherits the batch gate's TSLOG2
+  // force-off so the diagnosis modes keep their exact inline ordering, and is
+  // false whenever UNITRACE_GRAPH_BATCH_QKT is unset — the resets then stay on
+  // the untouched inline host-reset path.
+  inline bool BatchQktResetBatchActive(void) {
+    return BatchQktActive() && BatchQktResetBatchEnvEnabled();
+  }
+
+  // Resets one context's parked events: batched when the immediate list for
+  // that context exists, legacy host reset for anything that cannot ride it.
+  // Called outside the submission locks (every sweep flushes after unlocking),
+  // with uni_batchqkt_mutex_ held only around the shared-list use, like
+  // BatchQktExecute.
+  void BatchQktResetEvents(ze_context_handle_t context, const std::set<ze_event_handle_t> &events) {
+    // Drop events the cache no longer owns: ReleaseGraphResources destroys and
+    // recreates them, and appending a dead handle is worse than the no-op the
+    // legacy host reset was for it.
+    std::vector<ze_event_handle_t> live;
+    live.reserve(events.size());
+    for (ze_event_handle_t event : events) {
+      if (event_cache_.QueryEvent(event)) {
+        live.push_back(event);
+      }
+    }
+    if (live.empty()) {
+      return;
+    }
+    ze_command_list_handle_t imm = nullptr;
+    if (BatchQktResetBatchActive() && context != nullptr &&
+        ZE_HAVE_FUNC(zeCommandListAppendEventReset) &&
+        ZE_HAVE_FUNC(zeCommandListHostSynchronize)) {
+      std::lock_guard<std::mutex> lk(uni_batchqkt_mutex_);
+      auto it = uni_batchqkt_imm_lists_.find(context);
+      imm = (it != uni_batchqkt_imm_lists_.end()) ? it->second : nullptr;
+      if (imm == nullptr) {
+        // E6-v4c: with the read armed at a poll sweep the drain never runs
+        // BatchQktExecute, so nothing ever created the regular imm list —
+        // the reset batch then silently fell back to one zeEventHostReset
+        // ioctl per event (node3: reset_batched=0, reset_fallback==cmds,
+        // correct but the ~63ms/step serial shape v4 removed on the big
+        // workload). The poll list can host the reset batch: a parked set
+        // only exists once every armed read has been COMPLETED (its clones
+        // were consumed to park these events), so no wait op is pending —
+        // guard it anyway and take the legacy host reset if one somehow is.
+        if (!uni_batchqkt_read_pending_.load(std::memory_order_acquire)) {
+          auto pit = uni_batchqkt_poll_lists_.find(context);
+          imm = (pit != uni_batchqkt_poll_lists_.end()) ? pit->second : nullptr;
+        }
+      }
+      if (imm != nullptr) {
+        const bool prev_guard = uni_batchqkt_in_batch_;
+        uni_batchqkt_in_batch_ = true;  // our L0 calls must not re-enter the sweeps
+        auto t0 = std::chrono::steady_clock::now();
+        ze_result_t status = ZE_RESULT_SUCCESS;
+        for (ze_event_handle_t event : live) {
+          status = ZE_FUNC(zeCommandListAppendEventReset)(imm, event);
+          if (status != ZE_RESULT_SUCCESS) {
+            break;
+          }
+        }
+        if (status == ZE_RESULT_SUCCESS) {
+          status = ZE_FUNC(zeCommandListHostSynchronize)(imm, UINT64_MAX);
+        }
+        auto t1 = std::chrono::steady_clock::now();
+        uni_batchqkt_in_batch_ = prev_guard;
+        if (status == ZE_RESULT_SUCCESS) {
+          const uint64_t n = static_cast<uint64_t>(live.size());
+          uint64_t prev = uni_batchqkt_reset_max_.load(std::memory_order_relaxed);
+          while (n > prev &&
+                 !uni_batchqkt_reset_max_.compare_exchange_weak(prev, n, std::memory_order_relaxed)) {
+          }
+          const uint64_t batch_us = static_cast<uint64_t>(
+              std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
+          prev = uni_batchqkt_reset_max_us_.load(std::memory_order_relaxed);
+          while (batch_us > prev &&
+                 !uni_batchqkt_reset_max_us_.compare_exchange_weak(prev, batch_us, std::memory_order_relaxed)) {
+          }
+          uni_batchqkt_reset_batch_count_.fetch_add(1, std::memory_order_relaxed);
+          uni_batchqkt_reset_batched_.fetch_add(n, std::memory_order_relaxed);
+          if (!uni_batchqkt_notice_resetok_.exchange(true, std::memory_order_relaxed) &&
+              BatchQktDiagEnabled()) {
+            std::cerr << "[BATCHQKT] reset-batch=" << n
+                      << " events on the immediate list, per-clone host resets are gone (E6-v4)"
+                      << std::endl;
+          }
+          return;
+        }
+        // Append/synchronize failed: which of the appends executed is unknown,
+        // so put every event back through the legacy host reset (resetting an
+        // already-reset event is a no-op).
+        if (!uni_batchqkt_notice_resetfail_.exchange(true, std::memory_order_relaxed) &&
+            BatchQktDiagEnabled()) {
+          std::cerr << "[BATCHQKT] reset-batch failed (status=0x" << std::hex << status << std::dec
+                    << "), this sweep falls back to the per-event host reset" << std::endl;
+        }
+      }
+    }
+    uni_batchqkt_reset_fallback_.fetch_add(live.size(), std::memory_order_relaxed);
+    for (ze_event_handle_t event : live) {
+      event_cache_.ResetEvent(event);
+    }
+  }
+
+  // Releases the collector-owned batch resources. Called at the end of
+  // Finalize, after the tracer is gone and every submission is finalized, so
+  // the L0 calls below cannot re-enter a live sweep.
+  void ReleaseBatchQktResources(void) {
+    std::lock_guard<std::mutex> lk(uni_batchqkt_mutex_);
+    // E6-v4c: drop a still-armed poll read first — its commands are back in
+    // the free pool by now and its wait op (if any) must not outlive the poll
+    // lists destroyed below. Best effort, bounded: the last step completed
+    // long before teardown in the healthy case, so this returns immediately;
+    // a bounded timeout keeps a wedged step from hanging the shutdown (the
+    // descriptor is dropped either way).
+    if (uni_batchqkt_poll_read_.live && uni_batchqkt_poll_read_.list != nullptr) {
+      ZE_FUNC(zeCommandListHostSynchronize)(uni_batchqkt_poll_read_.list, 5000000000ULL);
+      uni_batchqkt_poll_read_ = ZeBatchQktPollRead();
+    }
+    uni_batchqkt_read_pending_.store(false, std::memory_order_release);
+    for (auto &kv : uni_batchqkt_bufs_) {
+      if (kv.second != nullptr) {
+        ZE_FUNC(zeMemFree)(kv.first, kv.second);
+      }
+    }
+    uni_batchqkt_bufs_.clear();
+    uni_batchqkt_buf_caps_.clear();
+    for (auto &kv : uni_batchqkt_poll_bufs_) {
+      if (kv.second != nullptr) {
+        ZE_FUNC(zeMemFree)(kv.first, kv.second);
+      }
+    }
+    uni_batchqkt_poll_bufs_.clear();
+    uni_batchqkt_poll_buf_caps_.clear();
+    for (auto &kv : uni_batchqkt_imm_lists_) {
+      if (kv.second != nullptr) {
+        ZE_FUNC(zeCommandListDestroy)(kv.second);
+      }
+    }
+    uni_batchqkt_imm_lists_.clear();
+    for (auto &kv : uni_batchqkt_poll_lists_) {
+      if (kv.second != nullptr) {
+        ZE_FUNC(zeCommandListDestroy)(kv.second);
+      }
+    }
+    uni_batchqkt_poll_lists_.clear();
+  }
+
+  inline void ProcessCommandSubmitted(ZeDeviceSubmissions& submissions, ZeCommand *command, std::vector<uint64_t> *kids, bool on_event, const ZePrefetchedTs *pre_ts = nullptr) {
 
     if (kids) {
         kids->push_back(command->instance_id_);
     }
+
+    ProcessCommandSubmittedTail(submissions, command, on_event);
+  }
+
+  // Fix B: the completion work that follows the synchronous kids bookkeeping —
+  // timestamp read (with TSBAD fallback), timeline/chrome emit, and the event
+  // release/reset that gives the event back to the app. Runs inline in the
+  // original path, and on the background completer thread when deferral
+  // (UNITRACE_DEFERRED_TS=1) is active. Whoever runs it owns the command
+  // object and deletes it afterwards.
+  // T6'/E6: pre_ts carries an already batch-read packet for graph replay
+  // clones (UNITRACE_GRAPH_BATCH_QKT=1) — the query step is skipped and every
+  // later stage (TSBAD check, emit, pending-clone event reset) runs unchanged.
+  // E6-v4b: deferred_emit marks a packet that was read at the staging drain
+  // and whose event was already released there (BatchQktReleaseArmedEvent);
+  // the event has since been reset and re-signaled by the next replay, so the
+  // release block below must not run again — resetting it here would erase the
+  // new generation's packet and permanently strand that clone at the next
+  // drain's readiness gate.
+  void ProcessCommandSubmittedTail(ZeDeviceSubmissions& submissions, ZeCommand *command, bool on_event,
+                                   const ze_kernel_timestamp_result_t *pre_ts = nullptr,
+                                   bool deferred_emit = false) {
 
     ze_kernel_timestamp_result_t timestamp;
     bool bad_read = false;
@@ -3136,7 +5181,7 @@ class ZeCollector {
           status = ZE_FUNC(zeEventQueryStatus)(command->event_);
           if (status == ZE_RESULT_SUCCESS) {
             std::cerr << "[WARNING] Trying to query event for timestamps" << std::endl;
-            status = ZE_FUNC(zeEventQueryKernelTimestamp)(command->event_, &timestamp);
+            status = QueryLatestTimestamp(command->event_, &timestamp);
             LogTsAnomalyV2(command, false, timestamp, ts_snap);
             bad_read = TsReadIsBad(command, timestamp);
             if (status != ZE_RESULT_SUCCESS) {
@@ -3149,14 +5194,29 @@ class ZeCollector {
     }
     else {
       if (command->event_ != nullptr) {
-        TsSnapshotV2 ts_snap = SnapshotTsQueryV2(command);
-        ze_result_t status = ZE_FUNC(zeEventQueryKernelTimestamp)(command->event_, &timestamp);
-        if (status != ZE_RESULT_SUCCESS) {
-          std::cerr << "[ERROR] Unable to query event for timestamps" << std::endl;
-          ReleaseGraphCommandEvent(command);  // v3: account the clone before dropping it
-          return;
+        TsSnapshotV2 ts_snap;
+        ze_result_t status = ZE_RESULT_SUCCESS;
+        if (pre_ts != nullptr) {
+          // T6'/E6: the packet was batch-read for this replay after the shared
+          // completion event was proven signaled (byte-identical to the
+          // per-event query this replaces, T3 e2 micro verified). Snapshot /
+          // anomaly logging stays on the query path only; TsReadIsBad below
+          // keeps the exact legacy TSBAD semantics for the batched packet.
+          timestamp = *pre_ts;
         }
-        LogTsAnomalyV2(command, true, timestamp, ts_snap);
+        else {
+          // Merge note: v3.1 prefetch pass-through dropped here — pre_ts is not
+          // available on the Fix B tail path (prefetch was proven inert for
+          // counter-based events in vLLM workloads).
+          ts_snap = SnapshotTsQueryV2(command);
+          status = QueryLatestTimestamp(command->event_, &timestamp);
+          if (status != ZE_RESULT_SUCCESS) {
+            std::cerr << "[ERROR] Unable to query event for timestamps" << std::endl;
+            ReleaseGraphCommandEvent(command);  // v3: account the clone before dropping it
+            return;
+          }
+          LogTsAnomalyV2(command, true, timestamp, ts_snap);
+        }
         bad_read = TsReadIsBad(command, timestamp);
         if (std::getenv("UNITRACE_DEBUG_TS") != nullptr) {
           std::cerr << "[TSLOG] on_event inst=" << command->instance_id_
@@ -3269,19 +5329,35 @@ class ZeCollector {
     if (command->immediate_ && !command->graph_command_) {
       EventHistoryErase(command->event_);  // TSLOG v2: handle will be destroyed/recreated
       event_cache_.ReleaseEvent(command->event_);
-    } else {
+    } else if (!deferred_emit) {  // E6-v4b: event already released at arm time
       EventHistoryMarkReset(command->event_);  // TSLOG v2: signal state zeroed before packet reset
       // Graph replay fix v3: reset the shared event as soon as the last pending
       // clone has read it. All clones consumed within this sweep see the same
       // packet (last-kernel attribution); resetting later (v2: end of sweep)
       // left the event latched across replays and the app's next host-wait
       // returned early on the previous generation's packet.
-      if (EventHistoryConsumePending(command->event_)) {
-        event_cache_.ResetEvent(command->event_);
-      } else if (!EventHistoryHasPending(command->event_)) {
+      bool reset_now = EventHistoryConsumePending(command->event_);
+      if (!reset_now && !EventHistoryHasPending(command->event_)) {
         // No pending clones tracked (eager command or untracked event) —
         // original immediate reset.
-        event_cache_.ResetEvent(command->event_);
+        reset_now = true;
+      }
+      if (reset_now) {
+        // E6-v4: a graph clone whose event is due for reset, with the batch
+        // gate on, hands the reset to the sweep-end batch
+        // (EventHistoryDeferGraphEventReset -> FlushGraphEventResets) instead
+        // of paying one zeEventHostReset ioctl here — at the staging drain
+        // those ~770 ioctls were ~63ms of fully-serial driver time on the
+        // app's critical path. Deferral still happens inside the sweep, so the
+        // event is un-signaled before this L0 call returns and before the
+        // clone staging loop re-signals it; the gate off keeps the inline
+        // reset below byte-identical.
+        if (command->graph_command_ && BatchQktResetBatchActive()) {
+          EventHistoryDeferGraphEventReset(command->context_, command->event_);
+        }
+        else {
+          event_cache_.ResetEvent(command->event_);
+        }
       }
       // else: clones of this event are still queued — they must read this
       // packet; the last one to be processed performs the reset.
@@ -3362,6 +5438,10 @@ class ZeCollector {
 
   void DestroyCommandList(ze_command_list_handle_t command_list) {
 
+    // Fix B barrier: this path releases the list's events (and frees its
+    // timestamp buffers); queued completer items must be finished first.
+    FlushDeferredTimestamps();
+
     command_lists_mutex_.lock();
 
     auto it = command_lists_.find(command_list);
@@ -3427,6 +5507,10 @@ class ZeCollector {
   }
 
   void ResetCommandList(ze_command_list_handle_t command_list) {
+
+    // Fix B barrier: this path releases the list's events (and frees its
+    // timestamp buffers); queued completer items must be finished first.
+    FlushDeferredTimestamps();
 
     command_lists_mutex_.lock();
 
@@ -3670,6 +5754,9 @@ class ZeCollector {
                                 ze_result_t result,
                                 void* global_data,
                                 void** /* instance_data */) {
+    if (uni_defer_on_completer_thread_) {
+      return;  // Fix B: replacement events created by the completer are not app events
+    }
     if (result == ZE_RESULT_SUCCESS && params->pphEvent && *params->pphEvent) {
       ZeCollector* collector = reinterpret_cast<ZeCollector*>(global_data);
       collector->events_mutex_.lock();
@@ -3697,8 +5784,19 @@ class ZeCollector {
       ze_event_destroy_params_t *params,
       void *global_data, void ** /* instance_data */, std::vector<uint64_t> *kids) {
 
+    // Fix B: the completer thread's own L0 calls (zeEventHostReset /
+    // zeEventDestroy inside the event cache, issued under the cache lock) come
+    // back through the tracing layer; re-entering the collector here would
+    // deadlock on the locks the caller already holds. Same guard on the other
+    // event-related callbacks below.
+    if (uni_defer_on_completer_thread_) {
+      return;
+    }
     if (*(params->phEvent) != nullptr) {
       ZeCollector* collector = reinterpret_cast<ZeCollector*>(global_data);
+      // Fix B barrier: the app is about to destroy this event; the completer
+      // thread must have finished every queued command that queries it.
+      collector->FlushDeferredTimestamps();
       if (ZE_FUNC(zeEventQueryStatus)(*(params->phEvent)) == ZE_RESULT_SUCCESS) {
         collector->ProcessCommandsSubmittedOnSignaledEvent(*(params->phEvent), kids);
       }
@@ -3744,6 +5842,9 @@ class ZeCollector {
   static void OnExitEventDestroy(
       ze_event_destroy_params_t *params, ze_result_t result,
       void *global_data, void ** /* instance_data */) {
+    if (uni_defer_on_completer_thread_) {
+      return;  // Fix B: no collector re-entry from the completer's own L0 calls
+    }
     if (result == ZE_RESULT_SUCCESS) {
       ZeCollector* collector = reinterpret_cast<ZeCollector*>(global_data);
       collector->events_mutex_.lock();
@@ -3758,6 +5859,12 @@ class ZeCollector {
       void *global_data, void ** /* instance_data */, std::vector<uint64_t> *kids) {
     if (*(params->phEvent) != nullptr) {
       ZeCollector* collector = reinterpret_cast<ZeCollector*>(global_data);
+      if (uni_defer_on_completer_thread_) {
+        return;  // Fix B: this host reset was issued by the completer itself
+      }
+      // Fix B barrier: this reset zeroes the kernel-timestamp packet; queued
+      // completer items must have read it before that.
+      collector->FlushDeferredTimestamps();
       if (ZE_FUNC(zeEventQueryStatus)(*(params->phEvent)) == ZE_RESULT_SUCCESS) {
         collector->ProcessCommandsSubmittedOnSignaledEvent(*(params->phEvent), kids);
       }
@@ -3768,6 +5875,9 @@ class ZeCollector {
   static void OnExitEventHostSynchronize(
       ze_event_host_synchronize_params_t *params,
       ze_result_t result, void *global_data, void ** /* instance_data */, std::vector<uint64_t> *kids) {
+    if (uni_defer_on_completer_thread_) {
+      return;  // Fix B: no collector re-entry from the completer's own L0 calls
+    }
     if (result == ZE_RESULT_SUCCESS) {
       ZeCollector* collector = reinterpret_cast<ZeCollector*>(global_data);
       collector->ProcessCommandsSubmittedOnSignaledEvent(*(params->phEvent), kids);
@@ -3786,6 +5896,9 @@ class ZeCollector {
   static void OnExitEventQueryStatus(
       ze_event_query_status_params_t *params,
       ze_result_t result, void *global_data, void ** /* instance_data */, std::vector<uint64_t> *kids) {
+    if (uni_defer_on_completer_thread_) {
+      return;  // Fix B: no collector re-entry from the completer's own L0 calls
+    }
     if (result == ZE_RESULT_SUCCESS) {
       ZeCollector* collector = reinterpret_cast<ZeCollector*>(global_data);
       collector->ProcessCommandsSubmittedOnSignaledEvent(*(params->phEvent), kids);
@@ -3795,6 +5908,9 @@ class ZeCollector {
   static void OnExitFenceHostSynchronize(
       ze_fence_host_synchronize_params_t *params,
       ze_result_t result, void *global_data, void ** /* instance_data */, std::vector<uint64_t> *kids) {
+    if (uni_defer_on_completer_thread_) {
+      return;  // Fix B: no collector re-entry from the completer's own L0 calls
+    }
     if (result == ZE_RESULT_SUCCESS) {
       PTI_ASSERT(*(params->phFence) != nullptr);
       ZeCollector* collector = reinterpret_cast<ZeCollector*>(global_data);
@@ -4903,6 +7019,25 @@ class ZeCollector {
 
   // Release all resources owned by a ZeGraph (events, metric queries, commands)
   void ReleaseGraphResources(ZeGraph& graph_info) {
+    // Fix B barrier: the graph's shared events are released/recreated below;
+    // queued clones must have read their packets first.
+    FlushDeferredTimestamps();
+    // T6'/E6 (v3): accumulate mode can leave this replay's clones queued
+    // (no staging drain ran since its execution). Their events are
+    // released/recreated right below, so flush the local thread's pending
+    // clones now — this is exactly the "graph destroyed while clones are
+    // pending" path (engine teardown, re-capture). Unready clones (none, if
+    // the app synchronized before destroying) stay queued and their dead
+    // event handles fail the readiness status check at every later drain, so
+    // they can never reach the batch append; worst case is a few leaked
+    // ZeCommand structs, never a dangling handle in a driver call.
+    // Lock order: callers already hold command_lists_mutex_/graphs_mutex_ and
+    // this sweep only takes global_device_submissions_mutex_ (shared), the
+    // same order DestroyCommandList -> ProcessAllCommandsSubmitted uses.
+    if (BatchQktActive() && !uni_batchqkt_in_batch_ &&
+        !local_device_submissions_.IsFinalized()) {
+      ProcessCommandsSubmitted(nullptr);
+    }
     for (auto* cmd : graph_info.commands_) {
       if (cmd != nullptr) {
         if (cmd->event_ != nullptr) {
@@ -5087,6 +7222,7 @@ class ZeCollector {
 
     // Get command list info for execution context
     ze_device_handle_t device = nullptr;
+    ze_context_handle_t context = nullptr;
     uint32_t engine_ordinal = 0;
     uint32_t engine_index = 0;
 
@@ -5094,6 +7230,7 @@ class ZeCollector {
     auto clit = command_lists_.find(command_list);
     if (clit != command_lists_.end()) {
       device = clit->second->device_;
+      context = clit->second->context_;
       engine_ordinal = clit->second->engine_ordinal_;
       engine_index = clit->second->engine_index_;
     }
@@ -5139,6 +7276,11 @@ class ZeCollector {
       // per-event pending counter guarantees the shared event is only reset
       // after its last clone has read it, so the status gate can no longer
       // strand same-generation clones into the next replay.
+      // T6'/E6 (v3): this drain is also THE batch flush point — every clone
+      // accumulated since the last replay is complete here, so the sweep's
+      // collect+execute reads the whole step's packets in one batch (~500us)
+      // and the consuming loop resets the shared events before the clone
+      // loop below re-bumps and re-signals them for this replay.
       for (auto event : graph_events) {
         if (!EventHistoryHasPending(event) &&
             ZE_FUNC(zeEventQueryStatus)(event) == ZE_RESULT_SUCCESS) {
@@ -5172,6 +7314,9 @@ class ZeCollector {
       }
       *cmd = *command;
 
+      // T6'/E6: owning context of this replay, recorded lock-free on the clone
+      // so the sweep can group the batched timestamp read per context.
+      cmd->context_ = context;
       cmd->instance_id_ = UniKernelInstanceId::GetKernelInstanceId();
       // TSLOG v2: this replay re-signals the SAME physical event. Bump its
       // generation and snapshot it as the generation this clone expects to read.
@@ -5800,6 +7945,19 @@ class ZeCollector {
 
     ZeCollector* collector = reinterpret_cast<ZeCollector*>(global_data);
 
+    if (uni_batchqkt_in_batch_) {
+      // E6-v4: the batched reset flush (FlushGraphEventResets ->
+      // BatchQktResetEvents) appending the parked graph events to the
+      // collector's own immediate list. The flag is thread-local and only set
+      // inside a batch window, so this can only be our own append: skipping
+      // the work below avoids an out-of-order-immediate-list warning plus a
+      // submission walk under command_lists_mutex_ per event — the per-event
+      // tax this batch exists to remove. Application calls (any other thread,
+      // or the same thread outside a batch window, or the gate off) are
+      // unaffected.
+      return;
+    }
+
     if (!(collector->reset_event_on_device_)) {
       return;
     }
@@ -5912,6 +8070,10 @@ class ZeCollector {
 
     if (result == ZE_RESULT_SUCCESS) {
       ZeCollector* collector = reinterpret_cast<ZeCollector*>(global_data);
+
+      if (uni_batchqkt_in_batch_) {
+        return;  // E6-v4: our own batched reset append — nothing to capture (see OnEnter)
+      }
 
       if (!(collector->reset_event_on_device_)) {
         return;
@@ -6732,7 +8894,12 @@ typedef struct _zex_kernel_register_file_size_exp_t {
   // Graph replay fix: events whose pending clones have been processed but whose
   // packet reset is deferred to the end of the sweep, so that all clones sharing
   // the event can read the packet before it is erased (guarded by events_mutex_).
-  std::set<ze_event_handle_t> graph_events_pending_reset_;
+  // E6-v4: the sweeps park the shared events here per owning context
+  // (EventHistoryDeferGraphEventReset) and FlushGraphEventResets resets each
+  // context's set as ONE device-side batch (BatchQktResetEvents). With the
+  // batch gate off nothing is ever inserted, so the flush keeps the legacy
+  // per-event host reset.
+  std::map<ze_context_handle_t, std::set<ze_event_handle_t>> graph_events_pending_reset_;
 
   constexpr static size_t kCallsLength = 12;
   constexpr static size_t kTimeLength = 20;
@@ -6740,6 +8907,106 @@ typedef struct _zex_kernel_register_file_size_exp_t {
   std::string data_dir_name_;
   std::vector<std::string> include_kernels_;
   std::vector<std::string> exclude_kernels_;
+
+  // ---- Fix B: background completer (UNITRACE_DEFERRED_TS=1) ----
+  std::mutex uni_defer_q_mutex_;
+  std::condition_variable uni_defer_q_cv_;
+  std::deque<DeferredTsItem> uni_defer_queue_;
+  std::thread uni_defer_worker_;
+  std::atomic<bool> uni_defer_ts_enabled_{false};
+  std::atomic<bool> uni_defer_worker_started_{false};
+  std::atomic<bool> uni_defer_worker_stop_{false};
+  std::atomic<bool> uni_defer_worker_joined_{false};
+  bool uni_defer_worker_busy_ = false;  // guarded by uni_defer_q_mutex_
+  // Diagnostics (relaxed atomics; diagnostics only, env UNITRACE_DEBUG_DEFER)
+  std::atomic<uint64_t> uni_defer_handoff_count_{0};
+  std::atomic<uint64_t> uni_defer_processed_count_{0};
+  std::atomic<uint64_t> uni_defer_inline_fallback_count_{0};
+  std::atomic<uint64_t> uni_defer_flush_count_{0};
+  std::atomic<uint64_t> uni_defer_flush_max_wait_us_{0};
+  std::atomic<uint64_t> uni_defer_batch_count_{0};
+  std::atomic<uint64_t> uni_defer_max_batch_{0};
+
+  // ---- T6'/E6: per-replay batched graph timestamp read (UNITRACE_GRAPH_BATCH_QKT=1) ----
+  std::atomic<bool> uni_batchqkt_enabled_{false};
+  std::atomic<bool> uni_batchqkt_ts2_notice_{false};  // one-shot TS2/DEBUG_TS2 forced-off notice
+  // Serializes the shared immediate command list + staging buffer (batch steps
+  // are once-per-replay, so contention is a non-issue).
+  std::mutex uni_batchqkt_mutex_;
+  std::map<ze_context_handle_t, ze_command_list_handle_t> uni_batchqkt_imm_lists_;  // nullptr = creation failed (sticky fallback)
+  std::map<ze_context_handle_t, void *> uni_batchqkt_bufs_;      // per-context host staging buffer
+  std::map<ze_context_handle_t, size_t> uni_batchqkt_buf_caps_;  // capacities in bytes
+  std::map<ze_device_handle_t, std::pair<uint32_t, bool>> uni_batchqkt_ordinals_;  // device -> {ordinal, has compute}
+  // Diagnostics (relaxed atomics; env UNITRACE_DEBUG_BATCHQKT)
+  std::atomic<uint64_t> uni_batchqkt_batch_count_{0};
+  std::atomic<uint64_t> uni_batchqkt_cmd_count_{0};
+  std::atomic<uint64_t> uni_batchqkt_fallback_count_{0};
+  std::atomic<uint64_t> uni_batchqkt_max_n_{0};
+  std::atomic<uint64_t> uni_batchqkt_max_batch_us_{0};
+  // v2 funnel counters: batch-enabled sweeps that saw graph clones, graph
+  // clones seen in them, and clones that joined a batch. Localizes a
+  // zero-batch result to the failing stage (see BatchQktAccountSweep).
+  std::atomic<uint64_t> uni_batchqkt_sweeps_{0};
+  std::atomic<uint64_t> uni_batchqkt_seen_{0};
+  std::atomic<uint64_t> uni_batchqkt_collected_{0};
+  // One-shot per-reason bail notices (guarded by UNITRACE_DEBUG_BATCHQKT)
+  std::atomic<bool> uni_batchqkt_notice_min_{false};
+  std::atomic<bool> uni_batchqkt_notice_syms_{false};
+  std::atomic<bool> uni_batchqkt_notice_ctx_{false};
+  std::atomic<bool> uni_batchqkt_notice_mixed_{false};
+  std::atomic<bool> uni_batchqkt_notice_notsig_{false};
+
+  // ---- E6-v4: batched reset of the graph clones' shared events ----
+  std::atomic<uint64_t> uni_batchqkt_reset_batch_count_{0};  // device-side reset batches run
+  std::atomic<uint64_t> uni_batchqkt_reset_batched_{0};      // events reset through them
+  std::atomic<uint64_t> uni_batchqkt_reset_max_{0};          // largest batch (distinct events)
+  std::atomic<uint64_t> uni_batchqkt_reset_max_us_{0};       // slowest batch (append+sync)
+  std::atomic<uint64_t> uni_batchqkt_reset_fallback_{0};     // events that took the legacy host reset
+  std::atomic<bool> uni_batchqkt_notice_resetok_{false};
+  std::atomic<bool> uni_batchqkt_notice_resetfail_{false};
+
+  // ---- E6-v4b: split flush — read at the drain, emit at a later sweep ----
+  // Fast-path hint that deferred_ts_ clones exist (set by the drain's arm,
+  // taken by the sweep that runs the emit pass; the drain's backstop pass
+  // ignores it and always scans).
+  std::atomic<bool> uni_batchqkt_flush_pending_{false};
+  // Packets of the live arm. Only the drain writes it (after its backstop pass
+  // consumed the previous arm, so no command can still point into it), and the
+  // submission lock serializes that against any emit pass reading it.
+  std::vector<ze_kernel_timestamp_result_t> uni_batchqkt_emit_buf_;
+  // Where the emit of a clone ran (clones, not flushes): poll sweep = the
+  // overlapped path working as designed, drain = the backstop (app skipped
+  // polling, or the clones belonged to another thread's list).
+  std::atomic<uint64_t> uni_batchqkt_flush_at_poll_{0};
+  std::atomic<uint64_t> uni_batchqkt_flush_at_drain_{0};
+
+  // ---- E6-v4c: poll-armed batch read (UNITRACE_GRAPH_QKT_AT_POLL=1) ----
+  // Published by BatchQktArmPollRead (release) and consumed by
+  // BatchQktCompletePollRead (acquire): the single slot of an armed read.
+  // Writers hold a submission lock (shared for the arm, exclusive for the
+  // completion), so the descriptor itself needs no lock of its own.
+  std::atomic<bool> uni_batchqkt_read_pending_{false};
+  ZeBatchQktPollRead uni_batchqkt_poll_read_;
+  // Dedicated immediate list + packet buffer for the armed read, per context.
+  // Kept separate from the drain's list/buffer so nothing else the collector
+  // appends (reset batches, a fallback execute) can ever queue behind a
+  // device-side wait, and so a fallback drain execute cannot clobber an armed
+  // read's packets.
+  std::map<ze_context_handle_t, ze_command_list_handle_t> uni_batchqkt_poll_lists_;
+  std::map<ze_context_handle_t, void *> uni_batchqkt_poll_bufs_;
+  std::map<ze_context_handle_t, size_t> uni_batchqkt_poll_buf_caps_;
+  // Counters (see the [BATCHQKT] summary line). qkt_batch_us is the TOTAL us
+  // of the poll-armed read's append+sync across the run, i.e. the cost that
+  // left the staging drain; the two halves are counted separately.
+  std::atomic<uint64_t> uni_batchqkt_qkt_at_poll_{0};
+  std::atomic<uint64_t> uni_batchqkt_qkt_at_drain_{0};
+  std::atomic<uint64_t> uni_batchqkt_qkt_batch_us_{0};
+  std::atomic<uint64_t> uni_batchqkt_qkt_append_us_{0};
+  std::atomic<uint64_t> uni_batchqkt_qkt_sync_us_{0};
+  // One-shot per-reason bail notices (guarded by UNITRACE_DEBUG_BATCHQKT)
+  std::atomic<bool> uni_batchqkt_notice_polllist_{false};
+  std::atomic<bool> uni_batchqkt_notice_pollmixed_{false};
+  std::atomic<bool> uni_batchqkt_notice_pollappend_{false};
 
 };
 

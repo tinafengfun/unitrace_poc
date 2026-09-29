@@ -18,7 +18,7 @@
 #include "ze_utils.h"
 
 // Test configuration constants
-constexpr int GRAPH_EXECUTION_COUNT = 3;
+constexpr int GRAPH_EXECUTION_COUNT = 1000;
 constexpr int MIN_CLI_ARGS = 2;  // program name + optional graph exec count
 constexpr int DATA_SIZE = 64;    // number of int elements
 

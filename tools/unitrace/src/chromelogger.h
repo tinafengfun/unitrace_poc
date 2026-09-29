@@ -9,14 +9,19 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <new>
 #include <sstream>
 #include <string>
 #include <algorithm>
+#include <mutex>
 #include <thread>
 #include <tuple>
+#include <type_traits>
 #include <set>
 #include <vector>
 #include "unitimer.h"
@@ -644,6 +649,19 @@ std::set<TraceBuffer *> *trace_buffers_ = nullptr;
 
 #define BUFFER_SLICE_SIZE_DEFAULT  (0x1 << 20)
 
+// Flow association records: the host EVENT_FLOW_SOURCE/SINK records emitted by
+// the call-logging callback plus the "ph":"t"/"ph":"s" pair appended to every
+// (non-implicit-scaling) device kernel slice. They carry the API<->kernel
+// causal arrows only -- the timeline slices are independent of them. They are
+// ON by default; UNITRACE_FLOW=0 (exactly) drops all of them, which removes
+// their record build, buffer, serialize and I/O cost. The kernel slice keeps
+// its "id" arg, so instances stay identifiable without the arrows.
+// Read once on first use; the record hot paths pay a single branch.
+static inline bool FlowRecordsEnabled(void) {
+  static const bool enabled = (utils::GetEnv("UNITRACE_FLOW") != "0");
+  return enabled;
+}
+
 #if BUILD_WITH_PERFETTO
 // H2D flow ids (from EVENT_FLOW_SOURCE records) awaiting the next host slice.
 // Per host-thread buffer: the callback pushes a call's flow records right before
@@ -789,7 +807,9 @@ inline void PerfettoEmitDeviceSlice(uint32_t seq_id, uint32_t pid, uint32_t tid,
   } else {
     opts.name = kname;
     // The JSON path emits a dep flow tied to kid for non-scaled commands.
-    opts.flow_ids.push_back(kid);
+    // UNITRACE_FLOW: without the host-side flow ids a lone device id would be a
+    // dangling arrow endpoint, so drop it here as well.
+    if (FlowRecordsEnabled()) { opts.flow_ids.push_back(kid); }
   }
   opts.annotations.push_back(perfetto_emit::Annotation::Str("id", std::to_string(kid)));
   if (metrics_enabled) {
@@ -803,6 +823,372 @@ inline void PerfettoEmitDeviceSlice(uint32_t seq_id, uint32_t pid, uint32_t tid,
   perfetto_emit::EmitSliceEnd(seq_id, track_uuid, UniTimer::GetEpochTime(end_time));
 }
 #endif /* BUILD_WITH_PERFETTO */
+
+// ---------------------------------------------------------------------------
+// T5/E7b: asynchronous chrome trace emission (UNITRACE_ASYNC_EMIT=1)
+// ---------------------------------------------------------------------------
+// The synchronous path builds the chrome JSON for every record and writes it
+// on the thread that produced the record (an application thread, or the FixB
+// completer thread). With UNITRACE_ASYNC_EMIT=1 the producer only appends a
+// fixed-size binary record -- the record struct copied by value into a bounded
+// lock-free ring -- and a single emitter thread owns the JSON construction and
+// the file write, the same proven shape as the FixB background completer
+// (UNITRACE_DEFERRED_TS) in levelzero/ze_collector.h.
+//
+// Design invariants:
+//   * Hot path = one in-place memcpy plus a few atomics. No allocation, no
+//     lock, no syscall, no string formatting. A full ring drops the record and
+//     counts it instead of blocking (kineto buffer-rejection semantics); the
+//     count is reported by the "[EMIT] summary:" line at teardown.
+//   * Per-producer order is preserved: a producer's successive appends get
+//     strictly increasing ring positions and the single consumer follows them.
+//     Cross-thread interleaving stays arbitrary, exactly as before.
+//   * Records are written by the same code as the synchronous path
+//     (TraceBuffer::SyncFlushHostEvent / SyncFlushDeviceEvent -> Stringify* ->
+//     logger_->Log), only on the emitter thread, so the trace is
+//     byte-identical. The emitter never re-timestamps: "ts"/"dur" come from
+//     the record the producer filled at append time.
+//   * Heap fields inside a record (HostEventRecord::name_ and the ITT metadata
+//     chain) are ownership-TRANSFERRED through the ring: the ring copy is the
+//     one whose Stringify* frees them and the producing slot's copy is
+//     neutered at append time. That is why there is no payload copy, no record
+//     size cap and no name truncation -- kernel names (2KB+ for the XeFMHA
+//     clones) are not part of the record at all, they are resolved by the
+//     emitter thread through GetZeKernelCommandName's shared_mutex-protected
+//     map.
+//   * Teardown: ChromeLogger::~ChromeLogger stops the thread and drains the
+//     ring before the JSON closing brackets are written, so sidecar tooling
+//     still sees the complete trace at process exit.
+// ---------------------------------------------------------------------------
+
+class TraceBuffer;
+#if BUILD_WITH_OPENCL
+class ClTraceBuffer;
+#endif /* BUILD_WITH_OPENCL */
+
+// Record kinds carried in the ring: one per (buffer class, record struct)
+// pair. The emitter dispatches on it to the owning buffer's synchronous flush
+// helper, which is where the per-buffer state lives (device event track
+// allocation, metrics flag, buffer pid/tid).
+enum EmitRecordType {
+  EMIT_REC_HOST = 1,       // TraceBuffer::SyncFlushHostEvent
+  EMIT_REC_ZE_DEVICE = 2,  // TraceBuffer::SyncFlushDeviceEvent
+#if BUILD_WITH_OPENCL
+  EMIT_REC_CL_HOST = 3,    // ClTraceBuffer::SyncFlushHostEvent
+  EMIT_REC_CL_DEVICE = 4,  // ClTraceBuffer::SyncFlushDeviceEvent
+#endif /* BUILD_WITH_OPENCL */
+};
+
+// Largest record carried in the ring.
+static constexpr size_t EmitMaxRecordBytes(void) {
+  size_t max_size = sizeof(HostEventRecord);
+  if (sizeof(ZeKernelCommandExecutionRecord) > max_size) {
+    max_size = sizeof(ZeKernelCommandExecutionRecord);
+  }
+#if BUILD_WITH_OPENCL
+  if (sizeof(ClKernelCommandExecutionRecord) > max_size) {
+    max_size = sizeof(ClKernelCommandExecutionRecord);
+  }
+#endif /* BUILD_WITH_OPENCL */
+  return max_size;
+}
+
+// Fixed-size ring record: small header + one record struct copied by value.
+// Nothing variable sized, nothing allocated, nothing formatted. The payload is
+// raw storage rather than a union because HostEventRecord's anonymous args
+// union has a non-trivial default constructor (IttArgs has default member
+// initializers) -- these record structs are malloc'd, never constructed,
+// everywhere else in this file too.
+struct EmitRecord {
+  uint32_t type_;
+  uint32_t pad_;   // keeps buffer_ self-aligned
+  void* buffer_;   // owning trace buffer, alive until the ring is drained
+  alignas(8) unsigned char payload_[EmitMaxRecordBytes()];
+};
+
+static_assert(sizeof(EmitRecord) >= sizeof(uint32_t) * 2 + sizeof(void *) + sizeof(HostEventRecord),
+              "EmitRecord payload must hold the largest record struct");
+
+// The records are copied with memcpy, so they have to be trivially copyable
+// (the heap pointers they carry are ownership-transferred, not deep-copied).
+static_assert(std::is_trivially_copyable<HostEventRecord>::value,
+              "HostEventRecord must stay trivially copyable");
+static_assert(std::is_trivially_copyable<ZeKernelCommandExecutionRecord>::value,
+              "ZeKernelCommandExecutionRecord must stay trivially copyable");
+#if BUILD_WITH_OPENCL
+static_assert(std::is_trivially_copyable<ClKernelCommandExecutionRecord>::value,
+              "ClKernelCommandExecutionRecord must stay trivially copyable");
+#endif /* BUILD_WITH_OPENCL */
+
+class ChromeTraceEmitter {
+  public:
+    // Gate, read once (DeferredTsEnvEnabled style strict match). Protobuf
+    // output keeps the synchronous path: the Perfetto emitter owns its own
+    // packet sequences and per-buffer flow accumulation.
+    static bool Enabled(void) {
+      static const bool enabled = []() {
+        const char *e = std::getenv("UNITRACE_ASYNC_EMIT");
+        if (e == nullptr || e[0] != '1' || e[1] != '\0') {
+          return false;
+        }
+        return !UseProtobufOutput();
+      }();
+      return enabled;
+    }
+
+    static bool DiagEnabled(void) {
+      static const bool enabled = (std::getenv("UNITRACE_DEBUG_EMIT") != nullptr);
+      return enabled;
+    }
+
+    static ChromeTraceEmitter& Get(void) {
+      static ChromeTraceEmitter emitter;  // one instance per process
+      return emitter;
+    }
+
+    // Starts the emitter thread if it is not running yet (idempotent, also
+    // called by the first enqueue).
+    void EnsureStarted(void) {
+      StartOnce();
+    }
+
+    // Returns false only when the emitter is unavailable (start failed or
+    // already shut down) so the caller can fall back to the synchronous path.
+    // A full ring is NOT reported as false: the record is dropped and counted.
+    bool EnqueueHostRecord(TraceBuffer* buffer, const HostEventRecord& rec) {
+      return EnqueueRecord(EMIT_REC_HOST, (void *)(buffer), &rec, sizeof(HostEventRecord));
+    }
+
+    bool EnqueueZeDeviceRecord(TraceBuffer* buffer, const ZeKernelCommandExecutionRecord& rec) {
+      return EnqueueRecord(EMIT_REC_ZE_DEVICE, (void *)(buffer), &rec, sizeof(ZeKernelCommandExecutionRecord));
+    }
+
+#if BUILD_WITH_OPENCL
+    bool EnqueueClHostRecord(ClTraceBuffer* buffer, const HostEventRecord& rec) {
+      return EnqueueRecord(EMIT_REC_CL_HOST, (void *)(buffer), &rec, sizeof(HostEventRecord));
+    }
+
+    bool EnqueueClDeviceRecord(ClTraceBuffer* buffer, const ClKernelCommandExecutionRecord& rec) {
+      return EnqueueRecord(EMIT_REC_CL_DEVICE, (void *)(buffer), &rec, sizeof(ClKernelCommandExecutionRecord));
+    }
+#endif /* BUILD_WITH_OPENCL */
+
+    // Waits until the emitter thread has written every record accepted at (or
+    // before) this call, or until |max_wait_us| elapses. Returns the number of
+    // records still pending. Deliberately takes no lock: callers may hold
+    // logger_lock_ and the emitter takes it inside GetDevicePidTid's
+    // first-sight metadata branch, so draining under it could deadlock against
+    // our own wait.
+    uint64_t Drain(uint64_t max_wait_us = kDrainTimeoutUs) {
+      if (!started_.load(std::memory_order_acquire)) {
+        return 0;
+      }
+      const uint64_t target = accepted_.load(std::memory_order_acquire);
+      const std::chrono::steady_clock::time_point deadline =
+          std::chrono::steady_clock::now() + std::chrono::microseconds(max_wait_us);
+      while (emitted_.load(std::memory_order_acquire) < target) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+          break;
+        }
+        std::this_thread::yield();
+      }
+      return target - emitted_.load(std::memory_order_acquire);
+    }
+
+    // Teardown: stop the emitter once the ring is drained and join it. Any
+    // record that committed after the emitter's last empty check is written
+    // here, inline, on the calling (teardown) thread -- the pre-T5 behaviour.
+    void Shutdown(void) {
+      std::lock_guard<std::mutex> lock(start_lock_);
+      if (!started_.load(std::memory_order_relaxed) ||
+          shutdown_.load(std::memory_order_relaxed)) {
+        return;
+      }
+      shutdown_.store(true, std::memory_order_release);
+      stop_.store(true, std::memory_order_release);
+      Drain(kDrainTimeoutUs);
+      started_.store(false, std::memory_order_release);
+      if (thread_.joinable()) {
+        thread_.join();
+      }
+      EmitRecord rec;
+      while (DequeueRecord(rec)) {
+        ProcessRecord(rec);
+      }
+    }
+
+    // Teardown accounting line, [DEFER]/[BATCHQKT] style. Printed whenever the
+    // gate is on: silently missing records have to be catchable by grepping
+    // the run log, so this is not behind a diagnostic env.
+    void PrintSummary(void) {
+      std::cerr << "[EMIT] summary: enabled=" << Enabled()
+                << " emitted=" << emitted_.load(std::memory_order_relaxed)
+                << " dropped=" << dropped_.load(std::memory_order_relaxed)
+                << " ring_hwm=" << ring_hwm_.load(std::memory_order_relaxed)
+                << " fallback_sync=" << fallback_sync_.load(std::memory_order_relaxed)
+                << " ring_slots=" << kRingSlots
+                << std::endl;
+    }
+
+    ChromeTraceEmitter(const ChromeTraceEmitter& that) = delete;
+    ChromeTraceEmitter& operator=(const ChromeTraceEmitter& that) = delete;
+
+    ~ChromeTraceEmitter() {
+      // Defensive: normally ~ChromeLogger already shut the thread down. A
+      // joinable std::thread must never be destroyed (it would terminate).
+      if (thread_.joinable()) {
+        stop_.store(true, std::memory_order_release);
+        shutdown_.store(true, std::memory_order_release);
+        Drain(kDrainTimeoutUs);
+        thread_.join();
+      }
+      delete[] slots_;
+    }
+
+  private:
+    ChromeTraceEmitter() = default;
+
+    // Ring sizing: 16k records. The emitter stringifies ~0.2-0.5us per record,
+    // so the ring absorbs tens of milliseconds of production; sampled high
+    // water marks stay in the hundreds while the emitter keeps up. Cost is
+    // ~4MB of lazily allocated, cache-line-padded slots.
+    static constexpr uint32_t kRingSlots = (uint32_t)(1 << 14);  // power of two
+    static constexpr uint32_t kRingMask = kRingSlots - 1;
+    static constexpr uint64_t kDrainTimeoutUs = (uint64_t)(30) * 1000 * 1000;
+
+    // Dmitry Vyukov's bounded MPMC queue; with a single consumer the dequeue
+    // CAS never fails, and a full ring reports overflow instead of spinning.
+    struct alignas(64) Slot {
+      std::atomic<uint64_t> sequence_;
+      EmitRecord record_;
+    };
+
+    void StartOnce(void) {
+      if (started_.load(std::memory_order_acquire) ||
+          shutdown_.load(std::memory_order_acquire)) {
+        return;
+      }
+      std::lock_guard<std::mutex> lock(start_lock_);
+      if (started_.load(std::memory_order_relaxed) ||
+          shutdown_.load(std::memory_order_relaxed)) {
+        return;
+      }
+      slots_ = new (std::nothrow) Slot[kRingSlots];
+      if (slots_ == nullptr) {
+        // No ring: stay on the synchronous path for the whole process.
+        shutdown_.store(true, std::memory_order_release);
+        return;
+      }
+      for (uint32_t i = 0; i < kRingSlots; i++) {
+        slots_[i].sequence_.store(i, std::memory_order_relaxed);
+      }
+      try {
+        thread_ = std::thread(&ChromeTraceEmitter::ThreadMain, this);
+      }
+      catch (...) {
+        // Thread creation failed (EAGAIN under load): synchronous fallback.
+        shutdown_.store(true, std::memory_order_release);
+        delete[] slots_;
+        slots_ = nullptr;
+        return;
+      }
+      started_.store(true, std::memory_order_release);
+      if (DiagEnabled()) {
+        std::cerr << "[EMIT] emitter thread started (UNITRACE_ASYNC_EMIT=1)" << std::endl;
+      }
+    }
+
+    bool EnqueueRecord(uint32_t type, void* buffer, const void* record, size_t record_size) {
+      if (!started_.load(std::memory_order_acquire)) {
+        StartOnce();
+        if (!started_.load(std::memory_order_acquire)) {
+          fallback_sync_.fetch_add(1, std::memory_order_relaxed);
+          return false;
+        }
+      }
+      uint64_t pos = enqueue_pos_.load(std::memory_order_relaxed);
+      Slot* slot = nullptr;
+      for (;;) {
+        slot = &slots_[pos & kRingMask];
+        uint64_t seq = slot->sequence_.load(std::memory_order_acquire);
+        intptr_t dif = (intptr_t)(seq) - (intptr_t)(pos);
+        if (dif == 0) {
+          if (enqueue_pos_.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed)) {
+            break;
+          }
+        }
+        else if (dif < 0) {
+          // Ring full: graceful drop, never block the application.
+          dropped_.fetch_add(1, std::memory_order_relaxed);
+          return true;
+        }
+        else {
+          pos = enqueue_pos_.load(std::memory_order_relaxed);
+        }
+      }
+
+      EmitRecord* rec = &slot->record_;
+      rec->type_ = type;
+      rec->pad_ = 0;
+      rec->buffer_ = buffer;
+      // The whole producer-side cost: one fixed-size copy.
+      memcpy(rec->payload_, record, record_size);
+
+      accepted_.fetch_add(1, std::memory_order_release);
+      uint64_t in_flight = pos + 1 - dequeue_pos_.load(std::memory_order_relaxed);
+      uint64_t hwm = ring_hwm_.load(std::memory_order_relaxed);
+      while ((in_flight > hwm) &&
+             !ring_hwm_.compare_exchange_weak(hwm, in_flight, std::memory_order_relaxed)) {}
+
+      // Publish the record; the consumer sees the payload through the
+      // acquire load of sequence_ below.
+      slot->sequence_.store(pos + 1, std::memory_order_release);
+      return true;
+    }
+
+    bool DequeueRecord(EmitRecord& out) {
+      uint64_t pos = dequeue_pos_.load(std::memory_order_relaxed);
+      for (;;) {
+        Slot* slot = &slots_[pos & kRingMask];
+        uint64_t seq = slot->sequence_.load(std::memory_order_acquire);
+        intptr_t dif = (intptr_t)(seq) - (intptr_t)(pos + 1);
+        if (dif == 0) {
+          if (dequeue_pos_.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed)) {
+            memcpy(&out, &slot->record_, sizeof(EmitRecord));
+            // Release the slot for reuse by the lap after next.
+            slot->sequence_.store(pos + kRingSlots, std::memory_order_release);
+            return true;
+          }
+        }
+        else if (dif < 0) {
+          return false;  // empty: nothing committed at this position yet
+        }
+        else {
+          pos = dequeue_pos_.load(std::memory_order_relaxed);
+        }
+      }
+    }
+
+    // Declared here, defined after TraceBuffer / ClTraceBuffer below: it calls
+    // the owning buffer's synchronous flush helper, so those classes must be
+    // complete first.
+    void ProcessRecord(EmitRecord& rec);
+    void ThreadMain(void);
+
+    Slot* slots_ = nullptr;
+    std::atomic<uint64_t> enqueue_pos_{0};
+    std::atomic<uint64_t> dequeue_pos_{0};
+    std::atomic<uint64_t> accepted_{0};
+    std::atomic<uint64_t> emitted_{0};
+    std::atomic<uint64_t> dropped_{0};
+    std::atomic<uint64_t> fallback_sync_{0};
+    std::atomic<uint64_t> ring_hwm_{0};
+    std::atomic<bool> started_{false};
+    std::atomic<bool> shutdown_{false};
+    std::atomic<bool> stop_{false};
+    std::mutex start_lock_;
+    std::thread thread_;
+};
 
 // TODO(refactor): TraceBuffer (Level Zero) and ClTraceBuffer (OpenCL) differ only
 // in the record type and device-id resolution; a TraceBuffer templated on the
@@ -824,6 +1210,11 @@ class TraceBuffer {
         }
         slice_capacity_ = buffer_capacity_;
       }
+      // T5/E7b: with the emitter thread on, this buffer's records are copied
+      // into the emitter ring as they are buffered (see Buffer*Event) and are
+      // never stringified from here, so a single reused slot per buffer is
+      // enough -- nothing accumulates in the slices.
+      async_emit_ = ChromeTraceEmitter::Enabled();
       ZeKernelCommandExecutionRecord *der = (ZeKernelCommandExecutionRecord *)(malloc(sizeof(ZeKernelCommandExecutionRecord) * slice_capacity_));
       UniMemory::ExitIfOutOfMemory((void *)(der));
 
@@ -865,6 +1256,13 @@ class TraceBuffer {
     }
 
     ~TraceBuffer() {
+      // T5/E7b: this buffer is still referenced by pending ring entries (the
+      // emitter calls back into it for the device track state and pid/tid), so
+      // wait for them to be written before the members go away. Drained
+      // outside logger_lock_ on purpose -- see ChromeTraceEmitter::Drain.
+      if (async_emit_) {
+        ChromeTraceEmitter::Get().Drain();
+      }
       std::lock_guard<std::recursive_mutex> lock(logger_lock_);
       if (!finalized_.exchange(true)) {
         // finalize if not finalized
@@ -960,6 +1358,27 @@ class TraceBuffer {
     }
 
     void BufferHostEvent(void) {
+      if (async_emit_) {
+        // T5/E7b: fixed-size binary append only -- the emitter thread owns the
+        // JSON build and the file write. The slot is free again right away
+        // (the record was copied out), so the index is reset instead of
+        // advanced: the slices never grow and no per-record flush pass runs.
+        HostEventRecord& rec = host_event_buffer_[current_host_event_buffer_slice_][next_host_event_index_];
+        if (ChromeTraceEmitter::Get().EnqueueHostRecord(this, rec)) {
+          // Ownership of the heap fields (name_, the ITT metadata chain) moved
+          // with the copy -- the emitter thread frees them after stringifying.
+          rec.name_ = nullptr;
+        }
+        else {
+          // Emitter unavailable (start failed / already joined): emit inline,
+          // exactly like the synchronous path.
+          std::lock_guard<std::recursive_mutex> lock(logger_lock_);
+          SyncFlushHostEvent(rec);
+        }
+        next_host_event_index_ = 0;
+        host_event_buffer_flushed_ = true;
+        return;
+      }
       if (flush_immediately_) {
         std::lock_guard<std::recursive_mutex> lock(logger_lock_);
         FlushHostEvent(host_event_buffer_[current_host_event_buffer_slice_][next_host_event_index_]);
@@ -973,6 +1392,17 @@ class TraceBuffer {
     }
 
     void BufferDeviceEvent(void) {
+      if (async_emit_) {
+        // T5/E7b: see BufferHostEvent. Device records carry no heap fields.
+        ZeKernelCommandExecutionRecord& rec = device_event_buffer_[current_device_event_buffer_slice_][next_device_event_index_];
+        if (!ChromeTraceEmitter::Get().EnqueueZeDeviceRecord(this, rec)) {
+          std::lock_guard<std::recursive_mutex> lock(logger_lock_);
+          SyncFlushDeviceEvent(rec);
+        }
+        next_device_event_index_ = 0;
+        device_event_buffer_flushed_ = true;
+        return;
+      }
       if (flush_immediately_) {
         std::lock_guard<std::recursive_mutex> lock(logger_lock_);
         FlushDeviceEvent(device_event_buffer_[current_device_event_buffer_slice_][next_device_event_index_]);
@@ -1031,7 +1461,10 @@ class TraceBuffer {
       }
       str += "}}";
 
-      if (!rec.implicit_scaling_) {
+      // UNITRACE_FLOW: the pair below is the device end of both association
+      // arrows ("t" closes the host submit -> kernel H2D flow, "s" opens the
+      // kernel -> host wait D2H flow); dropping it removes both arrows.
+      if (!rec.implicit_scaling_ && FlowRecordsEnabled()) {
         str += ",\n{";
         str += "\"ph\": \"t\"";
         str += ", \"tid\": " + std::to_string(tid);
@@ -1199,11 +1632,22 @@ class TraceBuffer {
     }
 #endif /* BUILD_WITH_PERFETTO */
 
-    void FlushDeviceEvent(ZeKernelCommandExecutionRecord& rec) {
+    // T5/E7b: the original emission path, kept verbatim -- it is what the
+    // emitter thread runs and what the fallback below runs.
+    void SyncFlushDeviceEvent(ZeKernelCommandExecutionRecord& rec) {
 #if BUILD_WITH_PERFETTO
       if (UseProtobufOutput()) { PerfettoEmitDeviceEvent(rec); return; }
 #endif /* BUILD_WITH_PERFETTO */
       logger_->Log(StringifyDeviceEvent(rec));
+    }
+
+    void FlushDeviceEvent(ZeKernelCommandExecutionRecord& rec) {
+      if (async_emit_) {
+        // T5/E7b: this record went to the emitter thread when it was buffered,
+        // so there is nothing left to write here.
+        return;
+      }
+      SyncFlushDeviceEvent(rec);
     }
 
     void FlushDeviceBuffer() {
@@ -1226,11 +1670,20 @@ class TraceBuffer {
       device_event_buffer_flushed_ = true;
     }
 
-    void FlushHostEvent(HostEventRecord& rec) {
+    // T5/E7b: the original emission path, kept verbatim (see SyncFlushDeviceEvent).
+    void SyncFlushHostEvent(HostEventRecord& rec) {
 #if BUILD_WITH_PERFETTO
       if (UseProtobufOutput()) { PerfettoEmitHostEvent(rec, pid_, tid_, seq_id_, pending_flows_, host_track_emitted_); return; }
 #endif /* BUILD_WITH_PERFETTO */
       logger_->Log(StringifyHostEvent(rec));
+    }
+
+    void FlushHostEvent(HostEventRecord& rec) {
+      if (async_emit_) {
+        // T5/E7b: already handed to the emitter thread at BufferHostEvent().
+        return;
+      }
+      SyncFlushHostEvent(rec);
     }
 
     void FlushHostBuffer() {
@@ -1306,6 +1759,7 @@ class TraceBuffer {
     // device event timestampes cached are <device, engine_ordinal, engine_index> specific
     std::map<std::tuple<ze_device_handle_t, uint32_t, uint32_t>, std::vector<std::set<std::pair<uint64_t, uint64_t>, DeviceTimestampComparator>>> recent_device_timestamps_;
     bool flush_immediately_;
+    bool async_emit_;  // T5/E7b: records go to the emitter ring, not to the file
     bool host_event_buffer_flushed_;
     bool device_event_buffer_flushed_;
     std::atomic<bool> finalized_;
@@ -1332,6 +1786,8 @@ class ClTraceBuffer {
         }
         slice_capacity_ = buffer_capacity_;
       }
+      // T5/E7b: see TraceBuffer's constructor -- one reused slot per buffer.
+      async_emit_ = ChromeTraceEmitter::Enabled();
       ClKernelCommandExecutionRecord *der = (ClKernelCommandExecutionRecord *)(malloc(sizeof(ClKernelCommandExecutionRecord) * slice_capacity_));
       UniMemory::ExitIfOutOfMemory((void *)(der));
 
@@ -1372,6 +1828,10 @@ class ClTraceBuffer {
     }
 
     ~ClTraceBuffer() {
+      // T5/E7b: see ~TraceBuffer -- drain the emitter ring before dying.
+      if (async_emit_) {
+        ChromeTraceEmitter::Get().Drain();
+      }
       std::lock_guard<std::recursive_mutex> lock(logger_lock_);
       if (!finalized_.exchange(true)) {
         // finalize if not finalized
@@ -1468,6 +1928,20 @@ class ClTraceBuffer {
     }
 
     void BufferHostEvent(void) {
+      if (async_emit_) {
+        // T5/E7b: fixed-size binary append only -- see TraceBuffer::BufferHostEvent.
+        HostEventRecord& rec = host_event_buffer_[current_host_event_buffer_slice_][next_host_event_index_];
+        if (ChromeTraceEmitter::Get().EnqueueClHostRecord(this, rec)) {
+          rec.name_ = nullptr;  // ownership moved to the ring copy
+        }
+        else {
+          std::lock_guard<std::recursive_mutex> lock(logger_lock_);
+          SyncFlushHostEvent(rec);
+        }
+        next_host_event_index_ = 0;
+        host_event_buffer_flushed_ = true;
+        return;
+      }
       if (flush_immediately_) {
         std::lock_guard<std::recursive_mutex> lock(logger_lock_);
         FlushHostEvent(host_event_buffer_[current_host_event_buffer_slice_][next_host_event_index_]);
@@ -1481,6 +1955,17 @@ class ClTraceBuffer {
     }
 
     void BufferDeviceEvent(void) {
+      if (async_emit_) {
+        // T5/E7b: see TraceBuffer::BufferDeviceEvent.
+        ClKernelCommandExecutionRecord& rec = device_event_buffer_[current_device_event_buffer_slice_][next_device_event_index_];
+        if (!ChromeTraceEmitter::Get().EnqueueClDeviceRecord(this, rec)) {
+          std::lock_guard<std::recursive_mutex> lock(logger_lock_);
+          SyncFlushDeviceEvent(rec);
+        }
+        next_device_event_index_ = 0;
+        device_event_buffer_flushed_ = true;
+        return;
+      }
       if (flush_immediately_) {
         std::lock_guard<std::recursive_mutex> lock(logger_lock_);
         FlushDeviceEvent(device_event_buffer_[current_device_event_buffer_slice_][next_device_event_index_]);
@@ -1541,7 +2026,9 @@ class ClTraceBuffer {
       }
       str += "}}";
 
-      if (!rec.implicit_scaling_) {
+      // UNITRACE_FLOW: device end of the CL association arrows; see the L0
+      // emitter above for the exact records dropped here.
+      if (!rec.implicit_scaling_ && FlowRecordsEnabled()) {
         str += ",\n{";
         str += "\"ph\": \"t\"";
         str += ", \"tid\": " + std::to_string(tid);
@@ -1583,11 +2070,20 @@ class ClTraceBuffer {
     }
 #endif /* BUILD_WITH_PERFETTO */
 
-    void FlushDeviceEvent(ClKernelCommandExecutionRecord& rec) {
+    // T5/E7b: the original emission path, kept verbatim (see SyncFlushDeviceEvent).
+    void SyncFlushDeviceEvent(ClKernelCommandExecutionRecord& rec) {
 #if BUILD_WITH_PERFETTO
       if (UseProtobufOutput()) { PerfettoEmitDeviceEvent(rec); return; }
 #endif /* BUILD_WITH_PERFETTO */
       logger_->Log(StringifyDeviceEvent(rec));
+    }
+
+    void FlushDeviceEvent(ClKernelCommandExecutionRecord& rec) {
+      if (async_emit_) {
+        // T5/E7b: already handed to the emitter thread at BufferDeviceEvent().
+        return;
+      }
+      SyncFlushDeviceEvent(rec);
     }
 
     void FlushDeviceBuffer() {
@@ -1729,11 +2225,20 @@ class ClTraceBuffer {
       return str;
     }
 
-    void FlushHostEvent(HostEventRecord& rec) {
+    // T5/E7b: the original emission path, kept verbatim (see SyncFlushDeviceEvent).
+    void SyncFlushHostEvent(HostEventRecord& rec) {
 #if BUILD_WITH_PERFETTO
       if (UseProtobufOutput()) { PerfettoEmitHostEvent(rec, pid_, tid_, seq_id_, pending_flows_, host_track_emitted_); return; }
 #endif /* BUILD_WITH_PERFETTO */
       logger_->Log(StringifyHostEvent(rec));
+    }
+
+    void FlushHostEvent(HostEventRecord& rec) {
+      if (async_emit_) {
+        // T5/E7b: already handed to the emitter thread at BufferHostEvent().
+        return;
+      }
+      SyncFlushHostEvent(rec);
     }
 
     void FlushHostBuffer() {
@@ -1809,6 +2314,7 @@ class ClTraceBuffer {
     // device event timestampes cached are <device, queue> specific
     std::map<std::tuple<cl_device_id, cl_command_queue>, std::vector<std::set<std::pair<uint64_t, uint64_t>, DeviceTimestampComparator>>> recent_device_timestamps_;
     bool flush_immediately_;
+    bool async_emit_;  // T5/E7b: records go to the emitter ring, not to the file
     bool host_event_buffer_flushed_;
     bool device_event_buffer_flushed_;
     std::atomic<bool> finalized_;
@@ -1817,6 +2323,73 @@ class ClTraceBuffer {
 
 thread_local ClTraceBuffer cl_thread_local_buffer_;
 #endif /* BUILD_WITH_OPENCL */
+
+// T5/E7b: the emitter thread is the only writer of the chrome trace file while
+// it runs. Processing a record runs the exact code the synchronous path would
+// have run (Stringify* -> logger_->Log), on the owning buffer, so the JSON is
+// byte-identical and the per-buffer device track allocation happens in the same
+// per-buffer append order as before. The record is already a private copy: the
+// free() side effects of Stringify* (name_, ITT metadata chain) land on the
+// ring copy, which is the one that owns them now.
+void ChromeTraceEmitter::ProcessRecord(EmitRecord& rec) {
+  switch (rec.type_) {
+    case EMIT_REC_HOST: {
+      TraceBuffer* buffer = static_cast<TraceBuffer *>(rec.buffer_);
+      buffer->SyncFlushHostEvent(*reinterpret_cast<HostEventRecord *>(rec.payload_));
+      break;
+    }
+    case EMIT_REC_ZE_DEVICE: {
+      TraceBuffer* buffer = static_cast<TraceBuffer *>(rec.buffer_);
+      buffer->SyncFlushDeviceEvent(*reinterpret_cast<ZeKernelCommandExecutionRecord *>(rec.payload_));
+      break;
+    }
+#if BUILD_WITH_OPENCL
+    case EMIT_REC_CL_HOST: {
+      ClTraceBuffer* buffer = static_cast<ClTraceBuffer *>(rec.buffer_);
+      buffer->SyncFlushHostEvent(*reinterpret_cast<HostEventRecord *>(rec.payload_));
+      break;
+    }
+    case EMIT_REC_CL_DEVICE: {
+      ClTraceBuffer* buffer = static_cast<ClTraceBuffer *>(rec.buffer_);
+      buffer->SyncFlushDeviceEvent(*reinterpret_cast<ClKernelCommandExecutionRecord *>(rec.payload_));
+      break;
+    }
+#endif /* BUILD_WITH_OPENCL */
+    default: {
+      // never happens: the type is written by the producer together with the
+      // payload, under the same release store
+      break;
+    }
+  }
+  emitted_.fetch_add(1, std::memory_order_release);
+}
+
+void ChromeTraceEmitter::ThreadMain(void) {
+  uint32_t idle = 0;
+  for (;;) {
+    EmitRecord rec;
+    if (DequeueRecord(rec)) {
+      idle = 0;
+      ProcessRecord(rec);
+      continue;
+    }
+    if (stop_.load(std::memory_order_acquire)) {
+      break;  // shutdown and nothing left to write: the ring is fully drained
+    }
+    // Idle backoff: spin briefly, then yield, then sleep -- the emitter must
+    // not burn CPU while the app is paused or between steps.
+    idle++;
+    if (idle < 64) {
+      continue;
+    }
+    else if (idle < 4096) {
+      std::this_thread::yield();
+    }
+    else {
+      std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+  }
+}
 
 class ChromeLogger {
   private:
@@ -1888,6 +2461,12 @@ class ChromeLogger {
 
       logger_->Log(str);
       logger_->SetEmptyPosition();
+
+      // T5/E7b: bring the emitter thread up with the logger. It also starts
+      // lazily on the first record, so this is only an optimization.
+      if (ChromeTraceEmitter::Enabled()) {
+        ChromeTraceEmitter::Get().EnsureStarted();
+      }
     }
 
   public:
@@ -1897,6 +2476,17 @@ class ChromeLogger {
     ~ChromeLogger() {
       if (logger_ != nullptr) {
         std::string chrome_trace_file_name_ = logger_->GetLogFileName();
+
+        // T5/E7b: stop the emitter thread and drain the ring BEFORE the trace
+        // is closed -- sidecar tooling depends on the complete trace existing
+        // at process exit. Done outside logger_lock_ on purpose (the emitter
+        // takes it inside GetDevicePidTid's first-sight metadata branch, so
+        // draining under it could deadlock against our own wait).
+        if (ChromeTraceEmitter::Enabled()) {
+          ChromeTraceEmitter& emitter = ChromeTraceEmitter::Get();
+          emitter.Shutdown();
+          emitter.PrintSummary();
+        }
 
         logger_lock_.lock();
 
@@ -1950,6 +2540,13 @@ class ChromeLogger {
     void Flush() {
       if (logger_ == nullptr) {
         return;
+      }
+      // T5/E7b: with the emitter thread on, the buffers below have nothing left
+      // to stringify -- their records went to the ring as they were buffered.
+      // Drain it before the JSON is closed, and outside logger_lock_ (see the
+      // destructor comment for the lock-order argument).
+      if (ChromeTraceEmitter::Enabled()) {
+        ChromeTraceEmitter::Get().Drain();
       }
       logger_lock_.lock();
       if (!flushed_) {
@@ -2150,6 +2747,11 @@ class ChromeLogger {
       flows_first = UseProtobufOutput();
 #endif /* BUILD_WITH_PERFETTO */
 
+      // UNITRACE_FLOW: the API slice itself is emitted either way (the timeline
+      // keeps its host slices); only the per-kid association records are
+      // dropped. The collector keeps filling kids -- it is simply not consumed.
+      const bool flows_on = FlowRecordsEnabled();
+
       auto buffer_complete = [&]() {
         HostEventRecord *rec = thread_local_buffer_.GetHostEvent();
         rec->type_ = EVENT_COMPLETE;
@@ -2166,7 +2768,7 @@ class ChromeLogger {
         buffer_complete();
       }
 
-      if ((kids != nullptr) && (flow_dir == FLOW_H2D)) {
+      if (flows_on && (kids != nullptr) && (flow_dir == FLOW_H2D)) {
         for (auto id : *kids) {
           HostEventRecord *rec = thread_local_buffer_.GetHostEvent();
 
@@ -2179,7 +2781,7 @@ class ChromeLogger {
           thread_local_buffer_.BufferHostEvent();
         }
       }
-      if ((kids != nullptr) && (flow_dir == FLOW_D2H)) {
+      if (flows_on && (kids != nullptr) && (flow_dir == FLOW_D2H)) {
         for (auto id : *kids) {
           HostEventRecord *rec = thread_local_buffer_.GetHostEvent();
 
@@ -2247,6 +2849,10 @@ class ChromeLogger {
       flows_first = UseProtobufOutput();
 #endif /* BUILD_WITH_PERFETTO */
 
+      // UNITRACE_FLOW: see ChromeCallLoggingCallback -- the API slice stays,
+      // only the per-kid association records are dropped.
+      const bool flows_on = FlowRecordsEnabled();
+
       auto buffer_complete = [&]() {
         HostEventRecord *rec = cl_thread_local_buffer_.GetHostEvent();
         rec->type_ = EVENT_COMPLETE;
@@ -2263,7 +2869,7 @@ class ChromeLogger {
         buffer_complete();
       }
 
-      if ((kids != nullptr) && (flow_dir == FLOW_H2D)) {
+      if (flows_on && (kids != nullptr) && (flow_dir == FLOW_H2D)) {
         for (auto id : *kids) {
           HostEventRecord *rec = cl_thread_local_buffer_.GetHostEvent();
 
@@ -2277,7 +2883,7 @@ class ChromeLogger {
         }
       }
 
-      if ((kids != nullptr) && (flow_dir == FLOW_D2H)) {
+      if (flows_on && (kids != nullptr) && (flow_dir == FLOW_D2H)) {
         for (auto id : *kids) {
           HostEventRecord *rec = cl_thread_local_buffer_.GetHostEvent();
 
