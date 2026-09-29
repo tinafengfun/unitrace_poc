@@ -1,0 +1,50 @@
+**/build
+**/build_debug
+**/__pycache__
+**/_perfetto_pb2
+venv/
+.vscode/
+.vs/
+.vim/
+.cache/
+compile_commands.json
+CMakeUserPresets.json
+error_diff.txt
+*.swp
+
+# --- object / library build outputs ---
+*.o
+*.so
+*.so.*
+*.a
+*.obj
+*.lib
+*.dll
+
+# --- local experiment snapshot copies (never commit) ---
+*.pret5_*
+*.pree6v4_*
+*.prefxb_*
+*.prefx_*
+*.v4b_*
+*.v4c_*
+*.bak
+*.orig
+*~
+
+# --- logs and collector trace output ---
+*.log
+*.ptt
+*.pit
+*.tracedump
+*.dump
+trace*.json
+*.trace.json
+unitrace_*.json
+
+# --- editor / OS droppings ---
+.idea/
+*.swo
+.DS_Store
+core
+core.*

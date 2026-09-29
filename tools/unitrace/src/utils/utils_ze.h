@@ -1,0 +1,445 @@
+//==============================================================
+// Copyright (C) Intel Corporation
+//
+// SPDX-License-Identifier: MIT
+// =============================================================
+
+#ifndef PTI_UTILS_ZE_UTILS_H_
+#define PTI_UTILS_ZE_UTILS_H_
+
+#include <string.h>
+
+#include <chrono>
+#include <string>
+#include <thread>
+#include <vector>
+#include <algorithm>
+
+#include <level_zero/ze_api.h>
+#include <level_zero/zet_api.h>
+#include "ze_loader.h"
+
+#include "demangle.h"
+#include "pti_assert.h"
+#include "utils.h"
+
+inline bool InitializeL0() {
+#if BUILD_WITH_L0
+  auto status = ZE_FUNC(zeInit)(ZE_INIT_FLAG_GPU_ONLY);
+  if (status != ZE_RESULT_SUCCESS) {
+    std::cerr << "[ERROR] Failed to initialize Level Zero runtime" << std::endl;
+#ifndef _WIN32
+    std::cerr << "[INFO] Please ensure that either /proc/sys/dev/i915/perf_stream_paranoid or /proc/sys/dev/xe/observation_paranoid is set to 0." << std::endl;
+#endif /* _WIN32 */
+    return false;
+  } else {
+    return true;
+  }
+#else /* BUILD_WITH_L0 */
+  return true;
+#endif /* BUILD_WITH_L0 */
+}
+
+inline std::vector<ze_driver_handle_t> GetDriverList() {
+  ze_result_t status = ZE_RESULT_SUCCESS;
+
+  uint32_t driver_count = 0;
+  status = ZE_FUNC(zeDriverGet)(&driver_count, nullptr);
+  PTI_ASSERT(status == ZE_RESULT_SUCCESS);
+
+  if (driver_count == 0) {
+    return std::vector<ze_driver_handle_t>();
+  }
+
+  std::vector<ze_driver_handle_t> driver_list(driver_count);
+  status = ZE_FUNC(zeDriverGet)(&driver_count, driver_list.data());
+  PTI_ASSERT(status == ZE_RESULT_SUCCESS);
+
+  return driver_list;
+}
+
+inline std::vector<ze_device_handle_t> GetDeviceList(ze_driver_handle_t driver) {
+  PTI_ASSERT(driver != nullptr);
+  ze_result_t status = ZE_RESULT_SUCCESS;
+
+  uint32_t device_count = 0;
+  status = ZE_FUNC(zeDeviceGet)(driver, &device_count, nullptr);
+  PTI_ASSERT(status == ZE_RESULT_SUCCESS);
+
+  if (device_count == 0) {
+    return std::vector<ze_device_handle_t>();
+  }
+
+  std::vector<ze_device_handle_t> device_list(device_count);
+  status = ZE_FUNC(zeDeviceGet)(driver, &device_count, device_list.data());
+  PTI_ASSERT(status == ZE_RESULT_SUCCESS);
+
+  return device_list;
+}
+
+inline std::vector<ze_device_handle_t> GetDeviceList() {
+  std::vector<ze_device_handle_t> device_list;
+  for (auto driver : GetDriverList()) {
+    for (auto device : GetDeviceList(driver)) {
+      device_list.push_back(device);
+    }
+  }
+  return device_list;
+}
+
+inline std::vector<ze_device_handle_t> GetSubDeviceList(
+    ze_device_handle_t device) {
+  PTI_ASSERT(device != nullptr);
+  ze_result_t status = ZE_RESULT_SUCCESS;
+
+  uint32_t sub_device_count = 0;
+  status = ZE_FUNC(zeDeviceGetSubDevices)(device, &sub_device_count, nullptr);
+  PTI_ASSERT(status == ZE_RESULT_SUCCESS);
+
+  if (sub_device_count == 0) {
+    return std::vector<ze_device_handle_t>();
+  }
+
+  std::vector<ze_device_handle_t> sub_device_list(sub_device_count);
+  status = ZE_FUNC(zeDeviceGetSubDevices)(
+      device, &sub_device_count, sub_device_list.data());
+  PTI_ASSERT(status == ZE_RESULT_SUCCESS);
+
+  return sub_device_list;
+}
+
+inline ze_driver_handle_t GetGpuDriver() {
+  std::vector<ze_driver_handle_t> driver_list;
+
+  for (auto driver : GetDriverList()) {
+    for (auto device : GetDeviceList(driver)) {
+      ze_device_properties_t props{ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES, };
+      ze_result_t status = ZE_FUNC(zeDeviceGetProperties)(device, &props);
+      PTI_ASSERT(status == ZE_RESULT_SUCCESS);
+      if (props.type == ZE_DEVICE_TYPE_GPU) {
+        driver_list.push_back(driver);
+      }
+    }
+  }
+
+  if (driver_list.empty()) {
+    return nullptr;
+  }
+
+  std::string value = utils::GetEnv("PTI_DEVICE_ID");
+  uint32_t device_id = value.empty() ? 0 : std::stoul(value);
+  PTI_ASSERT(device_id < driver_list.size());
+  return driver_list[device_id];
+}
+
+inline ze_device_handle_t GetGpuDevice() {
+  std::vector<ze_device_handle_t> device_list;
+
+  for (auto driver : GetDriverList()) {
+    for (auto device : GetDeviceList(driver)) {
+      ze_device_properties_t props{ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES, };
+      ze_result_t status = ZE_FUNC(zeDeviceGetProperties)(device, &props);
+      PTI_ASSERT(status == ZE_RESULT_SUCCESS);
+      if (props.type == ZE_DEVICE_TYPE_GPU) {
+        device_list.push_back(device);
+      }
+    }
+  }
+
+  if (device_list.empty()) {
+    return nullptr;
+  }
+
+  std::string value = utils::GetEnv("PTI_DEVICE_ID");
+  uint32_t device_id = value.empty() ? 0 : std::stoul(value);
+  PTI_ASSERT(device_id < device_list.size());
+
+  std::vector<ze_device_handle_t> sub_device_list =
+    GetSubDeviceList(device_list[device_id]);
+  if (sub_device_list.empty()) {
+    return device_list[device_id];
+  }
+
+  value = utils::GetEnv("PTI_SUB_DEVICE_ID");
+  if (value.empty()) {
+    return device_list[device_id];
+  }
+
+  uint32_t sub_device_id = value.empty() ? 0 : std::stoul(value);
+  PTI_ASSERT(sub_device_id < sub_device_list.size());
+  return sub_device_list[sub_device_id];
+}
+
+inline ze_context_handle_t GetContext(ze_driver_handle_t driver) {
+  PTI_ASSERT(driver != nullptr);
+
+  ze_result_t status = ZE_RESULT_SUCCESS;
+  ze_context_handle_t context = nullptr;
+  ze_context_desc_t context_desc = {
+      ZE_STRUCTURE_TYPE_CONTEXT_DESC, nullptr, 0};
+
+  status = ZE_FUNC(zeContextCreate)(driver, &context_desc, &context);
+  PTI_ASSERT(status == ZE_RESULT_SUCCESS);
+  return context;
+}
+
+inline std::string GetDeviceName(ze_device_handle_t device) {
+  PTI_ASSERT(device != nullptr);
+  ze_result_t status = ZE_RESULT_SUCCESS;
+  ze_device_properties_t props{ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES, };
+  status = ZE_FUNC(zeDeviceGetProperties)(device, &props);
+  PTI_ASSERT(status == ZE_RESULT_SUCCESS);
+  return props.name;
+}
+
+inline int GetMetricId(zet_metric_group_handle_t group, std::string name) {
+  PTI_ASSERT(group != nullptr);
+
+  ze_result_t status = ZE_RESULT_SUCCESS;
+  uint32_t metric_count = 0;
+  status = ZE_FUNC(zetMetricGet)(group, &metric_count, nullptr);
+  PTI_ASSERT(status == ZE_RESULT_SUCCESS);
+
+  if (metric_count == 0) {
+    return -1;
+  }
+
+  std::vector<zet_metric_handle_t> metric_list(metric_count, nullptr);
+  status = ZE_FUNC(zetMetricGet)(group, &metric_count, metric_list.data());
+  PTI_ASSERT(status == ZE_RESULT_SUCCESS);
+
+  int target = -1;
+  for (uint32_t i = 0; i < metric_count; ++i) {
+    zet_metric_properties_t metric_props{};
+    status = ZE_FUNC(zetMetricGetProperties)(metric_list[i], &metric_props);
+    PTI_ASSERT(status == ZE_RESULT_SUCCESS);
+
+    if (name == metric_props.name) {
+      target = i;
+      break;
+    }
+  }
+
+  return target;
+}
+
+inline zet_metric_group_handle_t FindMetricGroup(
+    ze_device_handle_t device, std::string name,
+    zet_metric_group_sampling_type_flag_t type) {
+  PTI_ASSERT(device != nullptr);
+
+  ze_result_t status = ZE_RESULT_SUCCESS;
+  uint32_t group_count = 0;
+  status = ZE_FUNC(zetMetricGroupGet)(device, &group_count, nullptr);
+  PTI_ASSERT(status == ZE_RESULT_SUCCESS);
+  if (group_count == 0) {
+    return nullptr;
+  }
+
+  std::vector<zet_metric_group_handle_t> group_list(group_count, nullptr);
+  status = ZE_FUNC(zetMetricGroupGet)(device, &group_count, group_list.data());
+  PTI_ASSERT(status == ZE_RESULT_SUCCESS);
+
+  zet_metric_group_handle_t target = nullptr;
+  for (uint32_t i = 0; i < group_count; ++i) {
+    zet_metric_group_properties_t group_props{};
+    group_props.stype = ZET_STRUCTURE_TYPE_METRIC_GROUP_PROPERTIES;
+    status = ZE_FUNC(zetMetricGroupGetProperties)(group_list[i], &group_props);
+    PTI_ASSERT(status == ZE_RESULT_SUCCESS);
+
+    if (name == group_props.name && (group_props.samplingType & type)) {
+      target = group_list[i];
+      break;
+    }
+  }
+
+  return target;
+}
+
+inline std::string GetResultType(zet_value_type_t type) {
+  switch (type) {
+    case ZET_VALUE_TYPE_UINT32:
+      return "UINT32";
+    case ZET_VALUE_TYPE_UINT64:
+      return "UINT64";
+    case ZET_VALUE_TYPE_FLOAT32:
+      return "FLOAT32";
+    case ZET_VALUE_TYPE_FLOAT64:
+      return "FLOAT64";
+    case ZET_VALUE_TYPE_BOOL8:
+      return "BOOL8";
+    default:
+      break;
+  }
+  return "UNKNOWN";
+}
+
+inline std::string GetMetricType(zet_metric_type_t type) {
+  switch (type) {
+    case ZET_METRIC_TYPE_DURATION:
+      return "DURATION";
+    case ZET_METRIC_TYPE_EVENT:
+      return "EVENT";
+    case ZET_METRIC_TYPE_EVENT_WITH_RANGE:
+      return "EVENT_WITH_RANGE";
+    case ZET_METRIC_TYPE_THROUGHPUT:
+      return "THROUGHPUT";
+    case ZET_METRIC_TYPE_TIMESTAMP:
+      return "TIMESTAMP";
+    case ZET_METRIC_TYPE_FLAG:
+      return "FLAG";
+    case ZET_METRIC_TYPE_RATIO:
+      return "RATIO";
+    case ZET_METRIC_TYPE_RAW:
+      return "RAW";
+    default:
+      break;
+  }
+  return "UNKNOWN";
+}
+
+inline size_t GetKernelMaxSubgroupSize(ze_kernel_handle_t kernel) {
+  PTI_ASSERT(kernel != nullptr);
+  ze_kernel_properties_t props{};
+  ze_result_t status = ZE_FUNC(zeKernelGetProperties)(kernel, &props);
+  PTI_ASSERT(status == ZE_RESULT_SUCCESS);
+  return props.maxSubgroupSize;
+}
+
+inline std::string GetKernelName(
+    ze_kernel_handle_t kernel, bool demangle = false) {
+  PTI_ASSERT(kernel != nullptr);
+
+  size_t size = 0;
+  ze_result_t status = ZE_FUNC(zeKernelGetName)(kernel, &size, nullptr);
+  PTI_ASSERT(status == ZE_RESULT_SUCCESS);
+  PTI_ASSERT(size > 0);
+
+  std::vector<char> name(size);
+  status = ZE_FUNC(zeKernelGetName)(kernel, &size, name.data());
+  PTI_ASSERT(status == ZE_RESULT_SUCCESS);
+  PTI_ASSERT(name[size - 1] == '\0');
+
+  if (demangle) {
+    return utils::Demangle(name.data());
+  }
+  return std::string(name.begin(), name.end() - 1);
+}
+
+inline void GetDeviceTimestamps(
+    ze_device_handle_t device,
+    uint64_t* host_timestamp,
+    uint64_t* device_timestamp) {
+  PTI_ASSERT(device != nullptr);
+  PTI_ASSERT(host_timestamp != nullptr);
+  PTI_ASSERT(device_timestamp != nullptr);
+  ze_result_t status = ZE_FUNC(zeDeviceGetGlobalTimestamps)(
+      device, host_timestamp, device_timestamp);
+  PTI_ASSERT(status == ZE_RESULT_SUCCESS);
+}
+
+// TODO: use zeMetricGetGlobalTimestamps
+inline void GetMetricTimestamps(
+    ze_device_handle_t device,
+    uint64_t* host_timestamp,
+    uint64_t* metric_timestamp) {
+  PTI_ASSERT(device != nullptr);
+  PTI_ASSERT(host_timestamp != nullptr);
+  PTI_ASSERT(metric_timestamp != nullptr);
+  ze_result_t status = ZE_FUNC(zeDeviceGetGlobalTimestamps)(
+      device, host_timestamp, metric_timestamp);
+  PTI_ASSERT(status == ZE_RESULT_SUCCESS);
+}
+
+inline ze_api_version_t GetDriverVersion(ze_driver_handle_t driver) {
+  PTI_ASSERT(driver != nullptr);
+
+  ze_api_version_t version = ZE_API_VERSION_FORCE_UINT32;
+  ze_result_t status = ZE_FUNC(zeDriverGetApiVersion)(driver, &version);
+  PTI_ASSERT(status == ZE_RESULT_SUCCESS);
+
+  return version;
+}
+
+inline ze_api_version_t GetZeVersion() {
+  auto driver_list = GetDriverList();
+  if (driver_list.empty()) {
+    return ZE_API_VERSION_FORCE_UINT32;
+  }
+  return GetDriverVersion(driver_list.front());
+}
+
+inline int GetZeDevicesToSample(std::set<int>& devices_to_sample) {
+  std::string devices_to_sample_str = utils::GetEnv("UNITRACE_DevicesToSampleArg");
+  if (devices_to_sample_str.empty()) {
+    return -1;
+  }
+
+  auto list_devices_str = utils::SplitString (devices_to_sample_str, ',');
+  for (const auto &s : list_devices_str) {
+    if (!s.empty()) {
+      bool is_number = std::find_if(s.begin(), s.end(), [] (unsigned char c) { return !std::isdigit(c); }) == s.end();
+      if (is_number) {
+        auto device_to_sample = std::stoi(s.c_str());
+        devices_to_sample.insert (device_to_sample);
+      } else {
+          std::cerr << "[ERROR] Given device to sample (" << s << ") is invalid" << std::endl;
+          return -1;
+      }
+    }
+  }
+  return 0;
+}
+
+inline int GetZeRanksToSample(std::set<int>& ranks_to_sample) {
+  std::string ranks_to_sample_str = utils::GetEnv("UNITRACE_RanksToSample");
+  if (ranks_to_sample_str.empty()) {
+    return -1;
+  }
+
+  auto my_MPI_size = (utils::GetEnv("PMI_SIZE").empty()) ? utils::GetEnv("PMIX_SIZE") : utils::GetEnv("PMI_SIZE");
+  if (my_MPI_size.empty()) {
+    my_MPI_size = (utils::GetEnv("OMPI_COMM_WORLD_SIZE").empty()) ? utils::GetEnv("OMPI_UNIVERSE_SIZE") : utils::GetEnv("OMPI_COMM_WORLD_SIZE");
+  }
+  if (my_MPI_size.empty()) {
+    std::cerr << "[ERROR] PMI_SIZE or PMIX_SIZE or OMPI_COMM_WORLD_SIZE or OMPI_UNIVERSE_SIZE not set. Given --ranks-to-sample but the application does not seem to be using MPI" << std::endl;
+    return -1;
+  }
+  int32_t my_size = std::stoi(my_MPI_size);
+  const auto &my_MPI_rank = (utils::GetEnv("PMI_RANK").empty()) ? utils::GetEnv("PMIX_RANK") : utils::GetEnv("PMI_RANK");
+  if (my_MPI_rank.empty()) {
+    std::cerr << "[ERROR] Given --ranks-to-sample but the application does not seem to be using MPI" << std::endl;
+    return -1;
+  }
+  int32_t my_rank = std::stoi(my_MPI_rank);
+  auto list_mpi_ranks_str = utils::SplitString (ranks_to_sample_str, ',');
+  for (const auto &s : list_mpi_ranks_str) {
+    if (!s.empty()) {
+      bool is_number = std::find_if(s.begin(), s.end(), [] (unsigned char c) { return !std::isdigit(c); }) == s.end();
+      if (is_number) {
+        auto rank_to_sample = std::stoi(s.c_str());
+        if ((0 <= rank_to_sample) && (rank_to_sample < my_size)) {
+          ranks_to_sample.insert (rank_to_sample);
+        } else if (my_rank == 0) {
+            std::cerr << "[WARNING] Given MPI rank to sample (" << s << ") is out of bounds for given execution. Ignoring." << std::endl;
+        }
+      } else if (my_rank == 0) {
+          std::cerr << "[ERROR] Given MPI rank to sample (" << s << ") is invalid" << std::endl;
+          return -1;
+      }
+    }
+  }
+  return 0;
+}
+
+inline void GetZeDevicesStringToSet(std::set<int>& device_ids_to_sample, std::string& devices_to_sample) {
+  if (devices_to_sample.length() > 0) {
+      auto list_devices_str = utils::SplitString (devices_to_sample, ',');
+      for (const auto &s : list_devices_str) {
+        if (!s.empty()) {
+          device_ids_to_sample.insert (std::stoi(s.c_str()));
+        }
+      }
+  }
+}
+#endif // PTI_UTILS_ZE_UTILS_H_

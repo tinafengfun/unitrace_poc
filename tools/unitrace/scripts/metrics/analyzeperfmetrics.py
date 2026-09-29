@@ -1,0 +1,1728 @@
+#==============================================================
+# Copyright (C) Intel Corporation
+#
+# SPDX-License-Identifier: MIT
+# =============================================================
+
+import os
+import io
+import socket
+import ssl
+import sys
+import re
+import shlex
+import subprocess
+import argparse
+import tempfile
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from matplotlib.backends.backend_pdf import PdfPages as pdf
+from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
+from urllib.parse import unquote
+from pathlib import Path
+from dataclasses import dataclass, field
+from typing import Optional, List, Dict, Union
+from enum import Enum
+
+class MetricsMode(Enum):
+    SINGLE_FILE = "single_file"
+    RESULT_DIRECTORY = "result_directory"
+    
+@dataclass
+class DeviceInfo:
+    """Device-specific information only."""
+    device_id: int
+    metrics_file: Path
+    mode: MetricsMode = field(init=False)
+    
+    # Single file mode specific
+    header_line: Optional[int] = field(default=None)
+    last_line: Optional[int] = field(default=None)
+    
+
+    
+    def __post_init__(self):
+        if self.header_line is None and self.last_line is None:
+            self.mode = MetricsMode.RESULT_DIRECTORY
+        elif self.header_line is not None and self.last_line is not None:
+            self.mode = MetricsMode.SINGLE_FILE
+        else:
+            raise ValueError(
+                f"DeviceInfo for device {self.device_id}: "
+                "Must specify both header_line and last_line (single file mode), "
+                "or neither (result directory mode). "
+                f"Currently: header_line={self.header_line}, last_line={self.last_line}"
+            )
+
+        if not (self.metrics_file.exists() and 
+                self.metrics_file.is_file() and 
+                self.metrics_file.stat().st_size > 0):
+            raise ValueError(
+                f"DeviceInfo for device {self.device_id}: "
+                f"File '{self.metrics_file}' does not exist, is not a file, or is empty"
+        )
+
+    def __repr__(self) -> str:
+        return (f"DeviceInfo(device_id={self.device_id}, "
+                f"header_line={self.header_line}, "
+                f"last_line={self.last_line}, "
+                f"metrics_file={self.metrics_file})")
+        
+    def get_device_data(self) -> Optional[pd.DataFrame]:
+        """
+        Read the device-specific metrics data into a DataFrame.
+        """
+        header_line = 0
+        nrows = None
+        try:
+            if self.mode == MetricsMode.RESULT_DIRECTORY:
+                # Skip blank lines at start
+                with self.metrics_file.open('r') as f:
+                    for i, line in enumerate(f):
+                        if line.strip():  # Found non-empty line
+                            header_line = i
+                            break
+            elif self.mode == MetricsMode.SINGLE_FILE:
+                header_line = self.header_line
+                nrows = self.last_line - self.header_line - 1
+                if nrows <= 0:
+                    print(f"Warning: No data rows for device {self.device_id}")
+                    return None
+                
+            df = pd.read_csv(
+                self.metrics_file,
+                skiprows=header_line,
+                nrows=nrows,
+                skip_blank_lines=False,
+                skipinitialspace=True
+                )
+            return df
+        
+        except Exception as e:
+            print(f"Error reading device file {self.metrics_file}: {e}")
+            return None
+
+    def _print_data_from_df(self, df, eustall, of):
+        """
+        Print the relevant data from the DataFrame to the output file or stdout.
+        """
+        if (eustall == False):
+            for m in df.columns.values.tolist():
+                if (m == 'Kernel'):
+                    continue
+                print("        " + m, file = of)
+                if (m == 'StreamMarker'):
+                    break
+
+            kernel_and_instances = dict()
+            kernel = ""
+            for index, row in df.iterrows():
+                if (pd.isna(row['Kernel']) == True):
+                    if kernel in kernel_and_instances:
+                        kernel_and_instances[kernel] = kernel_and_instances[kernel] + 1
+                    else:
+                        if (kernel != ""):
+                            kernel_and_instances[kernel] = 1
+
+                    kernel = ""	# reset kernel name to empty
+                else:
+                    if (kernel == ""):
+                        kernel = row['Kernel']
+
+            print("    Kernel, Number of Instances", file = of)
+            for i, (kernel, instances) in enumerate(kernel_and_instances.items()):
+                print("        \"" + kernel + "\", " + str(instances), file = of)
+        else:
+            for m in df.columns.values.tolist():
+                if (m == 'Kernel' or m == "IP[Address]"):
+                    continue
+                print("        " + m, file = of)
+                if (m == 'OtherStall[Events]'):
+                    break
+
+            kernels = []
+            for index, row in df.iterrows():
+                kernel = row['Kernel']
+                if (kernel not in kernels):
+                    kernels.append(kernel)
+
+            print("    Kernel", file = of)
+            for kernel in kernels:
+                print("        \"" + kernel + "\"", file = of)
+
+    def print_data(self, eustall, of):
+        df = self.get_device_data()
+        print("Device " + str(self.device_id), file=of)
+        if df is None:
+            print(f"    No data available for device {self.device_id}", file=of)
+            return
+        
+        print("    Metric", file = of)
+        self._print_data_from_df(df, eustall, of)
+
+@dataclass
+class MetricsInfo:
+    """Database containing global info and all devices information."""
+    input_path: Union[Path, str]
+    is_result_directory: bool
+    mode: MetricsMode = field(init=False)
+    is_eustall: bool = field(init=False, default=False)
+    devices: Dict[int, DeviceInfo] = field(init=False, default_factory=dict)
+
+    def __post_init__(self):
+        self._validate_input()
+        self._init_devices()
+        self._init_is_eustall()
+
+    def _init_is_eustall(self):
+        if self.is_result_directory and not self.devices:
+            return
+
+        first_metrics_file = self.devices[next(iter(self.devices))].metrics_file if self.is_result_directory else self.input_path
+        
+        if not first_metrics_file.exists():
+            print(f"Warning: Metrics file {first_metrics_file} does not exist")
+        try:
+            with first_metrics_file.open('r') as f:
+                for line in f:
+                    if 'OtherStall[Events]' in line:
+                        self.is_eustall = True
+        except (IOError, OSError) as e:
+            print(f"Warning: Could not read file {first_metrics_file}: {e}")
+    
+    def _init_devices(self):
+        if self.is_result_directory:
+            self._init_devices_from_directory()
+        else:
+            self._init_devices_from_single_file()
+
+    def _init_devices_from_directory(self):
+        """
+        For result_directory mode scan all sub-directories to find metrics files.
+        """
+        # Scan the result directory for metrics files
+        filename_pattern = re.compile(r'^metrics_(\d+)\.csv$')
+        
+        for metrics_file in self.input_path.rglob('metrics/metrics_*.csv'):
+            match = filename_pattern.match(metrics_file.name)
+            if match and metrics_file.stat().st_size > 0:
+                try:
+                    device_id = int(match.group(1))
+                    self.devices[device_id] = DeviceInfo(device_id=device_id,
+                                                         metrics_file=metrics_file)
+                except (ValueError, OverflowError) as e:
+                    print(f"Warning: Invalid device ID in {metrics_file.name}: {e}")
+                    continue
+        if not self.devices:
+            print(f"Warning: No valid metrics files found in directory {self.input_path}")
+
+    def _init_devices_from_single_file(self):
+        """
+        Initialize devices by parsing a single metrics file.
+        """
+        with self.input_path.open('r') as f:
+            linenum = 0
+            current_device_id = 0 # Initialize to 0, will be updated when/if a device banner is found
+            header_line = None
+            first_device_found = False
+            
+            for row in f:
+                if ("=== Device" in row) and ("Metrics ===" in row):
+                    # Save previous device if found
+                    if header_line is not None:
+                        device_info = DeviceInfo(
+                            device_id=current_device_id,
+                            metrics_file=self.input_path,
+                            header_line=header_line,
+                            last_line=linenum  # Current line is start of next device
+                        )
+                        self.devices[current_device_id] = device_info
+                        header_line = None
+                    
+                    # Parse device ID from banner: "=== Device #X Metrics ==="
+                    words = row.split()
+                    for word in words:
+                        if word.startswith('#'):
+                            try:
+                                current_device_id = int(word[1:])  # Remove '#' and convert
+                                break
+                            except ValueError:
+                                print(f"Warning: Could not parse device ID from '{word}'")
+                                continue
+                
+                # Look for header line (after device banner)
+                elif (("OtherStall[Events]" in row) or (row.startswith("Kernel,"))):
+                    header_line = linenum
+                
+                linenum += 1
+            
+            # last device
+            if header_line is not None:
+                device_info = DeviceInfo(
+                    device_id=current_device_id,
+                    metrics_file=self.input_path,
+                    header_line=header_line,
+                    last_line=linenum  # End of file
+                )
+                self.devices[current_device_id] = device_info        
+
+    def _validate_input(self):
+        if isinstance(self.input_path, str):
+            self.input_path = Path(self.input_path).resolve()
+        elif isinstance(self.input_path, Path):
+            self.input_path = self.input_path.resolve()
+        else:
+            raise TypeError(f"input_path must be a Path object or string, got {type(self.input_path).__name__}")
+        
+        if not isinstance(self.is_result_directory, bool):
+            raise TypeError(f"is_result_directory must be a boolean, got {type(self.is_result_directory).__name__}")
+        
+        if not self.input_path.exists():
+            raise FileNotFoundError(f"Input path '{self.input_path}' does not exist.")
+
+        if self.is_result_directory:
+            if not self.input_path.is_dir():
+                raise NotADirectoryError(f"'{self.input_path}' is not a directory")
+        else:
+            if not self.input_path.is_file():
+                raise FileNotFoundError(f"'{self.input_path}' is not a file")
+            if self.input_path.stat().st_size == 0:
+                raise ValueError(f"File '{self.input_path}' is empty")
+    
+    def get_device(self, device_id: int) -> Optional[DeviceInfo]:
+        """Get device info by ID."""
+        return self.devices.get(device_id)
+    
+    def get_device_ids(self) -> List[int]:
+        """Get sorted list of all device IDs."""
+        return sorted(self.devices.keys())
+    
+    def has_device(self, device_id: int) -> bool:
+        """Check if device exists."""
+        return device_id in self.devices
+    
+    def print_data(self, output=None):
+        of = sys.stdout
+        if (output is not None):
+            of = open(output, "w")
+        for device in self.devices.values():
+            device.print_data(self.is_eustall, of)
+        if (output is not None):
+            of.close()
+
+class ReadOptionsFromFile(argparse.Action):
+    def __call__ (self, parser, namespace, values, option_string = None):
+        inputfile = vars(namespace)['input']    # save input file argument in case it is already parsed
+        with values as f:
+            options = shlex.split(f.read().strip())
+            options.append("dummyinput")    # add a dummy input file argument to please parse_args() because input file argument is required
+            parser.parse_args(options, namespace)
+            vars(namespace)['input'] = inputfile # restore input file
+
+def ParseArguments(argv):
+    argparser = argparse.ArgumentParser(description = "GPU Kernel Performance Hardware Metrics Analyzer")
+    argparser.add_argument('-l', '--list', action = 'store_true', help = "list devices, metrics and kernels in the input performance metric data file")
+    argparser.add_argument('-d', '--device', type = int, default = 0, help = "GPU device (device 0 by default)")
+    argparser.add_argument('-k', '--kernel', help = "kernel name with shape, all kernels if this option is not specified")
+    argparser.add_argument('-i', '--instance', type = int, default = 1, help = "kernel instance. all instances if < 1 (1 or the first instance by default)")
+    argparser.add_argument('-m', '--metrics', action = 'append', help = "list of comma-separated metric names")
+    argparser.add_argument('-b', '--throughput', action = 'append', help = "list of comma-separated metric names for throughput")
+    argparser.add_argument('-o', '--output', help = "output file in text format if -l is present, PDF format regardless of file extension if -k is not present or if instance < 1")
+    argparser.add_argument('-p', '--https', action = 'store_true', help = "start https server for backward compatibility only to view metrics with https link")
+    argparser.add_argument('-q', '--http', action = 'store_true', help = "start http server")
+    argparser.add_argument('-c', '--certificate', help = "certificate file for https server")
+    argparser.add_argument('-e', '--key', help = "private key file for https server")
+    argparser.add_argument('-s', '--shaderdump', help = "shader dump folder for stall analysis")
+    argparser.add_argument('-n', '--numtopstalls', type = int, default = 10, help = "number of top most expensive stalls of each type to report for stall analysis(10 default, -1 unlimited)")
+    argparser.add_argument('-g', '--demangler', help = "symbol demangler if c++filt is not available")
+    argparser.add_argument('-r', '--report', help = "stall analysis report in plain text")
+    argparser.add_argument('-y', '--ylabel', action = 'append', help = "label for Y axis")
+    argparser.add_argument('-x', '--xlabel', default = "Time(in sampling intervals)", help = "label for X axis (defaut is \"Time(in sampling intervals)\")")
+    argparser.add_argument('-t', '--title', default = "Performance Metrics", help = "performance metric plot title")
+    argparser.add_argument('-f', '--config', type = open, action = ReadOptionsFromFile, help = "read command options from file")
+    argparser.add_argument('--result-dir', action = 'store_true', help = "Process metrics from structured result directory instead of single CSV file")
+    argparser.add_argument('input', help = 'hardware performance metric data file in .csv format generated by unitrace -k/--stall-sampling')
+
+    return argparser.parse_args(argv)
+
+class Demangler:
+    def __init__(self, demangler):
+        self.available = True
+        if (demangler is not None):
+            self.demangler = os.path.abspath(demangler)
+        else:
+            self.demangler = None
+
+    def Demangle(self, name):
+        if (self.available == True):
+            if (self.demangler is None):
+                cxxfilt = ['c++filt']
+                cxxfilt.append(name)
+
+                try:
+                    p = subprocess.Popen(cxxfilt, stdin = subprocess.PIPE, stdout = subprocess.PIPE, text = True)
+                    stdout, _ = p.communicate()
+                    demangled = stdout.split("\n")[0]
+                    if ("typeinfo name for" not in demangled):   # name is not mangled
+                        return name
+                    else:
+                        return demangled[18:]	#skip leading "typeinfo name for "
+                except (FileNotFoundError, PermissionError, subprocess.SubprocessError) as e:
+                    print(f"Error executing c++filt: {e}")
+                    self.available = False
+                    return name
+            else:
+                command = [self.demangler, name]
+
+                try:
+                    p = subprocess.Popen(command, stdin = subprocess.PIPE, stdout = subprocess.PIPE, text = True)
+                    stdout, _ = p.communicate()
+                    demangled = stdout
+                    if (demangled.endswith("\n")):
+                        demangled = stdout.split("\n")[0]
+                    if ("typeinfo name for" in demangled):   # name is not mangled
+                        return demangled[18:]   #skip leading "typeinfo name for "
+                    else:
+                        return demangled
+                except Exception as e:
+                    print(e)
+                    print(self.demangler + " is not found or fails to run")
+                    self.available = False
+                    return name
+        else:
+            return name
+
+
+class BB:
+    def __init__(self, bid, start, end, preds, succs):
+        self.bid = bid
+        self.start = start
+        self.end = end
+        self.preds = preds
+        self.succs = succs
+
+    def in_bb(self, ins):	# is ins in this basic block
+        if ((ins >= self.start) and (ins <= self.end)):
+            return True
+        else:
+            return False
+
+    def get_bid(self): # get basic block id
+        return self.bid
+
+    def get_preds(self): # get predecessors
+        return self.preds
+
+    def get_head(self):	# get basic lock head instruction address
+        return self.start
+
+    def get_tail(self):	# get basic block tail instruction address
+        return self.end
+
+
+def ConstructCFG(instructions):
+    bb_head = None
+    in_bb = False
+    bb_id = None
+    preds = []
+    succs = []
+    bbs = dict()
+    for addr, ins in enumerate(instructions):
+        if ((re.match("// *B", ins) is not None) and ("Preds" in ins) and ("Succs" in ins)):
+            if (in_bb):	# previous bb ends
+                bb = BB(bb_id, bb_head, addr - 1, preds, succs)
+                bbs[bb_id] = bb
+            in_bb = True
+            bb_head = addr
+            bb_id = ins.split(" ")[1].split(":")[0].strip()
+            preds = []
+            for b in ins.split("Preds")[1].split("{")[1].split("}")[0].split(","):
+                if (b.strip() != ""):
+                    preds.append(b.strip())
+
+            succs = []
+            for b in ins.split("Succs")[1].split("{")[1].split("}")[0].split(","):
+                if (b.strip() != ""):
+                    succs.append(b.strip())
+
+    # don't forget the last bb
+    if (in_bb):
+        bb = BB(bb_id, bb_head, len(instructions) - 1, preds, succs)
+        bbs[bb_id] = bb
+
+    if (len(bbs) == 0):	# at least one BB exits
+        bb = BB("B000", 0, len(instructions) - 1, [], [])
+        bbs["B000"] = bb	# dummy basic block id "B000"
+
+    return bbs
+
+def FindBB(bbs, ins):	# find BB of an instruction
+    for bb_id, bb in bbs.items():
+        if (bb.in_bb(ins)):
+            return bb_id, bb
+
+    return None, None	# never reaches here
+
+def AnalyzeStalls(kernel, args, stalldf):
+    shaders = os.listdir(args.shaderdump)
+    files = []	# .asm files
+    demangler = Demangler(args.demangler)
+
+    for f in shaders:
+        if f.endswith(".asm"):
+            files.append(args.shaderdump + "/" + f)
+
+    asmfiles = []
+    for f in files:
+        with open(f, "r") as inf:
+            for row in inf:
+                if row.startswith("//.kernel"):
+                    kname = row.split()[1]
+                    kname = demangler.Demangle(kname)
+                    if (kernel == kname):
+                        asmfiles.append(f)
+
+    if (len(asmfiles) == 0):
+        msg = "Not found .asm file for " + kernel
+        print(msg)
+        return msg
+
+    asm = asmfiles[0]
+    if (len(asmfiles) > 1):	# kernel has been retried, found the latest one
+        # find the longest name length
+        # the latest one has the longest name
+        max_asm_file_name_len = 0
+        for f in asmfiles:
+            if (len(f) > max_asm_file_name_len):
+                max_asm_file_name_len = len(f)
+                asm = f
+        # find the largest name in alphabetical order
+        # the latest one has the largest name
+        for f in asmfiles:
+            if (len(f) == max_asm_file_name_len):
+                if (asm < f):
+                    asm = f
+
+    ip = 0
+    addressed = True
+    with open(asm, "r") as inf:
+        for row in inf:
+            if ((row.startswith("//") == False) and ("//" in row)):
+                if (row.startswith("/* [" + str('{:08X}'.format(ip)) + "] */ ") == False):	# no ip in asm
+                    addressed = False
+                if ("Compacted" in row):
+                    ip = ip + 0x8
+                else:
+                    ip = ip + 0x10
+
+    if (addressed == False):	# add ip addresses
+        ip = 0
+        with open(asm, "r") as inf:
+            with open(asm + ".ip", "w") as outf:
+                for row in inf:
+                    if ((row.startswith("//") == False) and ("//" in row)):
+                        outf.write("/* [" + str('{:08X}'.format(ip)) + "] */ " + row)
+                        if ("Compacted" in row):
+                            ip = ip + 0x8
+                        else:
+                            ip = ip + 0x10
+                    else:
+                        outf.write(row)
+
+        asm = asm + ".ip"
+
+    source_available = False
+    instructions = []
+    with open(asm, "r") as inf:
+        for row in inf:
+            ins = row.split("\n")
+            if (len(ins) > 0):
+                instructions.append(ins[0])
+            else:
+                instructions.append("")
+            if (re.match("// *Line", row) is not None):
+                source_available = True
+
+    bbs = ConstructCFG(instructions)
+
+    df = stalldf[["IP[Address]", "SbidStall[Events]"]]
+    df = df[df["SbidStall[Events]"] > 0]	# drop 0s
+    df = df.sort_values(by = ["SbidStall[Events]"], ascending = False)
+
+    report = "Kernel: " + kernel + "\n"
+    report += "Assembly with instruction addresses: " + asm + "\n"
+    if (args.numtopstalls >= 0):
+        report += "\nReport of Top " + str(args.numtopstalls) + " Stalls of Each Type\n"
+    else:
+        report += "\nReport of Stalls of Each Type\n"
+
+    report += "***********************************************************************************************\n"
+    report += "Sbid Stalls: \n"
+
+    num_stalls_reported = 0
+    for index, row in df.iterrows():
+        if ((args.numtopstalls >= 0) and (num_stalls_reported >= args.numtopstalls)):
+            break
+
+        ip = row["IP[Address]"]
+        pc = int(ip, 16)
+        for addr, ins in enumerate(instructions):
+            if ((ins.startswith("//") == False) and ("//" in ins)):
+                if (ins.startswith("/* [" + str('{:08X}'.format(pc))+ "] */ ") == True):	# found stalled instruction
+                    words = ins.split("{")
+                    sbids_stalled = []
+                    if (len(words) >= 2):
+                        for token in words[1].split("}")[0].split(","):
+                            if (token.startswith("$") == True):
+                                if (("load" in ins) or ("store" in ins) or ("send" in ins) or ("EOT" in ins)):
+                                    if (len(token.split(".")) > 1): # .src or .dst
+                                        sbids_stalled.append(token)
+                                else:
+                                    sbids_stalled.append(token)
+                    if (len(sbids_stalled) == 0):
+                        words = ins.split("(")	# check if SBID tokens are in (...)
+                        if (len(words) >= 2):
+                            i = 1
+                            done = False
+                            while (done == False):
+                                for token in words[i].split(")")[0].split(","):
+                                    if (token.startswith("$") == True):
+                                        if (("load" in ins) or ("store" in ins) or ("send" in ins) or ("EOT" in ins)):
+                                            if (len(token.split(".")) > 1): # .src or .dst
+                                                sbids_stalled.append(token)
+                                        else:
+                                            sbids_stalled.append(token)
+                                        done = True
+                                i = i + 1
+                                if (i == len(words)):	# all words are inspected
+                                    break
+
+                    ins_stalled_not_line_resolved = addr
+                    ins_stalled_not_file_resolved = addr
+                    ins_stall_not_line_resolved = []
+                    ins_stall_not_file_resolved = []
+                    source_line_stalled = None
+                    source_file_stalled = None
+                    source_lines_stall = dict()
+                    source_files_stall = dict()
+
+                    bbid, bb = FindBB(bbs, addr)
+                    bbs_to_check = [(bbid, bb.get_head(), addr - 1)]	# instrction at addr is the instruction stalled
+                    j = 0
+                    done = False
+                    while (done == False):
+                        if (len(bbs_to_check) <= j):
+                            break
+                        bid, start, end = bbs_to_check[j]
+                        break_at = end
+                        for addr2, ins2 in enumerate(reversed(instructions[start : end + 1])):
+                            if (len(sbids_stalled) > 0):
+                                if ((ins2.startswith("//") == False) and ("//" in ins2) and (re.match(r"/\* *\[", ins2) is not None)):
+                                    tokens = ins2.split("{")
+                                    if (len(tokens) > 1):
+                                        sbids_stall = []
+                                        for token in tokens[1].split("}")[0].split(","):
+                                            if (token.startswith("$") == True):
+                                                sbids_stall.append(token)
+                                        for sbid in sbids_stalled:
+                                            for sbid2 in sbids_stall:
+                                                if (len(sbid.split(".")) > 1): # .dst or .src in bid
+                                                    if (sbid2 == sbid.split(".")[0]):
+                                                        sbids_stalled.remove(sbid)	# remove sbid from the sbids of the instruction stalled
+                                                        ins_stall_not_line_resolved.append(end - addr2)	# source lines/files to be resolved
+                                                        ins_stall_not_file_resolved.append(end - addr2)
+                                                else:
+                                                    if (sbid == sbid2.split(".")[0]): # stalled ins depends on ins2 or dependency already resolved
+                                                        if ((sbid == sbid2) and ("sync." not in ins2)): # ins2 not a sync. ins depends on ins2
+                                                            sbids_stalled.remove(sbid)	# remove sbid from the sbids of the instruction stalled
+                                                            ins_stall_not_line_resolved.append(end - addr2) # source lines/files to be resolved
+                                                            ins_stall_not_file_resolved.append(end - addr2)
+
+                            if (re.match("// *Line", ins2) is not None):
+                                if (ins_stalled_not_line_resolved != None): # source line of stalled instruction
+                                    source_line_stalled = end - addr2
+                                    ins_stalled_not_line_resolved = None
+
+                                for i in ins_stall_not_line_resolved:
+                                    source_lines_stall[i] = end - addr2
+                                ins_stall_not_line_resolved.clear()
+
+                            if (re.match("// *File", ins2) is not None):
+                                if (ins_stalled_not_file_resolved != None): # source file of stalled instruction
+                                    source_file_stalled = end - addr2
+                                    ins_stalled_not_file_resolved = None
+
+                                for i in ins_stall_not_file_resolved:
+                                    source_files_stall[i] = end - addr2
+                                ins_stall_not_file_resolved.clear()
+
+                            if (len(sbids_stalled) == 0):
+                                if (source_available == False):
+                                    done = True
+                                else:
+                                    if ((ins_stalled_not_line_resolved == None) and (ins_stalled_not_file_resolved == None)):
+                                        if ((len(ins_stall_not_line_resolved) == 0) and (len(ins_stall_not_file_resolved) == 0)):
+                                            done = True
+
+                                break_at = end - addr2
+                                break
+
+                        if (done == False):
+                            if (len(sbids_stalled) == 0):
+                                # scan backward for source line and file
+                                for addr3, ins3 in enumerate(reversed(instructions[0 : break_at])):
+                                    if (re.match("// *Line", ins3) is not None):
+                                        if (ins_stalled_not_line_resolved != None): # source line of stalled instruction
+                                            source_line_stalled = break_at - 1 - addr3
+                                            ins_stalled_not_line_resolved = None
+
+                                        for i in ins_stall_not_line_resolved:
+                                            source_lines_stall[i] = break_at - 1 - addr3
+                                        ins_stall_not_line_resolved.clear()
+
+                                    if (re.match("// *File", ins3) is not None):
+                                        if (ins_stalled_not_file_resolved != None): # source file of stalled instruction
+                                            source_file_stalled = break_at - 1 - addr3
+                                            ins_stalled_not_file_resolved = None
+
+                                        for i in ins_stall_not_file_resolved:
+                                            source_files_stall[i] = break_at - 1 - addr3
+                                        ins_stall_not_file_resolved.clear()
+
+                                done = True
+                                break
+                            else:
+                                for b in bbs[bid].get_preds():
+                                    bb = bbs[b]
+                                    bbs_to_check.append((b, bb.get_head(), bb.get_tail()))
+                        else:
+                            break
+
+                        j = j + 1
+
+                    report += "\nInstruction\n"
+                    report += "  " + ins + "\n";
+                    if (source_line_stalled != None):
+                        report += "  " + instructions[source_line_stalled][3:] + "\n"
+                        if (source_file_stalled != None):
+                            report += "  " + instructions[source_file_stalled][3:] + "\n"
+
+                    if ((len(source_lines_stall) > 0) or (len(ins_stall_not_line_resolved) > 0)):
+                        report += "is stalled potentially by\n"
+                        for i, line in source_lines_stall.items():
+                            report += "  instruction\n"
+                            report += "    " + instructions[i] + "\n"
+                            report += "    " + instructions[line][3:] + "\n"
+                            if (i in source_files_stall):
+                                report += "    " + instructions[source_files_stall[i]][3:] + "\n"
+                            else:
+                                report += "    File: unknown\n"
+                        for i in ins_stall_not_line_resolved:
+                            report += "  instruction\n"
+                            report += "    " + instructions[i] + "\n"
+                    else:
+                        report += "is stalled\n"
+
+                    break
+
+        num_stalls_reported = num_stalls_reported + 1 
+
+    # analyze stalls of other types
+
+    type = ["ControlStall[Events]", "PipeStall[Events]", "SendStall[Events]", "DistStall[Events]", "SyncStall[Events]", "InstrFetchStall[Events]", "OtherStall[Events]"]
+    for t in type:
+        df = stalldf[["IP[Address]", t]]
+        df = df[df[t] > 0]	# drop 0s
+        if (df.shape[0] == 0):	# zero stalls. move to the next type
+            continue
+        df = df.sort_values(by = [t], ascending = False)
+
+        report += "***********************************************************************************************\n"
+        report += t.split("Stall")[0] + " Stalls: \n"
+
+        num_stalls_reported = 0
+        for index, row in df.iterrows():
+            if ((args.numtopstalls >= 0) and (num_stalls_reported >= args.numtopstalls)):
+                break
+            ip = row["IP[Address]"]
+            pc = int(ip, 16)
+            for addr, ins in enumerate(instructions):
+                if ((ins.startswith("//") == False) and ("//" in ins)):
+                    if (ins.startswith("/* [" + str('{:08X}'.format(pc))+ "] */ ") == True):	# found stalled instruction
+                        if (source_available == True):
+                            ins_stalled_not_line_resolved = addr
+                            ins_stalled_not_file_resolved = addr
+                            source_line_stalled = None
+                            source_file_stalled = None
+
+                            for addr2, ins2 in enumerate(reversed(instructions[0: addr])):
+                                if (re.match("// *Line", ins2) is not None):
+                                    if (ins_stalled_not_line_resolved != None): # source line of stalled instruction
+                                        source_line_stalled = addr - 1 - addr2
+                                        ins_stalled_not_line_resolved = None
+
+                                if (re.match("// *File", ins2) is not None):
+                                    if (ins_stalled_not_file_resolved != None): # source file of stalled instruction
+                                        source_file_stalled = addr - 1 - addr2
+                                        ins_stalled_not_file_resolved = None
+
+                                if ((ins_stalled_not_line_resolved == None) and (ins_stalled_not_file_resolved == None)):
+                                    break	# we are done
+
+                        report += "\nInstruction\n"
+                        report += "  " + ins + "\n"
+                        if (source_line_stalled != None):
+                            report += "  " + instructions[source_line_stalled][3:] + "\n"
+                            if (source_file_stalled != None):
+                                report += "  " + instructions[source_file_stalled][3:] + "\n"
+
+                        report += "is stalled\n"
+
+                        break
+
+            num_stalls_reported = num_stalls_reported + 1 
+
+    report += "===============================================================================================\n"
+    return report
+
+def WriteOutStallReport(report, p): # p is PDF object
+    if (p is None): # p should already be created, but just in case
+        return  # do nothing
+
+    lines = report.split('\n')
+    page = ""
+    num = 0
+    page_size = 48  # number of lines per page
+    line_width = 160 # number of characters per line
+    font_size = 4
+    for line in lines:
+        if (len(line) == 0):    # empty line
+            line = "\n"
+        s = 0
+        while (len(line[s:]) > line_width):
+            page += line[s:s + line_width]
+            page += '\n'
+            num += 1
+            if (num == page_size):
+                fig = plt.figure()
+                plt.axis('off')
+                page = page.replace('$', r'\$')  # escape '$'
+                plt.text(0.0, 0.0, page, fontsize = font_size, ha = 'left', wrap = True)
+                fig.savefig(p, format = 'pdf')
+                plt.close(fig) # close figure
+                page = ""  # reset for next page
+                num = 0
+            s += line_width
+        if (s < len(line)):
+            page += line[s:]
+            page += '\n'
+            num += 1
+            if (num == page_size):
+                fig = plt.figure()
+                plt.axis('off')
+                page = page.replace('$', r'\$')
+                plt.text(0.0, 0.0, page, fontsize = font_size, ha = 'left', wrap = True)
+                fig.savefig(p, format = 'pdf')
+                plt.close(fig) # close figure
+                page = ""  # reset for next page
+                num = 0
+            
+    # don't forget the last page
+    if (num != 0):
+        fig = plt.figure()
+        plt.axis('off')
+        page = page.replace('$', r'\$')
+        plt.text(0.0, 0.0, page, fontsize = font_size, ha = 'left', wrap = True)
+        fig.savefig(p, format = 'pdf')
+        plt.close(fig) # close figure
+
+    return
+
+def AnalyzeStallMetrics(args, device_data_df, kernel, http = False):
+    if ((http == True) and (kernel is None)):
+        return None, None
+
+    buf = None
+    stall_analysis_report_out = None
+    if (args.shaderdump is not None):
+        if (os.path.isdir(args.shaderdump) == False):
+            msg = "Shader dump folder " + args.shaderdump + " does not exist"
+            if (http == False):
+                print(msg)
+            return msg, None
+        if ((http == False) and (args.report is not None)):
+            stall_analysis_report_out = open(args.report, "w")
+
+    stalls = ["ControlStall[Events]", "PipeStall[Events]", "SendStall[Events]", "DistStall[Events]", "SbidStall[Events]", "SyncStall[Events]", "InstrFetchStall[Events]", "OtherStall[Events]"]
+
+    ins_per_page = 100  # number of instuctions to histogram per page
+    if (kernel is None):    # http is False
+        # all kernels
+        start = 0
+        stop = -1
+        kernel = ""
+        p = None
+        for index, row in device_data_df.iterrows():
+            if (kernel == ""):
+                kernel = row['Kernel']
+                start = index
+            else:
+                if (kernel != row['Kernel']):
+                    stop = index
+                    df2 = device_data_df[start:stop]    # data frame of the kernel of interest
+                    # remove rows with 0 stall events
+                    df2 = df2.loc[(df2["ControlStall[Events]"] != 0) | (df2["PipeStall[Events]"] != 0) | (df2["SendStall[Events]"] != 0) | (df2["DistStall[Events]"] != 0) | (df2["SbidStall[Events]"] != 0) | (df2["SyncStall[Events]"] != 0) | (df2["InstrFetchStall[Events]"] != 0) | (df2["OtherStall[Events]"] != 0)]
+                    df3 = df2[stalls]
+
+                    if (df3.shape[0] > 0):
+                        xlabels = []
+                        xticks = []
+                        for i, ip in enumerate(df2["IP[Address]"]):
+                            xlabels.append(ip)
+                            xticks.append(i)
+
+                        df3 = df3.reset_index()
+                        numpages = (df3.shape[0] + (ins_per_page - 1)) // ins_per_page # multiple charts if more than ins_per_page instructions are stalled
+                        if (numpages > 1):
+                            for page in range(1, numpages + 1):
+                                df4 = df3[ins_per_page * (page - 1) : min([ins_per_page * page, df3.shape[0]])]
+                                if (df4.shape[0] > 1):
+                                    ax = df4.plot(y = stalls, kind = 'line', xlabel = "IP[Address]", ylabel = "Events", fontsize = 6)
+                                else:
+                                    ax = df4.plot(y = stalls, kind = 'bar', xlabel = "IP[Address]", ylabel = "Events", fontsize = 6)
+                                ax.set_xticks(xticks[ins_per_page * (page - 1) :  min([ins_per_page * page, df3.shape[0]])], labels = xlabels[ins_per_page * (page - 1) :  min([ins_per_page * page, df3.shape[0]])], rotation = 90, fontsize = 4)
+                                plt.grid(visible = True, which = 'both', axis = 'y')
+                                plt.legend(loc = 'best', fontsize = 4)
+                                plt.title(label = args.title + "\n(" + kernel + ")(" + str(page) + "/" + str(numpages) + ")", loc = 'center', fontsize = 8, wrap = True)
+                                plt.tight_layout()
+                                fig = ax.get_figure()
+                                if (p == None):
+                                    p = pdf(args.output)
+                                fig.savefig(p, format = 'pdf')
+                                plt.close(fig)	# close figure to save memory
+                        else:
+                            if (df3.shape[0] > 1):	# draw line chart if there are at least 2 data points
+                                ax = df3.plot(y = stalls, kind = 'line', xlabel = "IP[Address]", ylabel = "Events", fontsize = 6)
+                            else:	# draw bar chart otherwise
+                                ax = df3.plot(y = stalls, kind = 'bar', xlabel = "IP[Address]", ylabel = "Events", fontsize = 6)
+                            ax.set_xticks(xticks, labels = xlabels, rotation = 90, fontsize = 4)
+                            plt.grid(visible = True, which = 'both', axis = 'y')
+                            plt.legend(loc = 'best', fontsize = 4)
+                            plt.title(label = args.title + "\n(" + kernel + ")", loc = 'center', fontsize = 8, wrap = True)
+                            plt.tight_layout()
+                            fig = ax.get_figure()
+                            if (p == None):
+                                p = pdf(args.output)
+                            fig.savefig(p, format = 'pdf')
+                            plt.close(fig)	# close figure to save memory
+
+                        if (args.shaderdump is not None):
+                            report = AnalyzeStalls(kernel, args, df2)
+                            if (stall_analysis_report_out is not None):
+                                print(report, file = stall_analysis_report_out)
+                            if (p == None):
+                                p = pdf(args.output)
+                            WriteOutStallReport(report, p)
+            
+                        print("\nAnalyzed kernel " + kernel)
+                    else:
+                        print("\nNo stall events for kernel " + kernel)
+
+                    kernel = row['Kernel']
+                    start = index
+
+        # last kernel
+        stop = device_data_df.shape[0]
+        df2 = device_data_df[start : stop]    # data frame of the kernel of interest
+
+        # remove rows with 0 stall events
+        df2 = df2.loc[(df2["ControlStall[Events]"] != 0) | (df2["PipeStall[Events]"] != 0) | (df2["SendStall[Events]"] != 0) | (df2["DistStall[Events]"] != 0) | (df2["SbidStall[Events]"] != 0) | (df2["SyncStall[Events]"] != 0) | (df2["InstrFetchStall[Events]"] != 0) | (df2["OtherStall[Events]"] != 0)]
+        df3 = df2[stalls]
+
+        if (df3.shape[0] > 0):
+            xlabels = []
+            xticks = []
+            for i, ip in enumerate(df2["IP[Address]"]):
+                xlabels.append(ip)
+                xticks.append(i)
+
+            df3 = df3.reset_index()
+            numpages = (df3.shape[0] + (ins_per_page - 1)) // ins_per_page  # multiple charts if more than ins_per_page instructions are stalled
+            if (numpages > 1):
+                for page in range(1, numpages + 1):
+                    df4 = df3[ins_per_page * (page - 1) : min([ins_per_page * page, df3.shape[0]])]
+                    if (df4.shape[0] > 1):
+                        ax = df4.plot(y = stalls, kind = 'line', xlabel = "IP[Address]", ylabel = "Events", fontsize = 6)
+                    else:
+                        ax = df4.plot(y = stalls, kind = 'bar', xlabel = "IP[Address]", ylabel = "Events", fontsize = 6)
+                    ax.set_xticks(xticks[ins_per_page * (page - 1) :  min([ins_per_page * page, df3.shape[0]])], labels = xlabels[ins_per_page * (page - 1) :  min([ins_per_page * page, df3.shape[0]])], rotation = 90, fontsize = 4)
+                    plt.grid(visible = True, which = 'both', axis = 'y')
+                    plt.legend(loc = 'best', fontsize = 4)
+                    plt.title(label = args.title + "\n(" + kernel + ")(" + str(page) + "/" + str(numpages) + ")", loc = 'center', fontsize = 8, wrap = True)
+                    plt.tight_layout()
+                    fig = ax.get_figure()
+                    if (p == None):
+                        p = pdf(args.output)
+                    fig.savefig(p, format = 'pdf')
+                    plt.close(fig)	# close figure to save memory
+            else:
+                if (df3.shape[0] > 1):
+                    ax = df3.plot(y = stalls, kind = 'line', xlabel = "IP[Address]", ylabel = "Events", fontsize = 6)
+                else:
+                    ax = df3.plot(y = stalls, kind = 'bar', xlabel = "IP[Address]", ylabel = "Events", fontsize = 6)
+
+                ax.set_xticks(xticks, labels = xlabels, rotation = 90, fontsize = 4)
+                plt.grid(visible = True, which = 'both', axis = 'y')
+                plt.legend(loc = 'best', fontsize = 4)
+                plt.title(label = args.title + "\n(" + kernel + ")", loc = 'center', fontsize = 8, wrap = True)
+                plt.tight_layout()
+                fig = ax.get_figure()
+                if (p == None):
+                    p = pdf(args.output)
+                fig.savefig(p, format = 'pdf')
+                plt.close(fig)	# close figure to save memory
+
+            if (args.shaderdump is not None):
+                report = AnalyzeStalls(kernel, args, df2)
+                if (stall_analysis_report_out is not None):
+                    print(report, file = stall_analysis_report_out)
+                if (p == None):
+                    p = pdf(args.output)
+                WriteOutStallReport(report, p)
+
+            print("\nAnalyzed kernel " + kernel)
+        else:
+            print("\nNo stall events for kernel " + kernel)
+
+        if (p != None):
+            p.close()
+            print("\nStall metric charts are stored in file " + args.output + " in PDF format")
+
+        if ((args.shaderdump is not None) and (args.report is not None) and (stall_analysis_report_out is not None)):
+            stall_analysis_report_out.close()
+            print("Stall report is also stored in file " + args.report)
+
+    else:
+        counting = True
+        start = -1
+        stop = -1
+        kernelfound = False
+
+        for index, row in device_data_df.iterrows():
+            if (row['Kernel'] == kernel):
+                if (kernelfound == False):
+                    start = index
+                    kernelfound = True
+            else:
+                if (kernelfound == True):
+                    stop = index
+                    break
+
+        if (kernelfound == False):
+            msg = "No metric data for kernel " + kernel
+            if (http == False):
+                print(msg)
+            return msg, None
+
+        if (stop == -1):
+            stop = device_data_df.shape[0]
+
+        df2 = device_data_df[start : stop]    # data frame of the kernel of interest
+
+        # remove rows with 0 stall events
+        df2 = df2.loc[(df2["ControlStall[Events]"] != 0) | (df2["PipeStall[Events]"] != 0) | (df2["SendStall[Events]"] != 0) | (df2["DistStall[Events]"] != 0) | (df2["SbidStall[Events]"] != 0) | (df2["SyncStall[Events]"] != 0) | (df2["InstrFetchStall[Events]"] != 0) | (df2["OtherStall[Events]"] != 0)]
+        df3 = df2[stalls]
+
+        if (df3.shape[0] > 0):
+            xlabels = []
+            xticks = []
+            for i, ip in enumerate(df2["IP[Address]"]):
+                xlabels.append(ip)
+                xticks.append(i)
+
+            df3 = df3.reset_index()
+            numpages = (df3.shape[0] + (ins_per_page - 1)) // ins_per_page # multiple charts if more than ins_per_page instructions are stalled
+            p = None
+            if (http == False):
+                p = pdf(args.output)
+            else:
+                tmpdir = tempfile.TemporaryDirectory()
+                tmpfile = os.path.join(tmpdir.name, "stallchart.pdf")
+                p = pdf(tmpfile)
+
+            if (numpages > 1):
+                for page in range(1, numpages + 1):
+                    df4 = df3[ins_per_page * (page - 1) : min([ins_per_page * page, df3.shape[0]])]
+                    if (df4.shape[0] > 1):
+                        ax = df4.plot(y = stalls, kind = 'line', xlabel = "IP[Address]", ylabel = "Events", fontsize = 6)
+                    else:
+                        ax = df4.plot(y = stalls, kind = 'bar', xlabel = "IP[Address]", ylabel = "Events", fontsize = 6)
+                    ax.set_xticks(xticks[ins_per_page * (page - 1) :  min([ins_per_page * page, df3.shape[0]])], labels = xlabels[ins_per_page * (page - 1) :  min([ins_per_page * page, df3.shape[0]])], rotation = 90, fontsize = 4)
+                    plt.grid(visible = True, which = 'both', axis = 'y')
+                    plt.legend(loc = 'best', fontsize = 4)
+                    plt.title(label = args.title + "\n(" + kernel + ")(" + str(page) + "/" + str(numpages) + ")", loc = 'center', fontsize = 8, wrap = True)
+                    plt.tight_layout()
+                    fig = ax.get_figure()
+                    fig.savefig(p, format = 'pdf')
+                    plt.close(fig)	# close figure to save memory
+            else:
+                if (df3.shape[0] > 1):
+                    ax = df3.plot(y = stalls, kind = 'line', xlabel = "IP[Address]", ylabel = "Events", fontsize = 6)
+                else:
+                    ax = df3.plot(y = stalls, kind = 'bar', xlabel = "IP[Address]", ylabel = "Events", fontsize = 6)
+                ax.set_xticks(xticks, labels = xlabels, rotation = 90, fontsize = 4)
+                plt.grid(visible = True, which = 'both', axis = 'y')
+                plt.legend(loc = 'best', fontsize = 4)
+                plt.title(label = args.title + "\n(" + kernel + ")", loc = 'center', fontsize = 8, wrap = True)
+                plt.tight_layout()
+                fig = ax.get_figure()
+                fig.savefig(p, format = 'pdf')
+                plt.close(fig)
+
+            if (args.shaderdump is not None):
+                report = AnalyzeStalls(kernel, args, df2)
+                if ((http == False) and (stall_analysis_report_out is not None)):
+                    print(report, file = stall_analysis_report_out)
+                WriteOutStallReport(report, p)
+
+            if (p != None):
+                p.close()
+
+            if (http == True):
+                buf = io.BytesIO()
+                fp = open(tmpfile, "rb")
+                buf.write(fp.read())
+                fp.close()
+                os.remove(tmpfile)
+                tmpdir.cleanup()
+
+            if (http == False):
+                print("\nStall metric chart in file " + args.output + " has been successfully generated.")
+        else:
+            print("\nNo stall events for kernel " + kernel + " in the input data")
+
+        if ((http == False) and (args.shaderdump is not None) and (args.report is not None) and (stall_analysis_report_out is not None)):
+            stall_analysis_report_out.close()
+            print("Stall report is also stored in file " + args.report)
+
+    return None, buf
+
+def PlotKernelInstancePerfMetrics(args, kernel, df, metric_sets_cleansed, throughputs_sets_cleansed, p):
+    k = 0
+    counting = True
+    start = -1
+    stop = -1
+    instancefound = False
+
+    for index, row in df.iterrows():
+        if (pd.isna(row['Kernel']) == False):
+            if ((row['Kernel'] == kernel) and (counting == True)):
+                k = k + 1			# found kernel of interest
+                counting = False		# set to false so this block will not enter again for this instance
+                if (k == args.instance):	# found instance of interest
+                    start = index
+                    instancefound = True
+        else:
+            counting = True			# a new kernel and/or a new instance starts in the data frame
+            if (instancefound == True):
+                stop = index
+                break
+
+    if ((instancefound == True) and (stop == -1)):	# the instance of interest is at the end of data frame
+        stop = df.shape[0]
+
+    if (instancefound == False):
+        print("No metric data for instance " + str(args.instance) + " of kernel " + kernel)
+        return False, p
+
+    df2 = df[start : stop]	# data frame of the instance of interest
+    analyzed = False
+    for metrics_cleansed, label in zip(metric_sets_cleansed, args.ylabel):
+        df3 = df2[metrics_cleansed]
+
+        if (df3.shape[0] > 0):
+            if (df3.shape[0] > 1):
+                ax = df3.plot(y = metrics_cleansed, kind = 'line', xlabel = args.xlabel, ylabel = label)
+            else:
+                ax = df3.plot(y = metrics_cleansed, kind = 'bar', xlabel = args.xlabel, ylabel = label)
+            plt.grid(visible = True, which = 'both', axis = 'y')
+            plt.legend(loc = 'best', fontsize = 4)
+            plt.title(label = args.title + "\n(" + kernel + ")", loc = 'center', fontsize = 8, wrap = True)
+            plt.tight_layout()
+            if (p == None):
+                p = pdf(args.output)
+            fig = ax.get_figure()
+            fig.savefig(p, format = 'pdf')
+            plt.close(fig)	# close figure to save memory
+            analyzed = True
+        else:
+            break
+
+    if (analyzed == True):
+        for throughputs_cleansed in throughputs_sets_cleansed:
+            df3 = df2[throughputs_cleansed]
+            df3 = (df3.iloc[:, 1:]).div(df3.iloc[:, 0], axis = 0)
+    
+            if (df3.shape[0] > 0):
+                if (df3.shape[0] > 1):
+                    ax = df3.plot(y = throughputs_cleansed[1:], kind = 'line', xlabel = args.xlabel, ylabel = 'Throughput(GB/s)')
+                else:
+                    ax = df3.plot(y = throughputs_cleansed[1:], kind = 'bar', xlabel = args.xlabel, ylabel = 'Throughput(GB/s)')
+    
+                plt.grid(visible = True, which = 'both', axis = 'y')
+                plt.legend(loc = 'best', fontsize = 4)
+                plt.title(label = args.title + "\n(" + kernel + ")", loc = 'center', fontsize = 8, wrap = True)
+                plt.tight_layout()
+                if (p == None):
+                    p = pdf(args.output)
+                fig = ax.get_figure()
+                fig.savefig(p, format = 'pdf')
+                plt.close(fig)	# close figure to save memory
+
+            else:
+                break
+    
+    return analyzed, p
+
+def AnalyzePerfMetrics(args, device_data_df):
+    metric_sets_cleansed = []
+    for metric_set in args.metrics:
+        metrics = metric_set.split(sep = ',')
+        metrics_cleansed = []
+        for metric in metrics:
+            me = metric.strip()			# strip off leading and trailing whitespaces
+            if (me not in device_data_df.columns):
+                print("No metric data for " + metric)
+                return
+            else:
+                metrics_cleansed.append(me)
+        metric_sets_cleansed.append(metrics_cleansed)
+
+    throughputs_sets_cleansed = []
+    if (args.throughput is not None):
+        for throughput_set in args.throughput:
+            throughputs = throughput_set.split(sep = ',')
+            throughputs_cleansed = ['GpuTime[ns]']
+            for throughput in throughputs:
+                bw = throughput.strip()			# strip off leading and trailing whitespaces
+                if (bw not in device_data_df.columns):
+                    print("No throughput data for " + bw)
+                    return
+                else:
+                    throughputs_cleansed.append(bw)
+            throughputs_sets_cleansed.append(throughputs_cleansed)
+
+    p = None
+    if (args.kernel is None):
+        if (args.instance < 1):
+            # all kernels and all instances
+            start = 0
+            stop = -1
+            kernel = ""
+            for index, row in device_data_df.iterrows():
+                if (pd.isna(row['Kernel']) == True):
+                    stop = index	# current kernel instance ends
+
+                    df2 = device_data_df[start : stop]	# data frame of the instance of interest
+                    analyzed = False
+                    for metrics_cleansed, label in zip(metric_sets_cleansed, args.ylabel):
+                        df3 = df2[metrics_cleansed]
+                        if (df3.shape[0] > 0):
+                            if (df3.shape[0] > 1):
+                                ax = df3.plot(y = metrics_cleansed, kind = 'line', xlabel = args.xlabel, ylabel = label)
+                            else:
+                                ax = df3.plot(y = metrics_cleansed, kind = 'bar', xlabel = args.xlabel, ylabel = label)
+    
+                            plt.grid(visible = True, which = 'both', axis = 'y')
+                            plt.legend(loc = 'best', fontsize = 4)
+                            plt.title(label = args.title + "\n(" + kernel + ")", loc = 'center', fontsize = 8, wrap = True)
+                            plt.tight_layout()
+                            if (p == None):
+                                p = pdf(args.output)
+                            fig = ax.get_figure()
+                            fig.savefig(p, format = 'pdf')
+                            plt.close(fig)	# close figure to save memory
+                            analyzed = True
+                        else:
+                            break
+
+                    if (analyzed == True):
+                        for throughputs_cleansed in throughputs_sets_cleansed:
+                            df3 = df2[throughputs_cleansed]
+                            df3 = (df3.iloc[:, 1:]).div(df3.iloc[:, 0], axis = 0)
+    
+                            if (df3.shape[0] > 0):
+                                if (df3.shape[0] > 1):
+                                    ax = df3.plot(y = throughputs_cleansed[1:], kind = 'line', xlabel = args.xlabel, ylabel = 'Throughput(GB/s)')
+                                else:
+                                    ax = df3.plot(y = throughputs_cleansed[1:], kind = 'bar', xlabel = args.xlabel, ylabel = 'Throughput(GB/s)')
+        
+                                plt.grid(visible = True, which = 'both', axis = 'y')
+                                plt.legend(loc = 'best', fontsize = 4)
+                                plt.title(label = args.title + "\n(" + kernel + ")", loc = 'center', fontsize = 8, wrap = True)
+                                plt.tight_layout()
+                                if (p == None):
+                                    p = pdf(args.output)
+                                fig = ax.get_figure()
+                                fig.savefig(p, format = 'pdf')
+                                plt.close(fig)	# close figure to save memory
+                                analyzed = True
+                            else:
+                                break
+    
+                        print("Analyzed kernel " + kernel)
+                    else:
+                        print("No samples for kernel " + kernel)
+
+                    kernel = ""	# reset kernel name to empty
+                else:
+                    if (kernel == ""):
+                        start = index	# a new kernel instance starts
+                        kernel = row['Kernel']
+
+        else:
+            # specified instance of all kernels
+            kernels = device_data_df['Kernel'].unique()
+            for kernel in kernels:
+                if (pd.isna(kernel) == True):
+                    continue
+
+                analyzed, p = PlotKernelInstancePerfMetrics(args, kernel, device_data_df, metric_sets_cleansed, throughputs_sets_cleansed, p)
+                if (analyzed == True):
+                    print("Analyzed kernel " + kernel)
+
+    else:
+        if (args.instance < 1):
+            # specified kernel all instances
+            counting = True
+            start = -1
+            stop = -1
+            instance = 0
+            for index, row in device_data_df.iterrows():
+                if (pd.isna(row['Kernel']) == False):
+                    if ((row['Kernel'] == args.kernel) and (counting == True)):
+                        start = index			# found kernel of interest
+                        counting = False		# set to false so this block will not enter again for this instance
+                else:
+                    if (counting == False):
+                        # instance ends
+                        stop = index
+                        df2 = device_data_df[start : stop]	# data frame of the instance of interest
+                        analyzed = False
+                        for metrics_cleansed, label in zip(metric_sets_cleansed, args.ylabel):
+                            df3 = df2[metrics_cleansed]
+
+                            instance = instance + 1
+                            if (df3.shape[0] > 0):
+                                if (df3.shape[0] > 1):
+                                    ax = df3.plot(y = metrics_cleansed, kind = 'line', xlabel = args.xlabel, ylabel = label)
+                                else:
+                                    ax = df3.plot(y = metrics_cleansed, kind = 'bar', xlabel = args.xlabel, ylabel = label)
+
+                                plt.grid(visible = True, which = 'both', axis = 'y')
+                                plt.legend(loc = 'best', fontsize = 4)
+                                plt.title(label = args.title + "\n(" + args.kernel + ")", loc = 'center', fontsize = 8, wrap = True)
+                                plt.tight_layout()
+                                if (p == None):
+                                    p = pdf(args.output)
+                                fig = ax.get_figure()
+                                fig.savefig(p, format = 'pdf')
+                                plt.close(fig)	# close figure to save memory
+                                analyzed = True
+                            else:
+                                break
+
+                        if (analyzed):
+                            for throughputs_cleansed in throughputs_sets_cleansed:
+                                df3 = df2[throughputs_cleansed]
+                                df3 = (df3.iloc[:, 1:]).div(df3.iloc[:, 0], axis = 0)
+        
+                                if (df3.shape[0] > 0):
+                                    if (df3.shape[0] > 1):
+                                        ax = df3.plot(y = throughputs_cleansed[1:], kind = 'line', xlabel = args.xlabel, ylabel = 'Throughput(GB/s)')
+                                    else:
+                                        ax = df3.plot(y = throughputs_cleansed[1:], kind = 'bar', xlabel = args.xlabel, ylabel = 'Throughput(GB/s)')
+            
+                                    plt.grid(visible = True, which = 'both', axis = 'y')
+                                    plt.legend(loc = 'best', fontsize = 4)
+                                    plt.title(label = args.title + "\n(" + args.kernel + ")", loc = 'center', fontsize = 8, wrap = True)
+                                    plt.tight_layout()
+                                    if (p == None):
+                                        p = pdf(args.output)
+                                    fig = ax.get_figure()
+                                    fig.savefig(p, format = 'pdf')
+                                    plt.close(fig)	# close figure to save memory
+                                    analyzed = True
+                                else:
+                                    break
+    
+                            print("Analyzed instance " + str(instance) + " of kernel " + args.kernel)
+                        else:
+                            print("No samples for instance " + str(instance) + " of kernel " + args.kernel)
+
+                        # continue scan for next instance
+                        counting = True			# a new kernel and/or a new instance starts in the data frame
+                        start = -1
+                        stop = -1
+
+            if ((start != -1) and (stop == -1)):	# the instance of interest is at the end of data frame
+                stop = device_data_df.shape[0]
+
+                df2 = device_data_df[start : stop]	# data frame of the instance of interest
+                analyzed = False
+                for metrics_cleansed, label in zip(metric_sets_cleansed, args.ylabel):
+                    df3 = df2[metrics_clenased]
+
+                    instance = instance + 1
+                    if (df3.shape[0] > 0):
+                        if (df3.shape[0] > 1):
+                            ax = df3.plot(y = metric_cleansed, kind = 'line', xlabel = args.xlabel, ylabel = label)
+                        else:
+                            ax = df3.plot(y = metric_cleansed, kind = 'bar', xlabel = args.xlabel, ylabel = label)
+
+                        plt.grid(visible = True, which = 'both', axis = 'y')
+                        plt.legend(loc = 'best', fontsize = 4)
+                        plt.title(label = args.title + "\n(" + args.kernel + ")", loc = 'center', fontsize = 8, wrap = True)
+                        plt.tight_layout()
+                        if (p == None):
+                            p = pdf(args.output)
+                        fig = ax.get_figure()
+                        fig.savefig(p, format = 'pdf')
+                        plt.close(fig)	# close figure to save memory
+                        analyzed = True
+                    else:
+                        break
+
+                if (analyzed == True):
+                    for throughputs_cleansed in throughputs_sets_cleansed:
+                        df3 = df2[throughputs_cleansed]
+                        df3 = (df3.iloc[:, 1:]).div(df3.iloc[:, 0], axis = 0)
+    
+                        if (df3.shape[0] > 0):
+                            if (df3.shape[0] > 1):
+                                ax = df3.plot(y = throughputs_cleansed[1:], kind = 'line', xlabel = args.xlabel, ylabel = 'Throughput(GB/s)')
+                            else:
+                                ax = df3.plot(y = throughputs_cleansed[1:], kind = 'bar', xlabel = args.xlabel, ylabel = 'Throughput(GB/s)')
+    
+                            plt.grid(visible = True, which = 'both', axis = 'y')
+                            plt.legend(loc = 'best', fontsize = 4)
+                            plt.title(label = args.title + "\n(" + kernel + ")", loc = 'center', fontsize = 8, wrap = True)
+                            plt.tight_layout()
+                            if (p == None):
+                                p = pdf(args.output)
+                            fig = ax.get_figure()
+                            fig.savefig(p, format = 'pdf')
+                            plt.close(fig)	# close figure to save memory
+                            analyzed = True
+                        else:
+                            break
+
+                    print("Analyzed instance " + str(instance) + " of kernel " + args.kernel)
+                else:
+                    print("No samples for " + str(instance) + " of kernel " + args.kernel)
+
+        else:
+            # specified kernel specified instance
+            analyzed, p = PlotKernelInstancePerfMetrics(args, args.kernel, device_data_df, metric_sets_cleansed, throughputs_sets_cleansed, p)
+            if (analyzed == True):
+                print("Performance metric chart for instance " + str(args.instance) + " of kernel " + args.kernel + " hsa been successfully generated")
+            else:
+                print("No performance data for instance " + str(args.instance) + " of kernel " + args.kernel)
+
+    if (p != None):
+        p.close()
+        print("Performance metric charts are successfully generated in PDF format")
+    else:
+        print("No performance metric data for kernel or kernel instance")
+
+def HttpAnalyzePerfMetrics(args, device_data_df, kname, instance):
+    if (args.metrics is None):
+        return None, None
+    
+    device_data_df = device_data_df.loc[device_data_df['GlobalInstanceId'] == float(instance)]
+    if (device_data_df.shape[0] == 0):
+        return None, None
+    
+    buf = None
+    metric_sets_cleansed = []
+    for metric_set in args.metrics:
+        metrics = metric_set.split(sep = ',')
+        metrics_cleansed = []
+        for metric in metrics:
+            me = metric.strip()			# strip off leading and trailing whitespaces
+            if (me not in device_data_df.columns):
+                msg = "No metric data for " + metric + ". Is the metric name correctly spelled?"
+                return msg, None
+            else:
+                metrics_cleansed.append(me)
+        metric_sets_cleansed.append(metrics_cleansed)
+
+    throughputs_sets_cleansed = []
+    if (args.throughput is not None):
+        for throughput_set in args.throughput:
+            throughputs = throughput_set.split(sep = ',')
+            throughputs_cleansed = ['GpuTime[ns]']
+            for throughput in throughputs:
+                bw = throughput.strip()			# strip off leading and trailing whitespaces
+                if (bw not in device_data_df.columns):
+                    msg = "No metric data for " + bw + ". Is the metric name correctly spelled?"
+                    return msg, None
+                else:
+                    throughputs_cleansed.append(bw)
+            throughputs_sets_cleansed.append(throughputs_cleansed)
+
+    p = None
+    for metrics_cleansed, label in zip(metric_sets_cleansed, args.ylabel):
+        df2 = device_data_df[metrics_cleansed]
+        
+        if (df2.shape[0] > 0):
+            if (df2.shape[0] > 1):
+                ax = df2.plot(y = metrics_cleansed, kind = 'line', xlabel = args.xlabel, ylabel = label)
+            else:
+                ax = df2.plot(y = metrics_cleansed, kind = 'bar', xlabel = args.xlabel, ylabel = label)
+            plt.grid(visible = True, which = 'both', axis = 'y')
+            plt.legend(loc = 'best', fontsize = 4)
+            kernel = device_data_df.iloc[0]['Kernel']
+            plt.title(label = args.title + "\n(" + kernel + ")", loc = 'center', fontsize = 8, wrap = True)
+            plt.tight_layout()
+        
+            fig = ax.get_figure()
+            if (p == None):
+                tmpdir = tempfile.TemporaryDirectory()
+                tmpfile = os.path.join(tmpdir.name, "perfchart.pdf")
+                p = pdf(tmpfile)
+            fig.savefig(p, format = 'pdf')
+            plt.close(fig)  # close figure to save memory
+        else:
+            break
+
+    if (p != None):
+        for throughputs_cleansed in throughputs_sets_cleansed:
+            df2 = device_data_df[throughputs_cleansed]
+            df2 = (df2.iloc[:, 1:]).div(df2.iloc[:, 0], axis = 0)
+            if (df2.shape[0] > 0):
+                if (df2.shape[0] > 1):
+                    ax = df2.plot(y = throughputs_cleansed[1:], kind = 'line', xlabel = args.xlabel, ylabel = 'Throughput(GB/s)')
+                else:
+                    ax = df2.plot(y = throughputs_cleansed[1:], kind = 'bar', xlabel = args.xlabel, ylabel = 'Throughput(GB/s)')
+    
+                plt.grid(visible = True, which = 'both', axis = 'y')
+                plt.legend(loc = 'best', fontsize = 4)
+                plt.title(label = args.title + "\n(" + kernel + ")", loc = 'center', fontsize = 8, wrap = True)
+                plt.tight_layout()
+                fig = ax.get_figure()
+                fig.savefig(p, format = 'pdf')
+                plt.close(fig)	# close figure to save memory
+            else:
+                break
+
+        p.close()
+        buf = io.BytesIO()
+        fp = open(tmpfile, "rb")
+        buf.write(fp.read())
+        fp.close()
+        os.remove(tmpfile)
+        tmpdir.cleanup()
+
+    return None, buf 
+    
+
+def GenerateSelfSignedCertificate(cert, key):
+    # construct command to generate a self-signed certificate and private key
+    command = ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-keyout", key, "-out", cert, "-days", "365", "-nodes", "-subj", "/CN=localhost"]
+
+    try:
+        subprocess.run(command, check = True)
+        print(f"Self-signed certificate and private key have been generated.")
+    except subprocess.CalledProcessError as e:
+        print(f"Error occurred while generating self-signed certificate: {e}", file = sys.stderr)
+
+def PerfMetricsHTTPServer(args, metrics_info):
+    try:
+        class PerfMetricsRequestHandler(BaseHTTPRequestHandler):
+            def _send_invalid(self):
+                self.send_header('Content-type', 'text/plain')
+                self.end_headers()
+                self.wfile.write(b'Invalid')
+
+            def do_GET(self):
+                if (self.client_address[0] != "127.0.0.1"):
+                    return
+                request = unquote(self.path).split("/")  # format is name/instance
+                if (request[1] == "favicon.ico"): # ignore
+                    return
+                
+                self.send_response(200)
+                expected_request_params = 4 if args.result_dir else 3
+                if (len(request) < expected_request_params):
+                    self._send_invalid()
+                    return
+
+                kname = request[1].strip('"')   # strip leading and trailing double quotes
+                instance = request[2]
+                if ((instance == "") or (instance.isdigit() == False)):
+                    self._send_invalid()
+                    return
+
+                device_id = None
+                if args.result_dir:
+                    device_id = request[3]
+                    if ((device_id == "") or (device_id.isdigit() == False)):
+                        self._send_invalid()
+                        return
+
+                if (metrics_info.is_eustall):   # strip kernel shape for stall sampling
+                    pos = kname.rfind('[')
+                    if (pos != -1):
+                        kname = kname[0:pos]
+
+                msg = None
+                buf = None
+                target_devices = []
+
+                # for result_directory mode. device id is taken from request
+                # and we can search the kernel instance in this device only (not for eustall case)
+                if device_id is not None and not metrics_info.is_eustall:
+                    device_info = metrics_info.get_device(int(device_id))
+                    if device_info:
+                        target_devices.append(device_info)
+                else:
+                    target_devices = list(metrics_info.devices.values())
+
+                for device_info in target_devices:
+                    device_data_df = device_info.get_device_data()
+                    if (device_data_df is None) or (device_data_df.shape[0] == 0):
+                        msg = f"No metric data for device {device_info.device_id}"
+                        continue
+                    if metrics_info.is_eustall:
+                        msg, buf = AnalyzeStallMetrics(args, device_data_df, kname, http = True)
+                    else:
+                        msg, buf = HttpAnalyzePerfMetrics(args, device_data_df, kname, instance)                        
+
+                    if (buf is not None):
+                        buf.seek(0)
+                        try:
+                            self.send_header('Content-type', 'application/pdf')
+                            self.end_headers()
+                            self.wfile.write(buf.read())
+                        except BrokenPipeError:
+                            print("Try again please")
+                            return
+                        return
+                    else:
+                        if (msg is not None):
+                            break
+
+                self.send_header('Content-type', 'text/plain')
+                self.end_headers()
+                if (msg is not None):
+                    self.wfile.write(bytes(msg, 'utf-8'))
+                else:
+                    self.wfile.write(b'No metric data collected or no metrics specified')
+
+        # matplotlib does not like ThreadingHTTPServer
+        httpd = HTTPServer(('localhost', 8000), PerfMetricsRequestHandler)
+
+        if (args.https == True):
+            cert = args.certificate
+            key = args.key
+            tmpdir = None
+            if ((cert == None) and (key == None)):
+                # generate a self signed certificate
+                print("No certificate or private key is provided.")
+                print("Generating a self-signed certificate...")
+                tmpdir = tempfile.TemporaryDirectory()
+                cert = os.path.join(tmpdir.name, "selfsigned.crt")
+                key = os.path.join(tmpdir.name, "private.key")
+                GenerateSelfSignedCertificate(cert, key)
+            else:
+                if (cert is None):
+                    print("Certificate file is missing")
+                    return
+                if (key is None):
+                    print("Private key file is missing")
+                    return
+    
+                if (os.path.isfile(cert) == False):
+                    print("Certificate file " + cert + " does not exist")
+                    return
+                if (os.path.isfile(key) == False):
+                    print("Private key file " + key + " does not exist")
+                    return
+
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(cert, key)
+            httpd.socket = context.wrap_socket(httpd.socket, server_side = True)
+            if (tmpdir is not None):
+                tmpdir.cleanup()
+
+        httpd.serve_forever()
+
+    except KeyboardInterrupt:
+        print("Goodbye!")
+        return
+
+def main(args):
+    try:
+        metrics_info = MetricsInfo(input_path=args.input,
+                                   is_result_directory=args.result_dir)
+    except Exception as e:
+        print(f"Error: {e}")
+        return
+    
+    if (args.list == True):
+        metrics_info.print_data(args.output)
+        return
+    
+    metric_ylabel_match = True
+    if (((args.metrics is not None) and (args.ylabel is None)) or ((args.metrics is None) and (args.ylabel is not None))):
+        metric_ylabel_match = False
+    else:
+        if ((args.metrics is not None) and (args.ylabel is not None) and (len(args.metrics) != len(args.ylabel))):
+            metric_ylabel_match = False
+
+    if (metric_ylabel_match == False):
+        print("Number of metric sets does not match number of Y labels")
+        return
+
+    if ((args.https == True) and (args.http == True)):
+        print("Options -p and -q cannot be used at the same time")
+        return
+
+    if ((args.https == True) or (args.http == True)):
+        print("No output to file")
+        print("Options -o/--output, -r/--report, -k/--kernel, -i/--instance and -d/--device are ignored if they are present")
+        PerfMetricsHTTPServer(args, metrics_info)
+        return
+
+    if (args.output is None):
+        print("Error: -o/--output is missing")
+        return
+
+    device_info = metrics_info.get_device(args.device)
+    if device_info is None:
+        print(f"Error: Device {args.device} not found in metrics data")
+        return
+
+    device_data_df = device_info.get_device_data()
+    if (device_data_df is None) or (device_data_df.shape[0] == 0):
+        print(f"No metric data for device {device_info.device_id}")
+        return
+
+    if (not metrics_info.is_eustall):
+        if (args.metrics is None):
+            print("-m option is missing")
+            return
+        if (args.ylabel is None):
+            print("-y option is missing")
+            return
+        if (len(args.metrics) != len(args.ylabel)):
+            print("Numbers of -m options and -y options do not match")
+            return
+        AnalyzePerfMetrics(args, device_data_df)
+    else:
+        AnalyzeStallMetrics(args, device_data_df, args.kernel)
+
+if __name__== "__main__":
+    main(ParseArguments(sys.argv[1:]))  # skip sys.argv[0]

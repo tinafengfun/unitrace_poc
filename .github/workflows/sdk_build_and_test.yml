@@ -1,0 +1,233 @@
+name: sdk-build-and-test
+
+on:
+  push:
+    paths:
+      - .github/workflows/sdk_build_and_test.yml
+      - .github/actions/linuxTest/action.yml
+      - .github/actions/detectChanges/action.yml
+      - sdk/**
+    branches:
+      - master
+      - release/**
+  pull_request:
+    branches:
+      - master
+      - release/**
+    paths:
+      - sdk/**
+      - .github/workflows/**
+      - .github/actions/**
+  workflow_dispatch:
+  schedule:
+    - cron: '30 5 * * *' # Daily 5:30 AM UTC / 12:30 AM EST
+
+permissions:
+  contents: read
+
+jobs:
+  sdk-build-and-test:
+    name: Test PTI ${{ matrix.os_id }} ${{ matrix.tags }}
+
+    timeout-minutes: 45
+
+    runs-on: ${{ fromJSON(matrix.tags) }}
+    defaults:
+      run:
+        shell: bash
+
+    strategy:
+      matrix:
+        include:
+
+          - container: ${{ vars.PTI_DOCKER_UBUNTU_24_4_CLIENT_ONEAPI_N }}
+            os_id: ${{vars.PTI_PKG_UBUNTU_24_4_CLIENT_ONEAPI_N }}
+            preset: linux-icpx-release
+            tags: '["self-hosted", "Linux", "pti", "client", "BMG"]'
+          - container: ${{ vars.PTI_DOCKER_UBUNTU_24_4_ONEAPI_N }}
+            os_id: ${{vars.PTI_PKG_UBUNTU_24_4_ONEAPI_N}}
+            preset: linux-icpx-release
+            tags: '["self-hosted", "Linux", "pti", "server", "PVC"]'
+
+    container:
+      image: ${{ matrix.container }}
+      options: --device=/dev/dri --cap-add CAP_PERFMON --shm-size=24G --volume=/dev/dri/by-path:/dev/dri/by-path
+      credentials:
+        username: ${{ vars.PTI_DOCKER_USER }}
+        password: ${{ secrets.PTI_DOCKER_PWD }}
+
+    if: vars.PTI_RUN_LINUX_TESTS == 1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          clean: true
+
+      - name: Detect code changes
+        id: check
+        uses: ./.github/actions/detectChanges
+
+      - name: Configure Git to use GitHub PAT
+        run: |
+          git config --global url."https://user:${{ secrets.pat_pti_tools }}@github.com".insteadOf "https://github.com"
+      - name: Build
+        if: steps.check.outputs.code == 'true'
+        working-directory: sdk
+        run: |
+          source /opt/intel/oneapi/setvars.sh
+          cmake --preset ${{ matrix.preset }}
+          cmake --build --preset ${{ matrix.preset }} -j $(($(nproc)/2))
+
+      - name: Test action
+        if: steps.check.outputs.code == 'true'
+        uses: ./.github/actions/linuxTest
+        with:
+          wdir: sdk
+          preset: ${{ matrix.preset }}
+
+      - name: Build AddressSanitizer
+        if: steps.check.outputs.code == 'true' && contains(fromJSON(matrix.tags), 'server')
+        working-directory: sdk
+        run: |
+          source /opt/intel/oneapi/setvars.sh
+          cmake --preset linux-asan
+          cmake --build --preset linux-asan --parallel $(($(nproc)/2))
+
+      - name: Build ThreadSanitizer
+        if: steps.check.outputs.code == 'true' && contains(fromJSON(matrix.tags), 'server')
+        working-directory: sdk
+        run: |
+          source /opt/intel/oneapi/setvars.sh
+          cmake --preset linux-tsan
+          cmake --build --preset linux-tsan --parallel $(($(nproc)/2))
+
+      - name: Build libFuzzer
+        if: steps.check.outputs.code == 'true' && contains(fromJSON(matrix.tags), 'server')
+        working-directory: sdk
+        run: |
+          # To ensure it still builds, run build for fuzz targets until we have
+          # proper fuzz testing infrastructure in place.
+          source /opt/intel/oneapi/setvars.sh
+          cmake --preset linux-fuzz
+          cmake --build --preset linux-fuzz --parallel $(($(nproc)/2))
+
+      #
+      # Rocky8 has a problem with this test.
+      #
+      - name: Test AddressSanitizer
+        if: steps.check.outputs.code == 'true' && contains(fromJSON(matrix.tags), 'server')
+        working-directory: sdk
+        run: |
+          source /opt/intel/oneapi/setvars.sh
+
+          #
+          # Must skip Rocky8 with more than one GPU because of
+          # an unexpected failure as documented in PTI-74
+          #
+          if [ $(sycl-ls|grep 'ext_oneapi_level_zero:gpu:' -c) -gt 1 ] &&\
+             [[ $(cat /etc/redhat-release)  =~ Rocky.*8 ]]; then
+            exit 0
+          fi
+          ctest --preset linux-asan --output-on-failure -L samples
+
+      - name: Test ThreadSanitizer
+        if: steps.check.outputs.code == 'true' && contains(fromJSON(matrix.tags), 'server')
+        working-directory: sdk
+        run: |
+          source /opt/intel/oneapi/setvars.sh
+          ctest --preset linux-tsan --output-on-failure -L samples
+
+
+  win-lib-build-and-test:
+    name: Test pti-lib on Windows
+    runs-on: ${{ fromJSON(matrix.tags) }}
+
+    timeout-minutes: 30
+
+    env:
+      LEVEL_ZERO_LOADER_VERSION: 1.32.0
+    defaults:
+      run:
+        shell: cmd
+        working-directory: sdk
+
+    strategy:
+      matrix:
+        include:
+          - preset: windows-ci-release
+            build-dir: wbr
+            tags: '["self-hosted", "Windows", "pti", "client", "BMG"]'
+
+    if: vars.PTI_RUN_TESTS == 1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect code changes
+        id: check
+        uses: ./.github/actions/detectChanges
+
+      - name: Get Level Zero Loader Version
+        if: steps.check.outputs.code == 'true'
+        id: loader-ver
+        run: |
+          @echo off
+          REM Make sure there is no whitespace between ...>>...
+          echo ze_loader_ver=%LEVEL_ZERO_LOADER_VERSION%>>%GITHUB_OUTPUT%
+
+      - uses: actions/cache@v4
+        if: steps.check.outputs.code == 'true'
+        id: cache
+        with:
+          path: sdk/level-zero-sdk
+          key: ${{ runner.os }}-Ze-Loader-${{ steps.loader-ver.outputs.ze_loader_ver }}
+
+      - name: Download Dependencies
+        if: steps.check.outputs.code == 'true' && steps.cache.outputs.cache-hit != 'true'
+        run: |
+          @echo off
+          call "C:\Program Files (x86)\Intel\oneAPI\setvars-vcvarsall.bat"
+          call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat"
+          rmdir /S /Q level-zero-sdk
+          del /s level-zero-sdk_%LEVEL_ZERO_LOADER_VERSION%.zip
+          echo https://github.com/oneapi-src/level-zero/releases/download/v%LEVEL_ZERO_LOADER_VERSION%/level-zero-win-sdk-%LEVEL_ZERO_LOADER_VERSION%.zip
+          curl.exe -L -O https://github.com/oneapi-src/level-zero/releases/download/v%LEVEL_ZERO_LOADER_VERSION%/level-zero-win-sdk-%LEVEL_ZERO_LOADER_VERSION%.zip
+          7z x level-zero-win-sdk-%LEVEL_ZERO_LOADER_VERSION%.zip -olevel-zero-sdk
+          echo "Successfully Downloaded Level Zero Loader Version %LEVEL_ZERO_LOADER_VERSION%"
+
+      - name: Build
+        if: steps.check.outputs.code == 'true'
+        run: |
+          @echo off
+          call "C:\Program Files (x86)\Intel\oneAPI\setvars-vcvarsall.bat"
+          call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat"
+          set /A JOBS=%NUMBER_OF_PROCESSORS%/2
+          rmdir /S /Q ${{ matrix.build-dir }}
+          cmake --preset ${{ matrix.preset }}
+          cmake --build --preset ${{ matrix.preset }} --parallel %JOBS%
+
+      - name: Test
+        if: steps.check.outputs.code == 'true'
+        run: |
+          @echo off
+          call "C:\Program Files (x86)\Intel\oneAPI\setvars-vcvarsall.bat"
+          call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat"
+          REM TODO(PTI-88): OverheadRecordsCountsAllOnesViewRecords fails on Windows. Investigation needed. Bug filed.
+          ctest --output-on-failure --preset ${{ matrix.preset }} -LE "performance|quarantine" ^
+            -E "MainFixtureTest.OverheadRecordsCountsAllOnesViewRecords"
+
+      - name: Quarantined tests # performance and flaky tests
+        if: steps.check.outputs.code == 'true'
+        continue-on-error: true
+        run: |
+          @echo off
+          call "C:\Program Files (x86)\Intel\oneAPI\setvars-vcvarsall.bat"
+          call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat"
+          ctest --output-on-failure --preset ${{ matrix.preset }} -L "performance|quarantine"
+          if %ERRORLEVEL% NEQ 0 (
+            echo ::warning::Quarantined tests step failed.
+          )
+          exit /b 0 ::always exit 0 to keep the green check mark going
+

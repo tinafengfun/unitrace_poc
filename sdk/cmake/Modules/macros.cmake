@@ -1,0 +1,782 @@
+set(PTI_CMAKE_MACRO_DIR ${CMAKE_CURRENT_LIST_DIR}/../.. CACHE INTERNAL "")
+
+macro(RequirePythonInterp)
+  if(NOT DEFINED _Python_EXECUTABLE OR NOT TARGET Python::Interpreter)
+    find_package(Python COMPONENTS Interpreter REQUIRED)
+    set(PYTHON_EXECUTABLE "${Python_EXECUTABLE}")
+  else()
+    set(PYTHON_EXECUTABLE "${_Python_EXECUTABLE}")
+  endif()
+endmacro()
+
+macro(SetPtiVersion)
+  file(STRINGS "${PTI_CMAKE_MACRO_DIR}/VERSION" PTI_VERSION)
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+               "${PTI_CMAKE_MACRO_DIR}/VERSION")
+endmacro()
+
+macro(SetBuildType)
+  if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE "Release")
+  endif()
+  message(STATUS "Build Type: ${CMAKE_BUILD_TYPE}")
+
+  if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    message(STATUS "Bitness: 64 bits")
+  else()
+    message(FATAL_ERROR "32-bit mode is not supported")
+  endif()
+endmacro()
+
+macro(FindTracedLibrariesHeaderPaths TARGET L0_GEN_SCRIPT GEN_FILE_NAME custom_target L0_TARGET)
+  RequirePythonInterp()
+
+  # Use the target that links level zero to find the level zero library
+  get_target_property(L0_TARGET_PATH ${L0_TARGET} INTERFACE_INCLUDE_DIRECTORIES)
+
+  # HINTS before PATHS
+  find_path(L0_INC_PATH
+    NAMES level_zero/ze_api.h
+    HINTS ${L0_TARGET_PATH}
+    PATHS ENV CPATH)
+  if (NOT L0_INC_PATH)
+    message(FATAL_ERROR
+      "Level Zero headers path is not found.\n"
+      "You may need to install oneAPI Level Zero Driver to fix this issue.")
+  else()
+    message(STATUS "Level Zero headers are found at ${L0_INC_PATH}")
+  endif()
+
+  set(L0_GEN_INC_PATH "${PROJECT_BINARY_DIR}")
+  if (NOT TARGET unified-runtime::loader)
+    find_package(unified-runtime)
+  endif()
+
+  # Fake file path until we stop generating code on each build.
+  set(UR_HEADER_PATH "${PROJECT_SOURCE_DIR}/third-party/unified-runtime/include/unified-runtime/ur_api.h")
+  if (TARGET unified-runtime::loader)
+    get_target_property(UR_HEADER_PATH unified-runtime::loader INTERFACE_INCLUDE_DIRECTORIES)
+  endif()
+
+  add_custom_target(${custom_target} ALL
+                    DEPENDS ${L0_GEN_INC_PATH}/${GEN_FILE_NAME})
+  string(CONCAT PTI_L0_LOADER_COMMIT_INFO "commit: " ${PTI_L0_LOADER_COMMIT_HASH} " - v" ${PTI_L0_LOADER})
+  add_custom_command(OUTPUT ${L0_GEN_INC_PATH}/${GEN_FILE_NAME}
+                     COMMAND "${PYTHON_EXECUTABLE}" ${L0_GEN_SCRIPT}
+                     ${L0_GEN_INC_PATH} "${L0_INC_PATH}/level_zero"
+                     "${PROJECT_BINARY_DIR}" "${PROJECT_SOURCE_DIR}/include/pti" ${UR_HEADER_PATH} ${PTI_API_ID_REGENERATE} ${PTI_L0_LOADER_COMMIT_INFO}
+                     DEPENDS ${L0_GEN_SCRIPT})
+  target_include_directories(${TARGET}
+    PUBLIC "$<BUILD_INTERFACE:${L0_GEN_INC_PATH}>")
+  add_dependencies(${TARGET}
+    ${custom_target})
+endmacro()
+
+macro(CheckIfSyclIsAvailable)
+  include(CheckCXXCompilerFlag)
+  include(CheckIncludeFileCXX)
+  CHECK_CXX_COMPILER_FLAG("-fsycl" HAVE_SYCL)
+
+  if(HAVE_SYCL)
+    CHECK_INCLUDE_FILE_CXX("sycl/sycl.hpp" SYCL_IS_AVAILABLE "-fsycl")
+    if(NOT SYCL_IS_AVAILABLE)
+      set(HAVE_SYCL NO)
+    else()
+      message(STATUS "Able to compile sycl code. All samples will be built.")
+    endif()
+  endif()
+
+  if(NOT HAVE_SYCL)
+    message(
+      STATUS
+        "Not able to compile sycl code. Some tests may not run and some samples may not be built."
+    )
+  endif()
+endmacro()
+
+macro(GetSpdlog)
+  if(NOT TARGET spdlog::spdlog)
+    find_package(spdlog 1.17.0 QUIET)
+  endif()
+
+  if(NOT TARGET spdlog::spdlog)
+    include(FetchContent)
+    FetchContent_Declare(
+      fmt
+      GIT_REPOSITORY https://github.com/fmtlib/fmt
+      GIT_TAG 407c905e45ad75fc29bf0f9bb7c5c2fd3475976f # 12.1.0
+    )
+    FetchContent_Declare(
+      spdlog
+      GIT_REPOSITORY https://github.com/gabime/spdlog
+      GIT_TAG 79524ddd08a4ec981b7fea76afd08ee05f83755d # v1.17.0
+    )
+    set(FMT_SYSTEM_HEADERS
+        ON
+        CACHE BOOL "" FORCE)
+    set(FMT_INSTALL
+        OFF
+        CACHE BOOL "" FORCE)
+    set(SPDLOG_BUILD_SHARED
+        OFF
+        CACHE BOOL "" FORCE)
+    set(SPDLOG_BUILD_PIC
+        ON
+        CACHE BOOL "" FORCE)
+    set(SPDLOG_FMT_EXTERNAL_HO
+        ON
+        CACHE BOOL "" FORCE)
+    set(SPDLOG_SYSTEM_INCLUDES
+        ON
+        CACHE BOOL "" FORCE)
+    set(SPDLOG_BUILD_WARNINGS
+        OFF
+        CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(fmt spdlog)
+
+    # To keep macro self contained.
+    if (NOT DEFINED PTI_INTEL_LLVM_EXCLUDE_LIBS)
+      set(PTI_INTEL_LLVM_EXCLUDE_LIBS
+        $<$<AND:$<CXX_COMPILER_ID:IntelLLVM>,$<PLATFORM_ID:Linux>>:-no-intel-lib>
+        $<$<AND:$<CXX_COMPILER_ID:IntelLLVM>,$<PLATFORM_ID:Windows>>:/Qno-intel-lib>)
+    endif()
+
+    set(PTI_FMT_COMPILE_OPTIONS
+      $<$<CXX_COMPILER_ID:MSVC>:/wd6285 /wd6294 /wd6240 /wd6031
+      $<$<CONFIG:Release>:/wd4702 /wd6385
+      >>
+    )
+
+    # Prevent fmt from using exceptions because it could throw while logging.
+    # Disable warning in fmt due to our usage of EHsc.
+    set(PTI_FMT_COMPILE_DEFINITIONS
+      FMT_USE_EXCEPTIONS=0
+    )
+
+    # spdlog sets the /MP flag on MSVC which causes a warning on icx.
+    set(PTI_SPDLOG_COMPILE_OPTIONS
+      $<$<CXX_COMPILER_ID:IntelLLVM>:-Wno-unused-command-line-argument>
+    )
+
+    target_compile_definitions(fmt PRIVATE ${PTI_FMT_COMPILE_DEFINITIONS})
+    target_compile_options(fmt PRIVATE ${PTI_FMT_COMPILE_OPTIONS} ${PTI_INTEL_LLVM_EXCLUDE_LIBS})
+    target_link_options(fmt PRIVATE ${PTI_INTEL_LLVM_EXCLUDE_LIBS})
+
+    target_compile_definitions(fmt-header-only INTERFACE
+      ${PTI_FMT_COMPILE_DEFINITIONS})
+    target_compile_options(fmt-header-only INTERFACE ${PTI_FMT_COMPILE_OPTIONS})
+
+    target_compile_options(spdlog PRIVATE ${PTI_SPDLOG_COMPILE_OPTIONS} ${PTI_INTEL_LLVM_EXCLUDE_LIBS})
+    target_link_options(spdlog PRIVATE ${PTI_INTEL_LLVM_EXCLUDE_LIBS})
+  endif()
+endmacro()
+
+macro(GetGTest)
+  # TODO(PTI): Use FetchContent find_package mode when we bump minimum CMake
+  # version to 3.24 or higher.
+  if(NOT TARGET GTest::gtest
+      OR NOT TARGET GTest::gtest_main
+      OR NOT TARGET GTest::gmock
+      OR NOT TARGET GTest::gmock_main)
+    find_package(GTest QUIET)
+  endif()
+
+  if(NOT TARGET GTest::gtest
+      OR NOT TARGET GTest::gtest_main
+      OR NOT TARGET GTest::gmock
+      OR NOT TARGET GTest::gmock_main)
+    if(TARGET GTest::gtest AND NOT TARGET GTest::gmock)
+      message(FATAL_ERROR "GTest/GMock mismatch. Uninstall GTest or ensure GMock is available (e.g., install libgmock-dev on Ubuntu)")
+    endif()
+    if(TARGET GTest::gmock AND NOT TARGET GTest::gmock)
+      message(FATAL_ERROR "GTest/GMock mismatch. Uninstall GMock or ensure GTest is available (e.g., install libgtest-dev on Ubuntu)")
+    endif()
+    include(FetchContent)
+    FetchContent_Declare(
+      googletest
+      GIT_REPOSITORY https://github.com/google/googletest
+      GIT_TAG 52eb8108c5bdec04579160ae17225d66034bd723 # v1.17.0
+    )
+
+    set(INSTALL_GTEST
+        OFF
+        CACHE BOOL "" FORCE)
+    set(gtest_force_shared_crt
+        ON
+        CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(googletest)
+
+    set(PTI_GTEST_COMPILE_OPTIONS
+      $<$<OR:$<CXX_COMPILER_ID:IntelLLVM>,$<CXX_COMPILER_ID:Clang>>:
+          -Wno-deprecated-declarations
+          -Wno-character-conversion
+          -Wno-unknown-warning-option
+      >
+      $<$<CXX_COMPILER_ID:MSVC>:/wd6239 /wd6031 /wd6387>
+    )
+
+    set_target_properties(gmock_main gmock gtest gtest_main
+      PROPERTIES
+        COMPILE_OPTIONS "${PTI_GTEST_COMPILE_OPTIONS}")
+  endif()
+endmacro()
+
+macro(CheckSOVersion PROJ_SOVERSION)
+  # Not automatically set because this should be done intentionally.
+  # PTI's rules for backwards compatibility should be re-evaluated upon first
+  # major / production release.
+  # PTI is following [semver](https://semver.org/) versioning and we are using
+  # the SOVERSION to denote backward compatibility.
+  if ("${PROJECT_VERSION}" VERSION_GREATER_EQUAL "1.0.0")
+    if("${PROJ_SOVERSION}" STREQUAL "${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}")
+      message(AUTHOR_WARNING "${PROJECT_NAME} currently has the SOVERSION: "
+                    "${PROJ_SOVERSION}. After the first major release, ${PROJECT_NAME}"
+                    " should have the SOVERSION: ${PROJECT_VERSION_MAJOR}.")
+    endif()
+  endif()
+endmacro()
+
+macro(GetLevelZero PTI_L0_LOADER PTI_L0_LOADER_COMMIT_HASH)
+  if (NOT TARGET LevelZero::level-zero)
+    # Need zelEnableTracingLayer
+    message("-- Fetching L0: ${PTI_L0_LOADER}")
+    string(REPLACE "." ";" LZ_TMP_LIST ${PTI_L0_LOADER})
+    list(GET LZ_TMP_LIST 0 LZ_VER_MAJOR)
+    list(GET LZ_TMP_LIST 1 LZ_VER_MINOR)
+    list(GET LZ_TMP_LIST 2 LZ_VER_PATCH)
+    set(LZ_VER "${LZ_VER_MAJOR}.${LZ_VER_MINOR}.${LZ_VER_PATCH}")
+    set(LZ_BASE_DIR ${CMAKE_CURRENT_BINARY_DIR}/_deps)
+
+    if(FETCHCONTENT_BASE_DIR)
+      set(LZ_BASE_DIR ${FETCHCONTENT_BASE_DIR})
+    endif()
+
+    if (NOT Git_FOUND)
+      find_package(Git REQUIRED)
+    endif()
+
+    include(FetchContent)
+    FetchContent_Declare(
+        LevelZero
+        GIT_REPOSITORY
+        https://github.com/oneapi-src/level-zero.git
+        GIT_TAG ${PTI_L0_LOADER_COMMIT_HASH}
+    )
+    # Prevent content from automatically being installed with PTI
+    FetchContent_GetProperties(LevelZero)
+    if(NOT LevelZero_POPULATED)
+        FetchContent_Populate(LevelZero)
+        # Add patch to L0 build
+        file(WRITE "${levelzero_SOURCE_DIR}/VERSION_PATCH" ${LZ_VER_PATCH})
+        add_subdirectory(${levelzero_SOURCE_DIR} ${levelzero_BINARY_DIR} EXCLUDE_FROM_ALL)
+    endif()
+
+    get_target_property(PTI_ZE_LOADER_RUNTIME_DIR ze_loader RUNTIME_OUTPUT_DIRECTORY)
+
+    # Create new target to treat level zero loader as an external dependency.
+    # This prevents it from being added to the export set.
+    # (Basically treat as if including via find_package)
+    add_library(pti_ze_loader INTERFACE IMPORTED)
+    add_dependencies(pti_ze_loader ze_tracing_layer ze_validation_layer)
+
+    set(PTI_LZ_COMPILE_OPTIONS
+        $<$<CXX_COMPILER_ID:IntelLLVM>:
+            -Wno-error
+            -Wno-unused-parameter
+            -Wno-cast-function-type-mismatch
+            -Wno-extra-semi
+            $<$<VERSION_GREATER_EQUAL:$<CXX_COMPILER_VERSION>,19.0.0>:-Wno-variadic-macro-arguments-omitted>
+        >
+        $<$<CXX_COMPILER_ID:MSVC>:
+            /wd6285 /wd6246 /wd6031 /wd6386
+            $<$<CONFIG:Release>:/wd4702 /wd6385 /wd6386>
+        >
+        $<$<CXX_COMPILER_ID:GNU>:
+            -Wno-error
+            -Wno-unused-parameter
+            $<$<VERSION_GREATER_EQUAL:$<CXX_COMPILER_VERSION>,8.0.0>:-Wno-extra-semi>
+        >
+        $<$<CXX_COMPILER_ID:Clang>:
+            -Wno-error
+            -Wno-unused-parameter
+            $<$<VERSION_GREATER_EQUAL:$<CXX_COMPILER_VERSION>,3.0.0>:-Wno-extra-semi>
+            $<$<VERSION_GREATER_EQUAL:$<CXX_COMPILER_VERSION>,19.0.0>:-Wno-variadic-macro-arguments-omitted>
+        >
+    )
+
+    # Silence Warnings from Level Zero Loader. Allows us to better detect PTI
+    # warnings and errors.
+    set_target_properties(ze_loader ze_tracing_layer ze_null ze_validation_layer level_zero_utils
+      PROPERTIES
+        COMPILE_OPTIONS "${PTI_LZ_COMPILE_OPTIONS}"
+        RUNTIME_OUTPUT_DIRECTORY "${PTI_ZE_LOADER_RUNTIME_DIR}/loader")
+
+    # Pull Headers out of source tree and add them to level_zero/
+    # This allows us to keep the normal way to include level zero
+    file(GLOB_RECURSE L0_DL_HEADERS
+        LIST_DIRECTORIES TRUE
+        "${LZ_BASE_DIR}/levelzero-src/include/*")
+
+    file(COPY ${L0_DL_HEADERS}
+        DESTINATION
+       ${LZ_BASE_DIR}/levelzero-headers/include/level_zero/)
+
+    # Add new header path to our new target
+    find_path(LZ_INCLUDE_DIR
+      NAMES level_zero/ze_api.h
+      HINTS ${LZ_BASE_DIR}/levelzero-headers
+      PATH_SUFFIXES include
+      NO_PACKAGE_ROOT_PATH
+      NO_CMAKE_PATH
+      NO_CMAKE_ENVIRONMENT_PATH
+      NO_SYSTEM_ENVIRONMENT_PATH
+      NO_CMAKE_SYSTEM_PATH
+      NO_CMAKE_SYSTEM_PATH
+      NO_CMAKE_FIND_ROOT_PATH
+    )
+
+    set_target_properties(pti_ze_loader PROPERTIES
+                            INTERFACE_INCLUDE_DIRECTORIES ${LZ_INCLUDE_DIR})
+
+    target_link_libraries(pti_ze_loader INTERFACE
+                            $<BUILD_INTERFACE:ze_loader>)
+    add_library(LevelZero::level-zero ALIAS pti_ze_loader)
+    add_library(LevelZero::headers INTERFACE IMPORTED)
+    set_target_properties(
+      LevelZero::headers
+      PROPERTIES INTERFACE_INCLUDE_DIRECTORIES "${LZ_INCLUDE_DIR}")
+  endif()
+endmacro()
+
+macro(get_itt)
+  if (NOT TARGET ittapi::ittnotify OR NOT TARGET ittapi::headers)
+    include(FetchContent)
+    FetchContent_Declare(
+      ittapi
+      GIT_REPOSITORY https://github.com/intel/ittapi.git
+      GIT_TAG 2369c7eb60bbe5db9f0996b0366c68c4c0950100 # v3.26.8
+    )
+
+    set(ITT_API_INSTALL OFF CACHE BOOL "ITT is statically linked - avoid install" FORCE)
+    FetchContent_MakeAvailable(ittapi)
+
+    target_compile_options(ittnotify PRIVATE
+      $<$<C_COMPILER_ID:IntelLLVM>:-Wno-strict-prototypes>
+      $<$<C_COMPILER_ID:Clang>:-Wno-strict-prototypes>
+      $<$<C_COMPILER_ID:GNU>:-Wno-pedantic>
+    )
+
+    target_compile_options(jitprofiling PRIVATE
+      $<$<C_COMPILER_ID:IntelLLVM>:-Wno-strict-prototypes>
+      $<$<C_COMPILER_ID:Clang>:-Wno-strict-prototypes>
+      $<$<C_COMPILER_ID:GNU>:-Wno-pedantic>
+    )
+
+    # Allow rolling back to older versions of ITT without breaking the build.
+    # One can remove later.
+    if (TARGET ittnotify AND NOT TARGET ittapi::ittnotify)
+      add_library(ittapi::ittnotify ALIAS ittnotify)
+    endif()
+
+    if (NOT TARGET ittapi::headers)
+      add_library(ittapi::headers INTERFACE IMPORTED)
+      set_target_properties(
+        ittapi::headers
+        PROPERTIES INTERFACE_INCLUDE_DIRECTORIES "${ittapi_SOURCE_DIR}/include;${ittapi_SOURCE_DIR}/src/ittnotify")
+    endif()
+  endif()
+endmacro()
+
+macro(RemoveNDebugFlag)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "IntelLLVM" OR CMAKE_CXX_COMPILER_ID MATCHES
+                                                  "Clang")
+    # One must make sure -DNDEBUG is not set if using XPTI filename/linenumber
+    # https://stackoverflow.com/questions/22140520/how-to-enable-assert-in-cmake-release-mode
+    string(REPLACE "-DNDEBUG" "" CMAKE_CXX_FLAGS_RELEASE
+                   "${CMAKE_CXX_FLAGS_RELEASE}")
+    string(REPLACE "-DNDEBUG" "" CMAKE_CXX_FLAGS_RELWITHDEBINFO
+                   "${CMAKE_CXX_FLAGS_RELWITHDEBINFO}")
+  endif()
+endmacro()
+
+macro(ProjectIsTopLevel)
+  if(NOT DEFINED PROJECT_IS_TOP_LEVEL)
+    set(PROJECT_IS_TOP_LEVEL FALSE)
+    get_property(PTI_PROJ_PARENT DIRECTORY PROPERTY PARENT_DIRECTORY)
+    if(PTI_PROJ_PARENT STREQUAL "")
+      set(PROJECT_IS_TOP_LEVEL TRUE)
+    endif()
+  endif()
+endmacro()
+
+macro(AddApiGenTarget L0_GEN_SCRIPT GEN_FILE_NAME L0_TARGET)
+  RequirePythonInterp()
+
+  # Use the target that links level zero to find the level zero library
+  if(TARGET LevelZero::level-zero)
+    get_target_property(L0_TARGET_PATH ${L0_TARGET} INTERFACE_INCLUDE_DIRECTORIES)
+    include(CMakePrintHelpers)
+    cmake_print_variables(PTI_L0_LOADER PTI_L0_LOADER_COMMIT_HASH L0_TARGET_PATH)
+  endif()
+
+  # HINTS before PATHS
+  find_path(L0_INC_PATH
+    NAMES level_zero/ze_api.h
+    HINTS ${L0_TARGET_PATH}
+    PATHS ENV CPATH)
+  if (NOT L0_INC_PATH)
+    message(FATAL_ERROR
+      "Level Zero headers path is not found.\n"
+      "You may need to install oneAPI Level Zero Driver to fix this issue.")
+  else()
+    message(STATUS "Level Zero headers are found at ${L0_INC_PATH}")
+  endif()
+
+  set(L0_GEN_INC_PATH "${PROJECT_BINARY_DIR}")
+  if (NOT TARGET unified-runtime::loader)
+    find_package(unified-runtime)
+  endif()
+
+  # Temporary until we remove UR build dependency.
+  set(UR_HEADER_PATH "${PROJECT_SOURCE_DIR}/third-party/unified-runtime/include/unified-runtime/ur_api.h")
+  if (TARGET unified-runtime::loader)
+    get_target_property(UR_HEADER_PATH unified-runtime::loader INTERFACE_INCLUDE_DIRECTORIES)
+  endif()
+
+  string(CONCAT L0_LOADER_INFO "commit: " ${PTI_L0_LOADER_COMMIT_HASH} " - v" ${PTI_L0_LOADER})
+  add_custom_target(generate-ids
+                    DEPENDS ${L0_GEN_INC_PATH}/${GEN_FILE_NAME}
+                    COMMAND "${PYTHON_EXECUTABLE}" ${L0_GEN_SCRIPT}
+                    ${L0_GEN_INC_PATH} "${L0_INC_PATH}/level_zero"
+                    "${PROJECT_BINARY_DIR}" "${PROJECT_SOURCE_DIR}/include/pti" ${UR_HEADER_PATH} "ON" ${L0_LOADER_INFO})
+endmacro()
+
+macro(AddFormatTarget)
+  find_program(CLANG_FORMAT_EXE clang-format)
+  find_program(RUFF_FORMAT_EXE ruff)
+
+  add_custom_target(format)
+  add_custom_target(format-chk)
+
+  cmake_policy(PUSH)
+  cmake_policy(SET CMP0009 NEW)
+  file(GLOB_RECURSE cf_src_files CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/src/*.cc"
+                                  "${PROJECT_SOURCE_DIR}/src/*.h"
+                                  "${PROJECT_SOURCE_DIR}/src/**/*.h"
+                                  "${PROJECT_SOURCE_DIR}/src/**/*.cc"
+                                  "${PROJECT_SOURCE_DIR}/test/*.cc"
+                                  "${PROJECT_SOURCE_DIR}/test/*.h"
+                                  "${PROJECT_SOURCE_DIR}/test/**/*.h"
+                                  "${PROJECT_SOURCE_DIR}/test/**/*.cc"
+                                  "${PROJECT_SOURCE_DIR}/samples/*.cc"
+                                  "${PROJECT_SOURCE_DIR}/samples/*.h"
+                                  "${PROJECT_SOURCE_DIR}/samples/**/*.h"
+                                  "${PROJECT_SOURCE_DIR}/samples/**/*.cc"
+                                  "${PROJECT_SOURCE_DIR}/samples/**/*.c")
+
+  list(FILTER cf_src_files EXCLUDE REGEX
+      "^${PROJECT_SOURCE_DIR}/(build|samples/(dlworkload|iso3d))")
+
+  add_custom_target(format-cpp
+    COMMAND ${CLANG_FORMAT_EXE} -i ${cf_src_files}
+    VERBATIM COMMAND_EXPAND_LISTS USES_TERMINAL)
+
+  add_custom_target(format-cpp-chk
+    COMMAND ${CLANG_FORMAT_EXE} --dry-run --Werror ${cf_src_files}
+    VERBATIM COMMAND_EXPAND_LISTS USES_TERMINAL)
+
+  add_dependencies(format format-cpp)
+  add_dependencies(format-chk format-cpp-chk)
+
+  if(RUFF_FORMAT_EXE)
+    list(APPEND py_src_dirs "${PROJECT_SOURCE_DIR}/cmake"
+                            "${PROJECT_SOURCE_DIR}/src"
+                            "${PROJECT_SOURCE_DIR}/test"
+                            "${PROJECT_SOURCE_DIR}/samples")
+    file(GLOB py_src_dirs_cur "${PROJECT_SOURCE_DIR}/*.py")
+    set(py_src_dirs ${py_src_dirs} ${py_src_dirs_cur})
+    add_custom_target(format-py
+      COMMAND ${RUFF_FORMAT_EXE} format ${py_src_dirs}
+      VERBATIM COMMAND_EXPAND_LISTS USES_TERMINAL)
+
+    add_custom_target(format-py-chk
+      COMMAND ${RUFF_FORMAT_EXE} format --check ${py_src_dirs}
+      VERBATIM COMMAND_EXPAND_LISTS USES_TERMINAL)
+
+    add_dependencies(format format-py)
+    add_dependencies(format-chk format-py-chk)
+    unset(py_src_dirs)
+    unset(py_src_dirs_cur)
+  else()
+    message(STATUS "ruff not found. Python code cannot be formatted.")
+  endif()
+  cmake_policy(POP)
+endmacro()
+
+macro(AddProjectVersionInfo TARGET)
+  if (WIN32)
+    set(PTI_VERSIONINFO_RC "${PROJECT_BINARY_DIR}/$<CONFIG>/${TARGET}_versioninfo.rc")
+    set(PTI_VERSIONINFO_RC_IN "${PROJECT_BINARY_DIR}/${TARGET}_versioninfo.rc.in")
+    set(PTI_VERSIONINFO_RC_IN_INIT "${PROJECT_SOURCE_DIR}/cmake/Modules/pti_versioninfo.rc.in")
+
+    set(INTEL_LIC_PATH "${PTI_CMAKE_MACRO_DIR}/../LICENSE")
+
+    if (EXISTS "${INTEL_LIC_PATH}")
+      file(STRINGS "${INTEL_LIC_PATH}" INTEL_LICENSE_FILE_STRINGS)
+      foreach(PTI_STRING ${INTEL_LICENSE_FILE_STRINGS})
+        string(REGEX MATCH "^Copyright.*" PTI_COPYRIGHT "${PTI_STRING}")
+        if (PTI_COPYRIGHT)
+          break()
+        endif()
+      endforeach()
+    endif()
+
+    if(NOT PTI_COPYRIGHT)
+      message(WARNING "Copyright file not found, Windows versioninfo will be incomplete")
+      set(PTI_COPYRIGHT "Copyright (C) Intel Corporation")
+    endif()
+
+    set(PTI_VERSION_TWEAK "${PROJECT_VERSION_TWEAK}")
+    if(NOT PTI_VERSION_TWEAK)
+      set(PTI_VERSION_TWEAK 0)
+    endif()
+
+    set(TARGET_NAME ${TARGET})
+
+    # https://discourse.cmake.org/t/configuring-a-file-that-has-both-substitution-and-generator-expressions/3064/2
+    configure_file(${PTI_VERSIONINFO_RC_IN_INIT} ${PTI_VERSIONINFO_RC_IN} @ONLY NEWLINE_STYLE CRLF)
+    file(
+      GENERATE
+      OUTPUT ${PTI_VERSIONINFO_RC}
+      INPUT  ${PTI_VERSIONINFO_RC_IN}
+      NEWLINE_STYLE CRLF
+    )
+
+    target_sources(${TARGET} PRIVATE ${PTI_VERSIONINFO_RC})
+  endif()
+endmacro()
+
+#
+# Check whether to use experimental/filesystem or filesystem.
+#
+# defines `PTI_EXPERIMENTAL_FILESYSTEM` if the platform does not
+# support std::filesystem usage.
+# sets `FS_LIB` with proper library to link (empty if not needed).
+#
+macro(CheckExperimentalFilesystem)
+  if(NOT DEFINED PTI_EXPERIMENTAL_FILESYSTEM AND NOT DEFINED FS_LIB)
+    set(FS_LIB "")
+    cmake_policy(PUSH)
+    cmake_policy(SET CMP0067 NEW)
+    include(CMakePushCheckState)
+    cmake_push_check_state()
+    cmake_reset_check_state()
+    include(CheckCXXSourceCompiles)
+    # Check normal case
+    set(code
+      "#include <filesystem>
+      int main()
+      {
+        return std::filesystem::exists(std::filesystem::temp_directory_path());
+      }")
+    set(CMAKE_REQUIRED_LIBRARIES ${FS_LIB})
+    check_cxx_source_compiles("${code}" COMPILES_STD_FILESYSTEM)
+
+    if(NOT COMPILES_STD_FILESYSTEM)
+      cmake_reset_check_state()
+
+      # Check experimental filesystem case
+      set(code
+        "#include <experimental/filesystem>
+        int main()
+        {
+          return std::experimental::filesystem::exists(std::experimental::filesystem::temp_directory_path());
+        }")
+      set(CMAKE_REQUIRED_LIBRARIES ${FS_LIB})
+      check_cxx_source_compiles("${code}" COMPILES_STD_EXPERIMENTAL_FILESYSTEM)
+    endif()
+
+    # Check experimental filesystem glib case
+    if(NOT COMPILES_STD_FILESYSTEM AND NOT COMPILES_STD_EXPERIMENTAL_FILESYSTEM)
+      cmake_reset_check_state()
+      set(FS_LIB stdc++fs)
+      set(CMAKE_REQUIRED_LIBRARIES ${FS_LIB})
+      check_cxx_source_compiles("${code}"
+        COMPILES_STD_EXPERIMENTAL_FILESYSTEM_LIBSTDCXXFS)
+      if(COMPILES_STD_EXPERIMENTAL_FILESYSTEM_LIBSTDCXXFS)
+        set(COMPILES_STD_EXPERIMENTAL_FILESYSTEM TRUE)
+      endif()
+    endif()
+
+    # Check experimental filesystem LLVM case
+    if(NOT COMPILES_STD_FILESYSTEM AND NOT COMPILES_STD_EXPERIMENTAL_FILESYSTEM_LIBSTDCXXFS)
+      cmake_reset_check_state()
+      set(FS_LIB c++fs)
+      set(CMAKE_REQUIRED_LIBRARIES ${FS_LIB})
+      check_cxx_source_compiles("${code}"
+        COMPILES_STD_EXPERIMENTAL_FILESYSTEM_LIBCXXFS)
+      if(COMPILES_STD_EXPERIMENTAL_FILESYSTEM_LIBCXXFS)
+        set(COMPILES_STD_EXPERIMENTAL_FILESYSTEM TRUE)
+      endif()
+    endif()
+
+    cmake_pop_check_state()
+    cmake_policy(POP)
+
+    if(NOT COMPILES_STD_FILESYSTEM)
+      if(NOT COMPILES_STD_EXPERIMENTAL_FILESYSTEM)
+        message(FATAL_ERROR "C++17 filesystem support is required")
+      endif()
+      set(PTI_EXPERIMENTAL_FILESYSTEM ON)
+    else()
+      set(FS_LIB "") # Clear if we have std::filesystem
+      unset(PTI_EXPERIMENTAL_FILESYSTEM)
+    endif()
+  endif()
+endmacro()
+
+macro(AddVersionlessLinkFile MY_TARGET)
+  add_custom_command(TARGET ${MY_TARGET} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_LINKER_FILE:${MY_TARGET}>
+    $<TARGET_LINKER_FILE_DIR:${MY_TARGET}>/${CMAKE_SHARED_LIBRARY_PREFIX}${MY_TARGET}$<$<PLATFORM_ID:Windows>:$<$<CONFIG:Debug>:d>>${CMAKE_LINK_LIBRARY_SUFFIX}
+  )
+endmacro()
+
+function(GetCurrentGitCommit COMMIT_OUTPUT_VAR)
+  set(_OUT_TEMP "")
+  set(_GIT_RESULT_TEMP 1)
+  if (NOT Git_FOUND)
+    find_package(Git)
+  endif()
+  if(Git_FOUND)
+    execute_process(
+      COMMAND "${GIT_EXECUTABLE}" rev-parse HEAD
+      OUTPUT_VARIABLE _OUT_TEMP
+      RESULT_VARIABLE _GIT_RESULT_TEMP
+      ERROR_QUIET
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+    if(_GIT_RESULT_TEMP EQUAL 0)
+      set(${COMMIT_OUTPUT_VAR} "${_OUT_TEMP}" PARENT_SCOPE)
+    endif()
+  endif()
+endfunction()
+
+macro(GetLevelZeroExtensions)
+  if (NOT TARGET LevelZero::level-zero-ext)
+    add_library(level-zero-ext INTERFACE)
+    add_library(LevelZero::level-zero-ext ALIAS level-zero-ext)
+
+    target_include_directories(level-zero-ext SYSTEM INTERFACE
+      $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/third-party/compute-runtime/level_zero/include>)
+
+    target_link_libraries(level-zero-ext INTERFACE LevelZero::headers)
+  endif()
+endmacro()
+
+# DetectSystemLevelZeroMetricApi
+#
+# Detects whether the system-installed Level Zero loader exports both on-demand
+# metric enable/disable symbols (zetDeviceEnableMetricsExp and
+# zetDeviceDisableMetricsExp). Sets HAVE_ZET_DEVICE_METRIC_API to TRUE only if
+# both are present, FALSE otherwise. A single variable is used because both
+# symbols must be present for the feature to work — checking one is not enough.
+#
+# Always probes the SYSTEM loader, not the one potentially built from FetchContent
+# into _deps. The fetched loader is always a recent version that exports the
+# symbols, but the runtime driver may not — probing the fetched binary would give
+# a false positive.
+#
+# NO_CMAKE_PATH and NO_CMAKE_ENVIRONMENT_PATH prevent accidentally finding the
+# FetchContent copy if CMAKE_PREFIX_PATH points into _deps.
+#
+# Platform notes:
+#   Linux:   finds libze_loader.so in system lib dirs (/usr/lib, /usr/lib64, etc.)
+#   Windows: finds ze_loader.dll in %SystemRoot%\System32 (installed by GPU driver).
+#            CMAKE_FIND_LIBRARY_SUFFIXES is overridden to .dll since find_library
+#            defaults to .lib on Windows.
+macro(DetectSystemLevelZeroMetricApi)
+  if(WIN32)
+    # find_library on Windows appends CMAKE_FIND_LIBRARY_SUFFIXES (.lib by default).
+    # Override to .dll so we find ze_loader.dll in System32 as installed by the GPU driver.
+    set(_saved_suffixes ${CMAKE_FIND_LIBRARY_SUFFIXES})
+    set(CMAKE_FIND_LIBRARY_SUFFIXES ".dll")
+    find_library(_system_ze_loader
+      NAMES ze_loader
+      PATHS $ENV{SystemRoot}/System32
+      NO_DEFAULT_PATH
+    )
+    set(CMAKE_FIND_LIBRARY_SUFFIXES ${_saved_suffixes})
+    unset(_saved_suffixes)
+  else()
+    find_library(_system_ze_loader
+      NAMES ze_loader
+      NO_CMAKE_PATH
+      NO_CMAKE_ENVIRONMENT_PATH
+    )
+  endif()
+
+  if(_system_ze_loader)
+    if(WIN32)
+      # check_library_exists cannot link against a DLL; use dumpbin /EXPORTS instead
+      find_program(_dumpbin dumpbin)
+      if(_dumpbin)
+        execute_process(
+          COMMAND ${_dumpbin} /EXPORTS ${_system_ze_loader}
+          OUTPUT_VARIABLE _dumpbin_output
+          ERROR_VARIABLE  _dumpbin_error
+          RESULT_VARIABLE _dumpbin_result
+          OUTPUT_STRIP_TRAILING_WHITESPACE
+        )
+        if(NOT _dumpbin_result EQUAL 0)
+          message(WARNING "Level Zero: dumpbin failed (exit ${_dumpbin_result}): ${_dumpbin_error} -- assuming APIs not supported")
+          set(_symbols_found FALSE)
+        else()
+          string(FIND "${_dumpbin_output}" "zetDeviceEnableMetricsExp"  _have_ze_enable)
+          string(FIND "${_dumpbin_output}" "zetDeviceDisableMetricsExp" _have_ze_disable)
+          if(NOT _have_ze_enable EQUAL -1 AND NOT _have_ze_disable EQUAL -1)
+            set(_symbols_found TRUE)
+          else()
+            set(_symbols_found FALSE)
+          endif()
+        endif()
+        unset(_dumpbin_output)
+        unset(_dumpbin_error)
+        unset(_dumpbin_result)
+      else()
+        message(WARNING "Level Zero: dumpbin not found -- cannot check DLL exports, assuming APIs not supported")
+        set(_symbols_found FALSE)
+      endif()
+      unset(_dumpbin CACHE)
+    else()
+      include(CheckLibraryExists)
+      check_library_exists("${_system_ze_loader}" zetDeviceEnableMetricsExp ""
+                           _have_ze_enable)
+      check_library_exists("${_system_ze_loader}" zetDeviceDisableMetricsExp ""
+                           _have_ze_disable)
+      if(_have_ze_enable AND _have_ze_disable)
+        set(_symbols_found TRUE)
+      else()
+        set(_symbols_found FALSE)
+      endif()
+      unset(_have_ze_enable CACHE)
+      unset(_have_ze_enable)
+      unset(_have_ze_disable CACHE)
+      unset(_have_ze_disable)
+    endif()
+
+    if(_symbols_found)
+      set(HAVE_ZET_DEVICE_METRIC_API TRUE CACHE BOOL "" FORCE)
+      message(STATUS "Level Zero: zetDeviceEnableMetricsExp/zetDeviceDisableMetricsExp found in system loader -- on-demand metric enable supported")
+    else()
+      set(HAVE_ZET_DEVICE_METRIC_API FALSE CACHE BOOL "" FORCE)
+      message(STATUS "Level Zero: zetDeviceEnableMetricsExp/zetDeviceDisableMetricsExp NOT found in system loader -- ZET_ENABLE_METRICS=1 required at runtime")
+    endif()
+    unset(_symbols_found)
+  else()
+    set(HAVE_ZET_DEVICE_METRIC_API FALSE CACHE BOOL "" FORCE)
+    message(STATUS "Level Zero: system loader not found -- assuming ZET_ENABLE_METRICS=1 required at runtime")
+  endif()
+  unset(_system_ze_loader CACHE)
+  unset(_system_ze_loader)
+endmacro()

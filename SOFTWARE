@@ -1,0 +1,53 @@
+level-zero-loader:
+  deb:
+  - https://github.com/oneapi-src/level-zero/releases/download/v1.7.15/level-zero_1.7.15+u18.04_amd64.deb
+  - https://github.com/oneapi-src/level-zero/releases/download/v1.7.15/level-zero-devel_1.7.15+u18.04_amd64.deb
+compute-runtime:
+  deb:
+  - https://github.com/intel/compute-runtime/releases/download/22.10.22597/intel-gmmlib_22.0.2_amd64.deb
+  - https://github.com/intel/intel-graphics-compiler/releases/download/igc-1.0.10409/intel-igc-core_1.0.10409_amd64.deb
+  - https://github.com/intel/intel-graphics-compiler/releases/download/igc-1.0.10409/intel-igc-opencl_1.0.10409_amd64.deb
+  - https://github.com/intel/compute-runtime/releases/download/22.10.22597/intel-opencl-icd_22.10.22597_amd64.deb
+  - https://github.com/intel/compute-runtime/releases/download/22.10.22597/intel-level-zero-gpu_1.3.22597_amd64.deb
+metrics-discovery:
+  github:
+    build_path: build
+    commands:
+    - cmake ..
+    - make -j$(nproc)
+    - sudo make install
+    - sudo make package
+    - sudo dpkg -i *.deb
+    commit: 16ceed40246d9638fde27e384d8a8681337d9828
+    url: https://github.com/intel/metrics-discovery
+metrics-library:
+  github:
+    build_path: null
+    commands:
+    - cmake .
+    - make -j$(nproc)
+    - sudo make package
+    - sudo dpkg -i *.deb
+    commit: 3fd6eb0544fadcec2ac762aedee7c2d5d6479feb
+    url: https://github.com/intel/metrics-library
+gtpin:
+  archive:
+    commands:
+    - tar -xf {} -C {}
+    install_path: ~/
+    url: https://downloadmirror.intel.com/686383/external-gtpin-2.19-linux.tar.xz
+oneapit-toolkits:
+  apt:
+    apt_key: https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS-2023.PUB
+    apt_repo: deb https://apt.repos.intel.com/oneapi all main
+    apt_source: /etc/apt/sources.list.d/oneAPI.list
+    packages:
+    - intel-basekit=2022.1.1-119
+finalize:
+  config:
+    commands:
+    - echo "source /opt/intel/oneapi/setvars.sh" >> ~/.bashrc
+    - '[ ! -d "/sys/module/i915/parameters" ] && sudo mkdir -p /sys/module/i915/parameters'
+    - '[ ! -d "/proc/sys/dev/i915" ] && sudo mkdir -p /proc/sys/dev/i915'
+    - sudo echo N > /sys/module/i915/parameters/enable_hangcheck
+    - sudo echo 0 > /proc/sys/dev/i915/perf_stream_paranoid
