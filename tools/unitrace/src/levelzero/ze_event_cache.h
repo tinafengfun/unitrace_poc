@@ -118,7 +118,14 @@ class ZeEventCache {
           nullptr, flags, EVENT_POOL_SIZE};
       ze_event_pool_handle_t pool = nullptr;
       status = ZE_FUNC(zeEventPoolCreate)(context, &pool_desc, 0, nullptr, &pool);
-      PTI_ASSERT(status == ZE_RESULT_SUCCESS);
+      if (status != ZE_RESULT_SUCCESS || pool == nullptr) {
+        // Runtime allocation failure (device under pressure / device-lost
+        // class): never abort the instrumented app -- report and let the
+        // caller degrade (a nullptr event skips instrumentation of one op).
+        std::cerr << "[ERROR] Failed to create event pool (status = 0x" << std::hex
+                  << status << std::dec << ")" << std::endl;
+        return nullptr;
+      }
 
       auto pool_iter = event_pools_.find(context);
       if (pool_iter == event_pools_.end()) {
@@ -134,11 +141,31 @@ class ZeEventCache {
             ZE_EVENT_SCOPE_FLAG_HOST,
             ZE_EVENT_SCOPE_FLAG_HOST};
         status = ZE_FUNC(zeEventCreate)(pool, &event_desc, &event);
-        PTI_ASSERT(status == ZE_RESULT_SUCCESS);
+        if (status != ZE_RESULT_SUCCESS || event == nullptr) {
+          // Partial pool: keep what was created (they are usable), report the
+          // gap; the caller sees a shorter free list, never a bad handle.
+          std::cerr << "[WARNING] Event creation failed at index " << i << " of "
+                    << EVENT_POOL_SIZE << " (status = 0x" << std::hex << status
+                    << std::dec << ")" << std::endl;
+          break;
+        }
 
         PTI_ASSERT(event_info_map_.count(event) == 0);
         event_info_map_.insert({event, std::make_pair(context, i)});
         result->second.push_back(event);
+      }
+
+      if (result->second.empty()) {
+        // Not a single event came back: destroy the pool (alloc/destroy
+        // pairing) and report failure to the caller.
+        std::cerr << "[WARNING] No event created from new pool, destroying it" << std::endl;
+        status = ZE_FUNC(zeEventPoolDestroy)(pool);
+        if (status != ZE_RESULT_SUCCESS) {
+          std::cerr << "[WARNING] Failed to destroy empty event pool (status = 0x"
+                    << std::hex << status << std::dec << ")" << std::endl;
+        }
+        pool_iter->second.pop_back();
+        return nullptr;
       }
     }
 
@@ -160,7 +187,13 @@ class ZeEventCache {
     auto info = event_info_map_.find(event);
     if (info != event_info_map_.end()) {
       ze_result_t status = ZE_FUNC(zeEventHostReset)(event);
-      PTI_ASSERT(status == ZE_RESULT_SUCCESS);
+      if (status != ZE_RESULT_SUCCESS) {
+        // Device-lost class of errors must not abort the instrumented app:
+        // a lost reset only delays the event's next signal, it is reported
+        // and the waiters behave as for a slow (not a wrong) timestamp.
+        std::cerr << "[WARNING] Failed to reset event (status = 0x" << std::hex
+                  << status << std::dec << ")" << std::endl;
+      }
     }
   }
 
@@ -186,16 +219,30 @@ class ZeEventCache {
       uint32_t event_pool_index = info->second.second;
       auto context = info->second.first;
 
-      ze_event_pool_handle_t pool;
+      ze_event_pool_handle_t pool = nullptr;
       auto status = ZE_FUNC(zeEventGetEventPool)(event, &pool);
-      PTI_ASSERT(status == ZE_RESULT_SUCCESS);
+      if (status != ZE_RESULT_SUCCESS || pool == nullptr) {
+        // The event stays tracked in the maps and will be retried on the
+        // next release of the same handle -- nothing is corrupted, the old
+        // event object is still owned by this cache.
+        std::cerr << "[WARNING] Failed to query event pool for release (status = 0x"
+                  << std::hex << status << std::dec << ")" << std::endl;
+        return;
+      }
 
       // destroy old event
       status = ZE_FUNC(zeEventDestroy)(event);
-      PTI_ASSERT(status == ZE_RESULT_SUCCESS);
+      if (status != ZE_RESULT_SUCCESS) {
+        // Keep the old event tracked and retry on the next release; dropping
+        // the map entry here would leak the object while still vouching for a
+        // dead handle.
+        std::cerr << "[WARNING] Failed to destroy event on release (status = 0x"
+                  << std::hex << status << std::dec << ")" << std::endl;
+        return;
+      }
 
       // create new event
-      ze_event_handle_t new_event;
+      ze_event_handle_t new_event = nullptr;
       ze_event_desc_t event_desc = {
           ZE_STRUCTURE_TYPE_EVENT_DESC,
           nullptr,
@@ -203,7 +250,15 @@ class ZeEventCache {
           ZE_EVENT_SCOPE_FLAG_HOST,
           ZE_EVENT_SCOPE_FLAG_HOST};
       status = ZE_FUNC(zeEventCreate)(pool, &event_desc, &new_event);
-      PTI_ASSERT(status == ZE_RESULT_SUCCESS);
+      if (status != ZE_RESULT_SUCCESS || new_event == nullptr) {
+        // The old event is destroyed, its slot is temporarily unavailable:
+        // account the loss, keep the maps consistent (no entry for a handle
+        // that does not exist) and shrink the free list by one.
+        event_info_map_.erase(event);
+        std::cerr << "[WARNING] Failed to recreate event on release (status = 0x"
+                  << std::hex << status << std::dec << ")" << std::endl;
+        return;
+      }
 
       // Update event info map
       event_info_map_.erase(event);
@@ -212,6 +267,13 @@ class ZeEventCache {
     }
   }
 
+  // Releases every pool/event this cache owns for one context. Called from
+  // the zeContextDestroy ENTER intercept, while the context is still alive:
+  // zeEventDestroy/zeEventPoolDestroy below are exactly the destroy side of
+  // the zeEventPoolCreate/zeEventCreate allocations GetEvent made -- and they
+  // must run BEFORE the driver tears the context down (afterwards they are
+  // use-after-destroy). Also safe as a no-op if nothing is tracked (exit-path
+  // backstop).
   void ReleaseContext(ze_context_handle_t context) {
     if (context == nullptr) {
       return;
@@ -219,28 +281,63 @@ class ZeEventCache {
 
     const std::lock_guard<std::shared_mutex> lock(lock_);
 
-    // all events in the context should already be released
     auto result = event_map_.find(context);
-    if (result != event_map_.end()) {
-      auto iter = event_pools_.find(context);
-      if (iter != event_pools_.end()) {
-        if (result->second.size() == (EVENT_POOL_SIZE * iter->second.size())) {
-          for (auto event : result->second) {
-            ze_result_t status = ZE_RESULT_SUCCESS;
-            status = ZE_FUNC(zeEventDestroy)(event);
-            PTI_ASSERT(status == ZE_RESULT_SUCCESS);
-            event_info_map_.erase(event);
-          }
+    if (result == event_map_.end()) {
+      return;  // nothing tracked for this context
+    }
 
-          event_map_.erase(result);
+    size_t destroyed_events = 0, failed_events = 0;
+    for (auto event : result->second) {
+      ze_result_t status = ZE_FUNC(zeEventDestroy)(event);
+      if (status == ZE_RESULT_SUCCESS) {
+        event_info_map_.erase(event);
+        destroyed_events++;
+      } else {
+        // Do not vouch for the handle once its context is going away even if
+        // the destroy failed: report and drop the tracking either way.
+        event_info_map_.erase(event);
+        failed_events++;
+      }
+    }
 
-          for (auto pool: iter->second) {
-            ze_result_t status = ZE_RESULT_SUCCESS;
-            status = ZE_FUNC(zeEventPoolDestroy)(pool);
-            PTI_ASSERT(status == ZE_RESULT_SUCCESS);
-          }
-          event_pools_.erase(iter);
+    // Events still checked out (created but not yet released by the app
+    // path): their context is being destroyed, so they can no longer be
+    // returned through ReleaseEvent -- destroy them here, best effort.
+    size_t destroyed_inflight = 0, failed_inflight = 0;
+    for (auto info = event_info_map_.begin(); info != event_info_map_.end();) {
+      if (info->second.first != context) {
+        ++info;
+        continue;
+      }
+      ze_result_t status = ZE_FUNC(zeEventDestroy)(info->first);
+      if (status == ZE_RESULT_SUCCESS) {
+        destroyed_inflight++;
+      } else {
+        failed_inflight++;
+      }
+      info = event_info_map_.erase(info);
+    }
+
+    event_map_.erase(result);
+
+    auto iter = event_pools_.find(context);
+    if (iter != event_pools_.end()) {
+      size_t destroyed_pools = 0, failed_pools = 0;
+      for (auto pool : iter->second) {
+        ze_result_t status = ZE_FUNC(zeEventPoolDestroy)(pool);
+        if (status == ZE_RESULT_SUCCESS) {
+          destroyed_pools++;
+        } else {
+          failed_pools++;
         }
+      }
+      event_pools_.erase(iter);
+      if (failed_events != 0 || failed_inflight != 0 || failed_pools != 0) {
+        std::cerr << "[WARNING] Event cache release for context: " << destroyed_events
+                  << " returned + " << destroyed_inflight << " in-flight events, "
+                  << destroyed_pools << " pools destroyed; failures (status in prior lines): "
+                  << failed_events << "/" << failed_inflight << "/" << failed_pools
+                  << std::endl;
       }
     }
   }

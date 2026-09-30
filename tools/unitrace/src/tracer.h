@@ -166,7 +166,10 @@ class UniTracer {
 #endif /* BUILD_WITH_OPENCL */
 
 #if BUILD_WITH_L0
-      ze_collector = ZeCollector::Create(options, ze_kcallback, ze_fcallback, tracer);
+      // T14/A5: the meta callback is always wired -- ChromeLogger checks the
+      // UNITRACE_TRACE_META gate (default ON, "0" disables).
+      ze_collector = ZeCollector::Create(options, ze_kcallback, ze_fcallback, tracer,
+                                         ChromeLogger::MetaLoggingCallback);
       tracer->ze_collector_ = ze_collector;
 #endif /* BUILD_WITH_L0 */
     }

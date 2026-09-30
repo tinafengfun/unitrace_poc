@@ -662,6 +662,20 @@ static inline bool FlowRecordsEnabled(void) {
   return enabled;
 }
 
+// ---------------------------------------------------------------------------
+// T14/A5 (UNITRACE_TRACE_META): collector self-annotation records. The
+// collector's own debt (emit bursts, batch reads, batched resets, the dump)
+// is written into the timeline as host child slices with cat="unitrace_meta"
+// and a "unitrace." name prefix, so a Perfetto reader can tell collector debt
+// from application work. Default ON; exactly "0" disables, which also keeps
+// the trace byte-identical to the pre-meta output (nothing is built, buffered
+// or written). Read once on first use; the call sites pay a single branch.
+// ---------------------------------------------------------------------------
+static inline bool TraceMetaEnabled(void) {
+  static const bool enabled = (utils::GetEnv("UNITRACE_TRACE_META") != "0");
+  return enabled;
+}
+
 #if BUILD_WITH_PERFETTO
 // H2D flow ids (from EVENT_FLOW_SOURCE records) awaiting the next host slice.
 // Per host-thread buffer: the callback pushes a call's flow records right before
@@ -939,6 +953,14 @@ class ChromeTraceEmitter {
     static bool DiagEnabled(void) {
       static const bool enabled = (std::getenv("UNITRACE_DEBUG_EMIT") != nullptr);
       return enabled;
+    }
+
+    // T14/A5: records the ring dropped (full) plus records that fell back to
+    // the synchronous path -- the "how much of this emit was lost" number the
+    // unitrace.emit meta record reports.
+    uint64_t DroppedCount(void) const {
+      return dropped_.load(std::memory_order_relaxed) +
+             fallback_sync_.load(std::memory_order_relaxed);
     }
 
     static ChromeTraceEmitter& Get(void) {
@@ -1288,6 +1310,9 @@ class TraceBuffer {
           }
           host_event_buffer_flushed_ = true;
         }
+        // T14/A5: the unitrace_meta lines of this thread, after its host and
+        // device records (the trace is sorted by ts downstream).
+        FlushMetaRecords();
         for (auto& slice : device_event_buffer_) {
           free(slice);
         }
@@ -1413,6 +1438,121 @@ class TraceBuffer {
         next_device_event_index_++;
         device_event_buffer_flushed_ = false;
       }
+    }
+
+    // -----------------------------------------------------------------------
+    // T14/A5: one collector self-annotation record (UNITRACE_TRACE_META).
+    // Buffered as a ready-made JSON line in this thread's buffer, so a meta
+    // record shares the tid, the file-write path and the teardown ordering of
+    // the host API slice it must nest inside. |name| carries the full record
+    // name ("unitrace.emit"); |start_ns|/|end_ns| are
+    // UniTimer::GetHostTimestamp() ns (an instant when equal); |args_json| is
+    // a pre-rendered JSON object body (may be null); |counter_ms| >= 0
+    // additionally emits the ph=C debt-counter sample. Meta records are rare
+    // (~6 per graph replay step), so the per-record string build is
+    // irrelevant next to the work they measure.
+    // -----------------------------------------------------------------------
+    void EmitMetaRecord(const char* name, uint64_t start_ns, uint64_t end_ns,
+                        const char* args_json, double counter_ms) {
+#if BUILD_WITH_PERFETTO
+      if (UseProtobufOutput()) {
+        // Protobuf output cannot take JSON lines: emit TrackEvent packets
+        // synchronously on this thread's host track (EmitTrace serializes on
+        // the emit lock). Implemented for format completeness; the canonical
+        // unitrace profile writes JSON, and the JSON path below is the one
+        // the T14 acceptance ran against (the debt counter has no counter
+        // track here -- slices/instants only).
+        constexpr uint64_t kHostTrackMarker = 0x484f5354;
+        uint64_t track_uuid = perfetto_emit::MakeUuid(pid_, tid_, kHostTrackMarker + mpi_rank);
+        if (!host_track_emitted_) {
+          perfetto_emit::EmitThreadTrack(track_uuid, HostProcessTrackUuid(pid_),
+                                         pid_, tid_, "Thread " + std::to_string(tid_),
+                                         UniTimer::GetEpochTime(start_ns),
+                                         perfetto_emit::DescriptorSeqId());
+          host_track_emitted_ = true;
+        }
+        perfetto_emit::SliceOptions opts;
+        opts.category = "unitrace_meta";
+        opts.name = name;
+        if (args_json != nullptr) {
+          opts.annotations.push_back(perfetto_emit::Annotation::Str("args", args_json));
+        }
+        if (end_ns > start_ns) {
+          perfetto_emit::EmitSliceBegin(seq_id_, track_uuid, UniTimer::GetEpochTime(start_ns), opts);
+          perfetto_emit::EmitSliceEnd(seq_id_, track_uuid, UniTimer::GetEpochTime(end_ns));
+        }
+        else {
+          perfetto_emit::EmitInstant(seq_id_, track_uuid, UniTimer::GetEpochTime(start_ns), opts);
+        }
+        return;
+      }
+#endif /* BUILD_WITH_PERFETTO */
+      const bool instant = (end_ns <= start_ns);
+      const bool counter = (counter_ms >= 0.0);
+      std::string str = ",\n{";
+      str += "\"ph\": \"";
+      str += (instant ? "R" : "X");
+      str += "\"";
+      str += ", \"tid\": " + std::to_string(tid_);
+      str += ", \"pid\": " + std::to_string(pid_);
+      str += ", \"name\": \"" + std::string(name) + "\"";
+      str += ", \"cat\": \"unitrace_meta\"";
+      if (!instant) {
+        // cname is cosmetic (Perfetto slice colour: grey = "not app work");
+        // prefix + cat + nesting carry the semantics, this only helps the eye.
+        str += ", \"cname\": \"grey\"";
+      }
+      str += ", \"ts\": " + std::to_string(UniTimer::GetEpochTimeInUs(start_ns));
+      if (!instant) {
+        str += ", \"dur\": " + std::to_string(UniTimer::GetTimeInUs(end_ns - start_ns));
+      }
+      std::string str_args;
+      if (args_json != nullptr) {
+        str_args = args_json;
+      }
+      if (!instant && (std::strcmp(name, "unitrace.emit") == 0)) {
+        // The emit record reports how much of the burst the async emitter
+        // lost; the ring lives here, so the writer owns the number.
+        if (!str_args.empty()) {
+          str_args += ", ";
+        }
+        str_args += "\"dropped\": " +
+                    std::to_string(ChromeTraceEmitter::Get().DroppedCount());
+      }
+      if (!str_args.empty()) {
+        str += ", \"args\": {" + str_args + "}";
+      }
+      str += "}";
+      meta_records_.push_back(std::move(str));
+
+      if (counter) {
+        // BONUS: the debt curve. A separate ph=C record so Perfetto renders a
+        // counter track (its own lane) instead of overloading the slice args.
+        std::string cstr = ",\n{";
+        cstr += "\"ph\": \"C\"";
+        cstr += ", \"tid\": " + std::to_string(tid_);
+        cstr += ", \"pid\": " + std::to_string(pid_);
+        cstr += ", \"name\": \"unitrace_overhead_ms\"";
+        cstr += ", \"cat\": \"unitrace_meta\"";
+        cstr += ", \"ts\": " + std::to_string(UniTimer::GetEpochTimeInUs(start_ns));
+        cstr += ", \"args\": {\"unitrace_overhead_ms\": " + std::to_string(counter_ms) + "}";
+        cstr += "}";
+        meta_records_.push_back(std::move(cstr));
+      }
+    }
+
+    // File-write half: called by Finalize(), by the destructor and by
+    // ChromeLogger::Flush() -- all of which hold logger_lock_. Idempotent
+    // (empty vector = no-op), so a flushed buffer can be finalized again.
+    void FlushMetaRecords(void) {
+      if (meta_records_.empty()) {
+        return;
+      }
+      for (const std::string& str : meta_records_) {
+        logger_->Log(str);
+      }
+      meta_records_.clear();
+      meta_records_.shrink_to_fit();
     }
 
     uint32_t GetTid() { return tid_; }
@@ -1730,6 +1870,9 @@ class TraceBuffer {
           }
           host_event_buffer_flushed_ = true;
         }
+        // T14/A5: this thread's unitrace_meta lines, after its host and
+        // device records (the trace is sorted by ts downstream).
+        FlushMetaRecords();
       }
     }
 
@@ -1756,6 +1899,10 @@ class TraceBuffer {
 #endif /* BUILD_WITH_PERFETTO */
     std::vector<ZeKernelCommandExecutionRecord *> device_event_buffer_;
     std::vector<HostEventRecord *> host_event_buffer_;
+    // T14/A5: ready-made unitrace_meta JSON lines (UNITRACE_TRACE_META), kept
+    // beside the host/device records of this thread and written by
+    // FlushMetaRecords under the same locks and in the same teardown pass.
+    std::vector<std::string> meta_records_;
     // device event timestampes cached are <device, engine_ordinal, engine_index> specific
     std::map<std::tuple<ze_device_handle_t, uint32_t, uint32_t>, std::vector<std::set<std::pair<uint64_t, uint64_t>, DeviceTimestampComparator>>> recent_device_timestamps_;
     bool flush_immediately_;
@@ -2550,10 +2697,17 @@ class ChromeLogger {
       }
       logger_lock_.lock();
       if (!flushed_) {
+        // T14/A5: the dump itself is collector debt (T13's teardown-dump
+        // concern), so it is measured and written as the LAST trace record,
+        // before the closing brackets: unitrace.final_flush. It cannot ride
+        // the buffers it is about to drain.
+        const bool meta_on = TraceMetaEnabled();
+        const uint64_t mt0 = meta_on ? UniTimer::GetHostTimestamp() : 0;
         if (trace_buffers_) {
           for (auto it = trace_buffers_->begin(); it != trace_buffers_->end(); ++it) {
             (*it)->FlushDeviceBuffer();
             (*it)->FlushHostBuffer();
+            (*it)->FlushMetaRecords();
           }
         }
 
@@ -2570,6 +2724,21 @@ class ChromeLogger {
         // abnormally. The protobuf stream is binary and self-terminating, so the
         // tags would corrupt it -- JSON-only.
         if (!UseProtobufOutput() && !logger_->IsEmpty()) {
+          if (meta_on) {
+            const uint64_t mt1 = UniTimer::GetHostTimestamp();
+            std::string fstr = ",\n{";
+            fstr += "\"ph\": \"X\"";
+            fstr += ", \"tid\": " + std::to_string(utils::GetTid());
+            fstr += ", \"pid\": " + std::to_string(utils::GetPid());
+            fstr += ", \"name\": \"unitrace.final_flush\"";
+            fstr += ", \"cat\": \"unitrace_meta\"";
+            fstr += ", \"cname\": \"grey\"";
+            fstr += ", \"ts\": " + std::to_string(UniTimer::GetEpochTimeInUs(mt0));
+            fstr += ", \"dur\": " + std::to_string(UniTimer::GetTimeInUs(mt1 - mt0));
+            fstr += ", \"args\": {\"us\": " + std::to_string(UniTimer::GetTimeInUs(mt1 - mt0)) + "}";
+            fstr += "}";
+            logger_->Log(fstr);
+          }
           logger_->Log("\n]\n}\n");
           logger_->Flush();
         }
@@ -2728,6 +2897,30 @@ class ChromeLogger {
       rec->group_count_ = group_count;
       rec->mem_size_ = mem_size;
       thread_local_buffer_.BufferDeviceEvent();
+    }
+
+    // -----------------------------------------------------------------------
+    // T14/A5: the collector's self-annotation entry point (UNITRACE_TRACE_META).
+    // Wired as the ZeCollector mcallback_ by tracer.h, next to the kernel and
+    // call callbacks. Everything the collector measured lands here:
+    //   name       full record name ("unitrace.emit", "unitrace.step 12", ...)
+    //   start/end  UniTimer::GetHostTimestamp() ns window (instant if equal)
+    //   args_json  pre-rendered JSON object body, or nullptr
+    //   counter_ms >= 0 additionally emits the ph=C unitrace_overhead_ms sample
+    // The gate lives here AND at the call sites (the collector checks it to
+    // skip the arg build); with UNITRACE_TRACE_META=0 nothing is produced.
+    // The record rides this thread's TraceBuffer, so it shares the tid and the
+    // write path of the host API slice it must nest inside.
+    // -----------------------------------------------------------------------
+    static void MetaLoggingCallback(const char* name, uint64_t start_ns, uint64_t end_ns,
+                                    const char* args_json, double counter_ms) {
+      if (!TraceMetaEnabled()) {
+        return;
+      }
+      if (thread_local_buffer_.IsFinalized()) {
+        return;
+      }
+      thread_local_buffer_.EmitMetaRecord(name, start_ns, end_ns, args_json, counter_ms);
     }
 
     static void ChromeCallLoggingCallback(std::vector<uint64_t> *kids, FLOW_DIR flow_dir, API_TRACING_ID api_id,

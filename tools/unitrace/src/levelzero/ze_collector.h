@@ -20,6 +20,7 @@
 #include <list>
 #include <map>
 #include <mutex>
+#include <unordered_map>
 #include <shared_mutex>
 #include <set>
 #include <string>
@@ -1231,11 +1232,54 @@ struct ZeCommandList {
 
 typedef void (*OnZeFunctionFinishCallback)(std::vector<uint64_t> *kids, FLOW_DIR flow_dir, API_TRACING_ID api_id, uint64_t started, uint64_t ended);
 
+// T14/A5 (UNITRACE_TRACE_META): collector self-annotation. Wired to
+// ChromeLogger::MetaLoggingCallback by tracer.h. |name| is the full record
+// name ("unitrace.emit"); the window is UniTimer::GetHostTimestamp() ns (an
+// instant when end <= start); |args_json| is a pre-rendered JSON object body
+// or nullptr; |counter_ms| >= 0 additionally emits the per-step debt counter
+// sample. See IMPL_NOTES_meta.md for the record table.
+typedef void (*OnZeMetaRecordCallback)(const char* name, uint64_t start_ns, uint64_t end_ns, const char* args_json, double counter_ms);
+
 typedef void (*OnZeKernelFinishCallback)(uint64_t kid, uint64_t tid, uint64_t start, uint64_t end, uint32_t ordinal, uint32_t index, int32_t tile, const ze_device_handle_t device, const uint64_t kernel_command_id, bool implicit_scaling, const ze_group_count_t& group_count, size_t mem_size);
 
 ze_result_t (*ZexKernelGetBaseAddress)(ze_kernel_handle_t hKernel, uint64_t *baseAddress) = nullptr;
 
-inline std::string GetZeKernelCommandName(uint64_t id, const ze_group_count_t& group_count, size_t size, bool detailed = true) {
+// O2 (tax reduction): formatting a kernel command name costs ~13us per record
+// (Demangle + to_string x8 + concatenation, all under lock_shared) and the
+// vLLM trim24L bench emits ~350 records per step while only ~114 distinct
+// (kernel, grid) shapes exist. Cache the fully formatted name per shape;
+// misses and cache-bypass paths fall through to the original formatting.
+struct UniKernelNameCacheKey {
+  uint64_t id;
+  uint32_t gx;
+  uint32_t gy;
+  uint32_t gz;
+  size_t size;
+  bool detailed;
+  bool operator==(const UniKernelNameCacheKey& o) const {
+    return id == o.id && gx == o.gx && gy == o.gy && gz == o.gz &&
+           size == o.size && detailed == o.detailed;
+  }
+};
+struct UniKernelNameCacheHash {
+  size_t operator()(const UniKernelNameCacheKey& k) const {
+    size_t h = std::hash<uint64_t>()(k.id);
+    auto mix = [&h](size_t v) {
+      h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+    };
+    mix(std::hash<uint32_t>()(k.gx));
+    mix(std::hash<uint32_t>()(k.gy));
+    mix(std::hash<uint32_t>()(k.gz));
+    mix(std::hash<size_t>()(k.size));
+    mix(std::hash<bool>()(k.detailed));
+    return h;
+  }
+};
+// Bounded by shape count: beyond this many shapes the cache stops admitting
+// (no eviction logic, no unbounded growth); new shapes keep the direct path.
+static constexpr size_t kUniKernelNameCacheMax = 8192;
+
+inline std::string BuildZeKernelCommandName(uint64_t id, const ze_group_count_t& group_count, size_t size, bool detailed) {
   std::string str;
   kernel_command_properties_mutex_.lock_shared();
   auto it = kernel_command_properties_->find(id);
@@ -1269,6 +1313,57 @@ inline std::string GetZeKernelCommandName(uint64_t id, const ze_group_count_t& g
 
   kernel_command_properties_mutex_.unlock_shared();
 
+  return str;
+}
+
+inline std::string GetZeKernelCommandName(uint64_t id, const ze_group_count_t& group_count, size_t size, bool detailed = true) {
+  static std::shared_mutex cache_mutex;
+  static std::unordered_map<UniKernelNameCacheKey, std::string, UniKernelNameCacheHash>* cache = nullptr;
+  static std::atomic<bool> cache_alloc_failed{false};
+  static std::atomic<bool> cache_warn_logged{false};
+
+  UniKernelNameCacheKey key{id, group_count.groupCountX, group_count.groupCountY,
+                            group_count.groupCountZ, size, detailed};
+  if (cache != nullptr) {
+    std::shared_lock<std::shared_mutex> lk(cache_mutex);
+    auto cit = cache->find(key);
+    if (cit != cache->end()) {
+      return cit->second;
+    }
+  }
+  std::string str = BuildZeKernelCommandName(id, group_count, size, detailed);
+  // Only cache well-formed names: an empty result means the properties entry
+  // is not registered yet and would poison the cache if it appears later.
+  if (str.empty()) {
+    return str;
+  }
+  if (cache == nullptr) {
+    if (cache_alloc_failed.load(std::memory_order_relaxed)) {
+      return str;  // allocation already failed once; stay on the direct path
+    }
+    try {
+      cache = new std::unordered_map<UniKernelNameCacheKey, std::string, UniKernelNameCacheHash>();
+    } catch (const std::bad_alloc&) {
+      cache_alloc_failed.store(true, std::memory_order_relaxed);
+      std::cerr << "[WARNING] GetZeKernelCommandName: name cache allocation failed, staying on the direct formatting path" << std::endl;
+      return str;
+    }
+  }
+  {
+    std::unique_lock<std::shared_mutex> lk(cache_mutex);
+    if (cache->size() < kUniKernelNameCacheMax) {
+      try {
+        cache->emplace(key, str);
+      } catch (const std::bad_alloc&) {
+        if (!cache_warn_logged.exchange(true)) {
+          std::cerr << "[WARNING] GetZeKernelCommandName: name cache insert failed, this shape stays on the direct formatting path" << std::endl;
+        }
+      }
+    } else if (!cache_warn_logged.exchange(true)) {
+      std::cerr << "[WARNING] GetZeKernelCommandName: name cache full (" << kUniKernelNameCacheMax
+                << " shapes), new shapes stay on the direct formatting path" << std::endl;
+    }
+  }
   return str;
 }
 
@@ -1409,7 +1504,8 @@ class ZeCollector {
       CollectorOptions options,
       OnZeKernelFinishCallback kcallback = nullptr,
       OnZeFunctionFinishCallback fcallback = nullptr,
-      void* callback_data = nullptr) {
+      void* callback_data = nullptr,
+      OnZeMetaRecordCallback mcallback = nullptr) {
     ze_api_version_t version = GetZeVersion();
     PTI_ASSERT(
         ZE_MAJOR_VERSION(version) >= 1 &&
@@ -1451,7 +1547,7 @@ class ZeCollector {
     );
 
     ZeCollector* collector = new ZeCollector(
-      options, kcallback, fcallback, callback_data, data_dir_name, reset_event_on_device, include_kernels_vec, exclude_kernels_vec);
+      options, kcallback, fcallback, mcallback, callback_data, data_dir_name, reset_event_on_device, include_kernels_vec, exclude_kernels_vec);
 
     UniMemory::ExitIfOutOfMemory((void *)(collector));
 
@@ -1876,7 +1972,8 @@ class ZeCollector {
         // T6'/E6 (v3): stays queued for the next flush.
       }
       else if ((command->device_global_timestamps_ != nullptr) || (command->timestamps_on_event_reset_!= nullptr)) {
-        if (ZE_FUNC(zeEventQueryStatus)(command->timestamp_event_) == ZE_RESULT_SUCCESS) {
+        if (command->timestamp_event_ != nullptr &&  // HARDEN: null event from a failed pool creation never reaches the driver
+    ZE_FUNC(zeEventQueryStatus)(command->timestamp_event_) == ZE_RESULT_SUCCESS) {
           // Fix B: legacy host-buffer timestamps stay on the inline path.
           ProcessCommandSubmitted(local_device_submissions_, command, kids, false);
           processed = true;
@@ -1913,7 +2010,7 @@ class ZeCollector {
     FlushDeferredTimestamps();
   }
 
-  void ProcessAllCommandsSubmitted(std::vector<uint64_t> *kids) {
+  void ProcessAllCommandsSubmitted(std::vector<uint64_t> *kids, bool at_gexp = false) {
     if (uni_batchqkt_in_batch_) {
       return;  // T6'/E6: re-entry from the batch's own L0 calls (no-op, same pattern as Fix B)
     }
@@ -1925,8 +2022,8 @@ class ZeCollector {
     // Fix B barrier (entry): already-queued commands must be fully processed
     // before this drain runs, so the completion state this sweep observes is
     // final (graph replay staging relies on that).
-    FlushDeferredTimestamps();
-    global_device_submissions_mutex_.lock();
+    { UniPhaseTimer ph_d1(uni_pd_flush1_us_, uni_pd_flush1_n_); FlushDeferredTimestamps(); }
+    { UniPhaseTimer ph_d2(uni_pd_lock_us_, uni_pd_lock_n_); global_device_submissions_mutex_.lock(); }
 
     // T6'/E6 (v3): THE per-replay flush point. Graph replay staging runs this
     // drain after host-synchronizing every list with in-flight clones of the
@@ -1949,7 +2046,8 @@ class ZeCollector {
       // the next replay. This is what bounds a deferred clone's life when the
       // app never polls between steps: the emit then simply happens here, on
       // the v4 path, and nothing is lost — only the overlap is missed.
-      BatchQktConsumeDeferredEmit(kids, /*at_drain=*/true);
+      { UniPhaseTimer ph_d3(uni_pd_consume_us_, uni_pd_consume_n_);
+        BatchQktConsumeDeferredEmit(kids, /*at_drain=*/true); }
       // E6-v4c: prefer finishing a poll-armed read. Its device-side wait
       // resolved when the step's last kernel signaled, and the list
       // host-synchronize in PrepareGraphExecution above already proved the
@@ -1960,6 +2058,7 @@ class ZeCollector {
       // — is the unchanged v4b code. With the gate off, or when no sweep armed
       // a read (app never polled mid-step, arm skipped, or the sync failed),
       // this is the untouched v4b drain read.
+      { UniPhaseTimer ph_d4(uni_pd_pollread_us_, uni_pd_pollread_n_);
       if (!BatchQktCompletePollRead(batch)) {
         BatchQktCollectStatusGated(batch);
         if (!batch.cmds.empty()) {
@@ -2010,19 +2109,25 @@ class ZeCollector {
           }
         }
       }
+      }
     }
 
+    { UniPhaseTimer ph_d5(uni_pd_loop_us_, uni_pd_loop_n_);
+    uint64_t pd_outer = 0, pd_iter = 0, pd_take = 0, pd_acc = 0, pd_lq = 0;
     if (global_device_submissions_) {
       for (auto s : *global_device_submissions_) {
+        pd_outer++;
         auto& local_submissions = *s;
         auto it = local_submissions.commands_submitted_.begin();
         while (it != local_submissions.commands_submitted_.end()) {
+          pd_iter++;
           ZeCommand *command = *it;
 
           bool processed = false;
           bool deferred = false;
           const ze_kernel_timestamp_result_t *pre_ts = BatchQktTake(batch, command);
           if (pre_ts != nullptr) {
+            pd_take++;
             // T6'/E6: readiness was proven by the collection pass and the
             // packet is already read; inline consumption on the legacy tail.
             if (kids != nullptr) {
@@ -2032,11 +2137,14 @@ class ZeCollector {
             processed = true;
           }
           else if (BatchQktAccumulate(command, batchqkt && !batchqkt_legacy)) {
+            pd_acc++;
             // T6'/E6 (v3): not ready (or not part of) this flush — stays
             // queued for the next one instead of being consumed here.
           }
           else if ((command->device_global_timestamps_ != nullptr) || (command->timestamps_on_event_reset_ != nullptr)) {
-            if (ZE_FUNC(zeEventQueryStatus)(command->timestamp_event_) == ZE_RESULT_SUCCESS) {
+            if (command->timestamp_event_ != nullptr &&  // HARDEN: null event from a failed pool creation never reaches the driver
+    ZE_FUNC(zeEventQueryStatus)(command->timestamp_event_) == ZE_RESULT_SUCCESS) {
+              pd_lq++;
               // Fix B: legacy host-buffer timestamps stay on the inline path.
               ProcessCommandSubmitted(local_submissions, command, kids, false);
               processed = true;
@@ -2064,15 +2172,37 @@ class ZeCollector {
         }
       }
     }
+    if (at_gexp) {
+      // TAX-OPT drain2: one store per drain (single submit thread, one drain
+      // per step) -- snapshot the loop-shape counters for the meta record.
+      uni_pd_outer_n_.store(pd_outer, std::memory_order_relaxed);
+      uni_pd_iter_n_.store(pd_iter, std::memory_order_relaxed);
+      uni_pd_take_n_.store(pd_take, std::memory_order_relaxed);
+      uni_pd_acc_n_.store(pd_acc, std::memory_order_relaxed);
+      uni_pd_lq_n_.store(pd_lq, std::memory_order_relaxed);
+    }
     if (batchqkt) {
       uni_batchqkt_in_batch_ = false;  // end of the flush window
     }
     global_device_submissions_mutex_.unlock();
-    FlushGraphEventResets();  // Graph replay fix: end-of-sweep deferred resets
+    }
+    { UniPhaseTimer ph_d6(uni_pd_resets_us_, uni_pd_resets_n_);
+    FlushGraphEventResets(); }  // Graph replay fix: end-of-sweep deferred resets
     // Fix B barrier (exit): this drain may just have handed commands to the
     // completer thread; callers (context/list teardown, graph replay staging,
     // final flush) assume everything is done when this returns.
-    FlushDeferredTimestamps();
+    // TAX-OPT (deferred-ts drain tail): the gexp staging drain SKIPS this
+    // barrier. The commands it deferred (the eager commands whose events the
+    // poll sweeps saw not-yet-signaled) keep completing on the completer
+    // thread while the next replay executes (~38ms of overlap on node3);
+    // the next drain's ENTRY barrier (FlushDeferredTimestamps above) is the
+    // correctness point, and every non-gexp caller (teardown, finalize,
+    // fence backstops) still gets the full wait. Measured on node3 trim24L:
+    // the exit barrier waited 261us/step for the completer's tail while the
+    // entry barrier of the next drain was ~1us.
+    if (!at_gexp) {
+      { UniPhaseTimer ph_d7(uni_pd_flush2_us_, uni_pd_flush2_n_); FlushDeferredTimestamps(); }
+    }
   }
 
   void FinalizeDeviceSubmissions(std::vector<uint64_t> *kids) {
@@ -2098,7 +2228,8 @@ class ZeCollector {
         processed = true;
       }
       else if ((command->device_global_timestamps_ != nullptr) || (command->timestamps_on_event_reset_ != nullptr)) {
-        if (ZE_FUNC(zeEventQueryStatus)(command->timestamp_event_) == ZE_RESULT_SUCCESS) {
+        if (command->timestamp_event_ != nullptr &&  // HARDEN: null event from a failed pool creation never reaches the driver
+    ZE_FUNC(zeEventQueryStatus)(command->timestamp_event_) == ZE_RESULT_SUCCESS) {
           // Fix B: legacy host-buffer timestamps stay on the inline path.
           ProcessCommandSubmitted(local_device_submissions_, command, kids, false);
           processed = true;
@@ -2134,6 +2265,7 @@ class ZeCollector {
       CollectorOptions options,
       OnZeKernelFinishCallback kcallback,
       OnZeFunctionFinishCallback fcallback,
+      OnZeMetaRecordCallback mcallback,
       void* /* callback_data */,
       std::string& data_dir_name,
       bool reset_event_on_device,
@@ -2143,6 +2275,7 @@ class ZeCollector {
         options_(options),
         kcallback_(kcallback),
         fcallback_(fcallback),
+        mcallback_(mcallback),
         reset_event_on_device_(reset_event_on_device),
         event_cache_(ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP),
         include_kernels_(include_kernels),
@@ -3030,7 +3163,8 @@ class ZeCollector {
           // T6'/E6 (v3): stays queued for the next flush.
         }
         else if ((command->device_global_timestamps_ != nullptr) || (command->timestamps_on_event_reset_ != nullptr)) {
-          if (ZE_FUNC(zeEventQueryStatus)(command->timestamp_event_) == ZE_RESULT_SUCCESS) {
+          if (command->timestamp_event_ != nullptr &&  // HARDEN: null event from a failed pool creation never reaches the driver
+    ZE_FUNC(zeEventQueryStatus)(command->timestamp_event_) == ZE_RESULT_SUCCESS) {
             // Fix B: legacy host-buffer timestamps stay on the inline path.
             ProcessCommandSubmitted(local_device_submissions_, command, nullptr, false);
             processed = true;
@@ -3173,7 +3307,8 @@ class ZeCollector {
           // stays queued for the next flush
         }
         else if ((command->device_global_timestamps_ != nullptr) || (command->timestamps_on_event_reset_ != nullptr)) {
-          if (ZE_FUNC(zeEventQueryStatus)(command->timestamp_event_) == ZE_RESULT_SUCCESS) {
+          if (command->timestamp_event_ != nullptr &&  // HARDEN: null event from a failed pool creation never reaches the driver
+    ZE_FUNC(zeEventQueryStatus)(command->timestamp_event_) == ZE_RESULT_SUCCESS) {
             // Fix B: legacy host-buffer timestamps stay on the inline path.
             ProcessCommandSubmitted(local_device_submissions_, command, nullptr, false);
             processed = true;
@@ -3450,10 +3585,14 @@ class ZeCollector {
   // FlushData's join) and must never hand new commands back to it.
   static inline thread_local bool uni_defer_on_completer_thread_ = false;
 
+  // Shipping default ON: eager (non-graph) commands' timestamp query+read+emit
+  // runs on the completer thread instead of inline in the submit-thread drain
+  // (measured -0.48ms/step on node3 trim24L). Set UNITRACE_DEFERRED_TS=0 to
+  // restore the inline drain shape for A/B testing.
   static bool DeferredTsEnvEnabled(void) {
     static const bool enabled = []() {
       const char *e = std::getenv("UNITRACE_DEFERRED_TS");
-      return (e != nullptr && e[0] == '1' && e[1] == '\0');
+      return (e == nullptr || !(e[0] == '0' && e[1] == '\0'));
     }();
     return enabled;
   }
@@ -3580,12 +3719,24 @@ class ZeCollector {
              !uni_defer_max_batch_.compare_exchange_weak(prev_max, batch_size, std::memory_order_relaxed)) {
       }
       lk.unlock();
+      // T14/A5: the eager-side Fix B debt -- the deferred timestamp read + emit
+      // + reset burst this completer batch runs. It lives on the completer
+      // thread (not inside an app API call), so its meta slice has no host
+      // parent: it renders on the completer thread's own track.
+      const bool meta = MetaOn();
+      const uint64_t mt0 = meta ? UniTimer::GetHostTimestamp() : 0;
       for (DeferredTsItem &item : batch) {
         ProcessCommandSubmittedTail(local_device_submissions_, item.command_, item.on_event_);
         delete item.command_;
         uni_defer_processed_count_.fetch_add(1, std::memory_order_relaxed);
       }
       batch.clear();
+      if (meta) {
+        const uint64_t mt1 = UniTimer::GetHostTimestamp();
+        MetaRecord("unitrace.handoff", mt0, mt1,
+                   "\"n\": " + std::to_string(batch_size) +
+                   ", \"us\": " + std::to_string(UniTimer::GetTimeInUs(mt1 - mt0)) + "");
+      }
       lk.lock();
       uni_defer_worker_busy_ = false;
       uni_defer_q_cv_.notify_all();
@@ -4075,10 +4226,15 @@ class ZeCollector {
   // save/restore the flag so the window composes with their own inner guard.
   static inline thread_local bool uni_batchqkt_in_batch_ = false;
 
+  // Shipping default ON: batched graph-timestamp read (one batched query
+  // list per step instead of per-node timestamp events; measured net
+  // -4.25ms/step on node3 trim24L vs the legacy per-node shape). Set
+  // UNITRACE_GRAPH_BATCH_QKT=0 to restore the legacy per-node shape for
+  // A/B testing.
   static bool BatchQktEnvEnabled(void) {
     static const bool enabled = []() {
       const char *e = std::getenv("UNITRACE_GRAPH_BATCH_QKT");
-      return (e != nullptr && e[0] == '1' && e[1] == '\0');
+      return (e == nullptr || !(e[0] == '0' && e[1] == '\0'));
     }();
     return enabled;
   }
@@ -4088,21 +4244,159 @@ class ZeCollector {
     return enabled;
   }
 
-  // E6-v4c A/B knob: arm the step's batch read at a device-busy poll sweep
-  // (device-side wait on the step's own events) instead of appending +
-  // synchronizing it at the staging drain. Absent (or anything but exactly
-  // "1") keeps the v4b shape byte-for-byte.
+  // HARDEN (UNITRACE_TEST_ALLOC_FAIL=1): force every BATCHQKT allocation
+  // (host staging buffer, immediate command list) to fail so the
+  // graceful-skip path can be exercised on a healthy node. Read once.
+  static bool BatchQktTestAllocFail(void) {
+    static const bool enabled = []() {
+      const char *e = std::getenv("UNITRACE_TEST_ALLOC_FAIL");
+      return (e != nullptr && e[0] == '1' && e[1] == '\0');
+    }();
+    return enabled;
+  }
+
+  // HARDEN: true while any command list is inside a graph capture window.
+  inline bool BatchQktCaptureHold(void) {
+    return uni_batchqkt_capture_depth_.load(std::memory_order_acquire) > 0;
+  }
+
+  // HARDEN: someone requested BATCHQKT resources for a context handle the
+  // app already destroyed (L0 recycles handle values, so this is the exact
+  // pre-fix path that served a dead list/buffer to a fresh context and
+  // programmed it into the CCS stream). Counted, printed once.
+  void BatchQktNoteDeadContext(void) {
+    uni_batchqkt_dead_ctx_skips_.fetch_add(1, std::memory_order_relaxed);
+    if (!uni_batchqkt_notice_deadctx_.exchange(true, std::memory_order_relaxed)) {
+      std::cerr << "[BATCHQKT] resource request for a destroyed context handle, "
+                << "staying on the legacy per-event path (see dead_ctx_skips)" << std::endl;
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // T14/A5 (UNITRACE_TRACE_META): the collector's own debt becomes visible in
+  // the chrome trace as cat="unitrace_meta" child slices of the host API call
+  // it runs inside (see IMPL_NOTES_meta.md for the record table). Default ON;
+  // exactly "0" disables -- the call sites then skip the arg-string build and
+  // the output stays byte-identical to the pre-meta collector. The writer
+  // (ChromeLogger::MetaLoggingCallback) re-checks the same gate.
+  // -----------------------------------------------------------------------
+  static bool TraceMetaEnvEnabled(void) {
+    static const bool enabled = []() {
+      const char *e = std::getenv("UNITRACE_TRACE_META");
+      return (e == nullptr || !(e[0] == '0' && e[1] == '\0'));
+    }();
+    return enabled;
+  }
+
+  // Hot-path check: one atomic-free branch when the gate is off (the callback
+  // is always wired, so the gate decides).
+  inline bool MetaOn(void) const {
+    return TraceMetaEnvEnabled() && (mcallback_ != nullptr);
+  }
+
+  // One meta record. |name| is the full record name; |mt0|/|mt1| are the
+  // UniTimer::GetHostTimestamp() bounds of the measured window (an instant
+  // when equal); |args| is the JSON object body; |counter_ms| >= 0 additionally
+  // emits the ph=C unitrace_overhead_ms debt sample (see PrepareGraphExecution).
+  inline void MetaRecord(const char* name, uint64_t mt0, uint64_t mt1,
+                         const std::string& args, double counter_ms = -1.0) {
+    if (MetaOn()) {
+      // Debt ledger: every meta slice feeds the per-step overhead counter.
+      if (mt1 > mt0) {
+        uni_meta_debt_us_.fetch_add((mt1 - mt0) / 1000, std::memory_order_relaxed);
+      }
+      mcallback_(name, mt0, mt1, args.c_str(), counter_ms);
+    }
+  }
+
+  // T14/A5: 1-based graph-replay step number (the "unitrace.step <N>" landmark)
+  // and the meta microseconds accumulated since the last step sample.
+  std::atomic<uint64_t> uni_meta_step_{0};
+  std::atomic<uint64_t> uni_meta_debt_us_{0};
+
+  // TAX-OPT (enqueue-phase attribution): the exposed tax lives in the
+  // urEnqueueGraphExp enqueue phase (node3 trim24L: 1.53ms/step in the device
+  // gap, vs 5.80ms for the legacy u0 arm). The meta records cover emit/reset/
+  // qkt but not the append path, so time the collector's own work per phase
+  // and admit it as one "unitrace.enqueue" record at the end of every replay's
+  // PrepareGraphExecution. All relaxed -- attribution only.
+  std::atomic<uint64_t> uni_ph_evcollect_us_{0};  // graph_events + lists_to_wait collection
+  std::atomic<uint64_t> uni_ph_drain_us_{0};      // ProcessAllCommandsSubmitted (collect+execute+reset batch)
+  std::atomic<uint64_t> uni_ph_clone_us_{0};      // per-replay command clone loop
+  std::atomic<uint64_t> uni_ph_appendk_us_{0};    // eager kernel append: exit-side AppendLaunchKernel
+  std::atomic<uint64_t> uni_ph_prepk_us_{0};      // eager kernel append: enter-side PrepareToAppendKernelCommand
+  std::atomic<uint64_t> uni_ph_appendk_n_{0};
+  std::atomic<uint64_t> uni_ph_prepk_n_{0};
+  std::atomic<uint64_t> uni_ph_evcollect_n_{0};
+  std::atomic<uint64_t> uni_ph_drain_n_{0};
+  std::atomic<uint64_t> uni_ph_clone_n_{0};
+
+  // TAX-OPT drain2 (sub-drain attribution): the drain itself is 1.41ms/step
+  // on node3 while its known tenants (reset batch ~0.51, qkt read ~0.37) leave
+  // ~0.53ms unexplained. Time each statement group inside
+  // ProcessAllCommandsSubmitted at the drain call site only -- the same
+  // functions also run from poll sweeps, so call-site timers (not in-function
+  // ones) keep the poll-sweep work out of these counters. All relaxed.
+  std::atomic<uint64_t> uni_pd_flush1_us_{0};   // entry FlushDeferredTimestamps
+  std::atomic<uint64_t> uni_pd_lock_us_{0};     // exclusive submissions lock acquire
+  std::atomic<uint64_t> uni_pd_consume_us_{0};  // BatchQktConsumeDeferredEmit(at_drain)
+  std::atomic<uint64_t> uni_pd_pollread_us_{0}; // CompletePollRead / Collect+Execute chain
+  std::atomic<uint64_t> uni_pd_loop_us_{0};     // global submissions clone loop
+  std::atomic<uint64_t> uni_pd_resets_us_{0};   // FlushGraphEventResets (reset batch)
+  std::atomic<uint64_t> uni_pd_flush2_us_{0};   // exit FlushDeferredTimestamps
+  std::atomic<uint64_t> uni_pd_flush1_n_{0};
+  std::atomic<uint64_t> uni_pd_lock_n_{0};
+  std::atomic<uint64_t> uni_pd_consume_n_{0};
+  std::atomic<uint64_t> uni_pd_pollread_n_{0};
+  std::atomic<uint64_t> uni_pd_loop_n_{0};
+  std::atomic<uint64_t> uni_pd_resets_n_{0};
+  std::atomic<uint64_t> uni_pd_flush2_n_{0};
+  // drain2 loop-shape counters (gexp-site drain only; store-per-drain):
+  // outer = containers in the global set, iter = commands visited, take =
+  // batch-packet inline consumes, acc = clones kept queued (accumulate),
+  // lq = legacy timestamp-event status calls.
+  std::atomic<uint64_t> uni_pd_outer_n_{0};
+  std::atomic<uint64_t> uni_pd_iter_n_{0};
+  std::atomic<uint64_t> uni_pd_take_n_{0};
+  std::atomic<uint64_t> uni_pd_acc_n_{0};
+  std::atomic<uint64_t> uni_pd_lq_n_{0};
+
+  // RAII accumulator for the phase timers above: every exit path (early
+  // returns included) lands in the counter. Deliberately not gated by MetaOn()
+  // -- two relaxed atomic adds per call are noise next to the work measured.
+  struct UniPhaseTimer {
+    std::atomic<uint64_t>& us_;
+    std::atomic<uint64_t>& n_;
+    std::chrono::steady_clock::time_point t0_;
+    UniPhaseTimer(std::atomic<uint64_t>& us, std::atomic<uint64_t>& n)
+        : us_(us), n_(n), t0_(std::chrono::steady_clock::now()) {}
+    ~UniPhaseTimer() {
+      us_.fetch_add(static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - t0_).count()),
+          std::memory_order_relaxed);
+      n_.fetch_add(1, std::memory_order_relaxed);
+    }
+    UniPhaseTimer(const UniPhaseTimer&) = delete;
+    UniPhaseTimer& operator=(const UniPhaseTimer&) = delete;
+  };
+
+  // E6-v4c knob, shipping default ON: arm the step's batch read at a
+  // device-busy poll sweep (device-side wait on the step's own events)
+  // instead of appending + synchronizing it at the staging drain. Set
+  // UNITRACE_GRAPH_QKT_AT_POLL=0 to keep the v4b shape (read resolved at the
+  // staging drain) for A/B testing.
   static bool QktAtPollEnvEnabled(void) {
     static const bool enabled = []() {
       const char *e = std::getenv("UNITRACE_GRAPH_QKT_AT_POLL");
-      return (e != nullptr && e[0] == '1' && e[1] == '\0');
+      return (e == nullptr || !(e[0] == '0' && e[1] == '\0'));
     }();
     return enabled;
   }
 
   // Master gate of the poll-armed read. Inherits the batch gate's TSLOG2
   // force-off (diagnosis modes keep their exact inline ordering) and is false
-  // whenever UNITRACE_GRAPH_BATCH_QKT is unset.
+  // whenever UNITRACE_GRAPH_BATCH_QKT=0 disables the batch gate.
   inline bool BatchQktAtPollActive(void) {
     return BatchQktActive() && QktAtPollEnvEnabled();
   }
@@ -4267,7 +4561,10 @@ class ZeCollector {
   // until its emit runs. deferred_ts_ is only ever set with the gate on, so
   // the gate-off path is unchanged.
   inline bool BatchQktAccumulate(const ZeCommand *command, bool armed) const {
-    return (armed || command->deferred_ts_ != nullptr) &&
+    // HARDEN: a null submission entry can never be dereferenced (defensive;
+    // a false here just leaves the step on the legacy path).
+    return command != nullptr &&
+           (armed || command->deferred_ts_ != nullptr) &&
            command->graph_command_ && command->event_ != nullptr &&
            command->device_global_timestamps_ == nullptr &&
            command->timestamps_on_event_reset_ == nullptr;
@@ -4286,8 +4583,8 @@ class ZeCollector {
   // parked handle), so a clone stranded by a destroyed graph can never reach
   // the poll list.
   bool BatchQktPollBatchable(ZeCommand *command) {
-    if (command->deferred_ts_ != nullptr) {
-      return false;  // E6-v4b: packet read, emit pending — not ours to read
+    if (command == nullptr || command->deferred_ts_ != nullptr) {
+      return false;  // null is never batchable; E6-v4b: packet read, emit pending — not ours to read
     }
     if (!command->graph_command_ || command->event_ == nullptr ||
         command->device_global_timestamps_ != nullptr ||
@@ -4334,26 +4631,42 @@ class ZeCollector {
   // context. A nullptr entry means creation failed: permanently fall back to
   // the legacy per-event path for that context (no retry storm, one line).
   ze_command_list_handle_t BatchQktEnsureImmList(ze_context_handle_t context, ze_device_handle_t device) {
+    // HARDEN: a destroyed context's handle value is never trusted again.
+    if (uni_batchqkt_dead_contexts_.count(context) != 0) {
+      BatchQktNoteDeadContext();
+      return nullptr;
+    }
     auto it = uni_batchqkt_imm_lists_.find(context);
     if (it != uni_batchqkt_imm_lists_.end()) {
       return it->second;
     }
     uint32_t ordinal = 0;
     ze_command_list_handle_t imm = nullptr;
-    if (BatchQktComputeOrdinal(device, ordinal)) {
+    ze_result_t status = ZE_RESULT_SUCCESS;
+    if (BatchQktTestAllocFail()) {
+      // HARDEN: forced failure (UNITRACE_TEST_ALLOC_FAIL=1); counted below.
+      status = ZE_RESULT_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    else if (BatchQktComputeOrdinal(device, ordinal)) {
       ze_command_queue_desc_t qdesc = {};
       qdesc.stype = ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC;
       qdesc.ordinal = ordinal;
       qdesc.index = 0;
       qdesc.mode = ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS;
       qdesc.priority = ZE_COMMAND_QUEUE_PRIORITY_NORMAL;
-      ze_result_t status = ZE_FUNC(zeCommandListCreateImmediate)(context, device, &qdesc, &imm);
+      status = ZE_FUNC(zeCommandListCreateImmediate)(context, device, &qdesc, &imm);
       if (status != ZE_RESULT_SUCCESS) {
         imm = nullptr;
       }
     }
     if (imm == nullptr) {
-      std::cerr << "[BATCHQKT] immediate command list creation failed, graph replay timestamps stay on the per-event path" << std::endl;
+      // HARDEN: counted, visible with the driver status; the sticky nullptr
+      // fallback below keeps this context on the legacy per-event path
+      // (never a bad enqueue).
+      uni_batchqkt_alloc_fail_.fetch_add(1, std::memory_order_relaxed);
+      std::cerr << "[BATCHQKT] immediate command list creation failed (status = 0x"
+                << std::hex << status << std::dec
+                << "), graph replay timestamps stay on the per-event path" << std::endl;
     }
     uni_batchqkt_imm_lists_[context] = imm;
     return imm;
@@ -4366,28 +4679,41 @@ class ZeCollector {
   // device-side wait, and only the drain that owns the arm synchronizes it.
   ze_command_list_handle_t BatchQktEnsurePollList(ze_context_handle_t context,
                                                   ze_device_handle_t device) {
+    // HARDEN: a destroyed context's handle value is never trusted again.
+    if (uni_batchqkt_dead_contexts_.count(context) != 0) {
+      BatchQktNoteDeadContext();
+      return nullptr;
+    }
     auto it = uni_batchqkt_poll_lists_.find(context);
     if (it != uni_batchqkt_poll_lists_.end()) {
       return it->second;
     }
     uint32_t ordinal = 0;
     ze_command_list_handle_t imm = nullptr;
-    if (BatchQktComputeOrdinal(device, ordinal)) {
+    ze_result_t status = ZE_RESULT_SUCCESS;
+    if (BatchQktTestAllocFail()) {
+      // HARDEN: forced failure (UNITRACE_TEST_ALLOC_FAIL=1); counted below.
+      status = ZE_RESULT_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    else if (BatchQktComputeOrdinal(device, ordinal)) {
       ze_command_queue_desc_t qdesc = {};
       qdesc.stype = ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC;
       qdesc.ordinal = ordinal;
       qdesc.index = 0;
       qdesc.mode = ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS;
       qdesc.priority = ZE_COMMAND_QUEUE_PRIORITY_NORMAL;
-      ze_result_t status = ZE_FUNC(zeCommandListCreateImmediate)(context, device, &qdesc, &imm);
+      status = ZE_FUNC(zeCommandListCreateImmediate)(context, device, &qdesc, &imm);
       if (status != ZE_RESULT_SUCCESS) {
         imm = nullptr;
       }
     }
     if (imm == nullptr) {
+      // HARDEN: counted, visible; sticky fallback, never a bad enqueue.
+      uni_batchqkt_alloc_fail_.fetch_add(1, std::memory_order_relaxed);
       if (!uni_batchqkt_notice_polllist_.exchange(true, std::memory_order_relaxed) &&
           BatchQktDiagEnabled()) {
-        std::cerr << "[BATCHQKT] poll immediate command list creation failed, "
+        std::cerr << "[BATCHQKT] poll immediate command list creation failed (status = 0x"
+                  << std::hex << status << std::dec << "), "
                   << "QKT_AT_POLL stays on the drain read for this context" << std::endl;
       }
     }
@@ -4405,6 +4731,13 @@ class ZeCollector {
   void *BatchQktEnsureBufferIn(std::map<ze_context_handle_t, void *> &bufs,
                                std::map<ze_context_handle_t, size_t> &caps,
                                ze_context_handle_t context, size_t bytes) {
+    // HARDEN: a destroyed context's handle value is never trusted again (its
+    // host allocations died with the context; serving them to a recycled
+    // handle would hand the device a dangling dst).
+    if (uni_batchqkt_dead_contexts_.count(context) != 0) {
+      BatchQktNoteDeadContext();
+      return nullptr;
+    }
     void *&buf = bufs[context];
     size_t &cap = caps[context];
     if (buf != nullptr && cap >= bytes) {
@@ -4412,14 +4745,35 @@ class ZeCollector {
     }
     size_t want = ((bytes + 4095) / 4096) * 4096;  // page-granular, cache-line safe
     if (buf != nullptr) {
-      ZE_FUNC(zeMemFree)(context, buf);
+      ze_result_t status = ZE_FUNC(zeMemFree)(context, buf);
+      if (status != ZE_RESULT_SUCCESS) {
+        std::cerr << "[WARNING] Failed to free grown staging buffer (status = 0x"
+                  << std::hex << status << std::dec << ")" << std::endl;
+      }
       buf = nullptr;
       cap = 0;
+    }
+    // HARDEN (UNITRACE_TEST_ALLOC_FAIL=1): pretend the allocation failed so
+    // the graceful-skip path can be exercised without a degraded device.
+    if (BatchQktTestAllocFail()) {
+      uni_batchqkt_alloc_fail_.fetch_add(1, std::memory_order_relaxed);
+      buf = nullptr;
+      cap = 0;
+      return nullptr;
     }
     ze_host_mem_alloc_desc_t host_desc = {};
     host_desc.stype = ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC;
     ze_result_t status = ZE_FUNC(zeMemAllocHost)(context, &host_desc, want, 64, &buf);
     if (status != ZE_RESULT_SUCCESS) {
+      // HARDEN: counted + one-shot visible line. Callers (BatchQktExecute /
+      // BatchQktArmPollRead) see dst == nullptr and skip the batch -- a clone
+      // read is never enqueued with a bad handle.
+      uni_batchqkt_alloc_fail_.fetch_add(1, std::memory_order_relaxed);
+      if (!uni_batchqkt_notice_allocfail_.exchange(true, std::memory_order_relaxed) &&
+          BatchQktDiagEnabled()) {
+        std::cerr << "[BATCHQKT] host staging allocation failed (status=0x" << std::hex << status
+                  << std::dec << "), batch reads skip gracefully (see qkt_skip_alloc_fail)" << std::endl;
+      }
       buf = nullptr;
       cap = 0;
       return nullptr;
@@ -4445,6 +4799,17 @@ class ZeCollector {
       if (!uni_batchqkt_notice_min_.exchange(true, std::memory_order_relaxed) &&
           BatchQktDiagEnabled()) {
         std::cerr << "[BATCHQKT] skip: n=" << n << " below min=" << kBatchQktMinCommands << std::endl;
+      }
+      batch.cmds.clear();
+      return false;
+    }
+    if (n > 0xFFFFFFFFull) {
+      // HARDEN: the append API takes uint32_t; this cannot happen by
+      // construction (one replay step's clones), never cast blindly.
+      uni_batchqkt_fallback_count_.fetch_add(1, std::memory_order_relaxed);
+      if (!uni_batchqkt_notice_invariant_.exchange(true, std::memory_order_relaxed) &&
+          BatchQktDiagEnabled()) {
+        std::cerr << "[BATCHQKT] skip: batch size overflows uint32 (n=" << n << ")" << std::endl;
       }
       batch.cmds.clear();
       return false;
@@ -4475,6 +4840,17 @@ class ZeCollector {
     }
     std::vector<ze_event_handle_t> events(n);
     for (size_t i = 0; i < n; i++) {
+      // HARDEN: a null command pointer in the batch can never be dereferenced
+      // (cannot happen by construction -- batches hold collected commands --
+      // but the deref below would be a straight crash if that ever changed).
+      if (batch.cmds[i] == nullptr) {
+        if (!uni_batchqkt_notice_invariant_.exchange(true, std::memory_order_relaxed) &&
+            BatchQktDiagEnabled()) {
+          std::cerr << "[BATCHQKT] skip: null command pointer in batch (i=" << i << ")" << std::endl;
+        }
+        batch.cmds.clear();
+        return false;
+      }
       if (batch.cmds[i]->context_ != context || batch.cmds[i]->device_ != device) {
         if (!uni_batchqkt_notice_mixed_.exchange(true, std::memory_order_relaxed) &&
             BatchQktDiagEnabled()) {
@@ -4483,7 +4859,27 @@ class ZeCollector {
         batch.cmds.clear();
         return false;
       }
+      // HARDEN: a null event handle must never reach
+      // zeCommandListAppendQueryKernelTimestamps -- the collector gates
+      // clones on event_ != nullptr at collect time, but the batch is
+      // consumed a few lines later; re-check at the last moment and drop the
+      // whole batch instead of enqueueing a null handle.
+      if (batch.cmds[i]->event_ == nullptr) {
+        uni_batchqkt_alloc_fail_.fetch_add(1, std::memory_order_relaxed);
+        batch.cmds.clear();
+        return false;
+      }
       events[i] = batch.cmds[i]->event_;
+    }
+
+    // HARDEN: never issue collector-side device work while any command list
+    // is inside a graph capture window. Capture appends create no clones, so
+    // whatever is pending belongs to an earlier replay and can wait for the
+    // first drain after capture ends (ready clones are re-collected there).
+    if (BatchQktCaptureHold()) {
+      uni_batchqkt_capture_skip_.fetch_add(1, std::memory_order_relaxed);
+      batch.cmds.clear();
+      return false;
     }
 
     std::lock_guard<std::mutex> lk(uni_batchqkt_mutex_);
@@ -4497,6 +4893,9 @@ class ZeCollector {
 
     const bool prev_guard = uni_batchqkt_in_batch_;
     uni_batchqkt_in_batch_ = true;  // our L0 calls must not re-enter the sweeps
+    // T14/A5: this read runs at the staging drain, on the app's critical path.
+    const bool meta = MetaOn();
+    const uint64_t mt0 = meta ? UniTimer::GetHostTimestamp() : 0;
     auto t0 = std::chrono::steady_clock::now();
     ze_result_t status = ZE_FUNC(zeCommandListAppendQueryKernelTimestamps)(
         imm, static_cast<uint32_t>(n), events.data(), dst,
@@ -4505,6 +4904,7 @@ class ZeCollector {
       status = ZE_FUNC(zeCommandListHostSynchronize)(imm, UINT64_MAX);
     }
     auto t1 = std::chrono::steady_clock::now();
+    const uint64_t mt1 = meta ? UniTimer::GetHostTimestamp() : 0;
     uni_batchqkt_in_batch_ = prev_guard;
     if (status != ZE_RESULT_SUCCESS) {
       // Append may have succeeded and the sync failed (device-lost class of
@@ -4532,6 +4932,13 @@ class ZeCollector {
     uni_batchqkt_batch_count_.fetch_add(1, std::memory_order_relaxed);
     uni_batchqkt_cmd_count_.fetch_add(n, std::memory_order_relaxed);
     batch.ok = true;
+    if (meta) {
+      // T14/A5: the v4b/legacy batch read, spent serially at the staging drain.
+      MetaRecord("unitrace.qkt_batch", mt0, mt1,
+                 "\"n\": " + std::to_string(n) +
+                 ", \"us\": " + std::to_string(batch_us) +
+                 ", \"at\": \"drain\"");
+    }
     if (BatchQktDiagEnabled()) {
       std::cerr << "[BATCHQKT] n=" << n << " batch_us=" << batch_us << std::endl;
     }
@@ -4567,11 +4974,22 @@ class ZeCollector {
     if (!BatchQktAtPollActive() || uni_batchqkt_in_batch_) {
       return;
     }
+    // HARDEN: no device-side wait op is armed while a graph capture is open
+    // (the arm's poll list could otherwise be the next boot's stale handle).
+    if (BatchQktCaptureHold()) {
+      uni_batchqkt_capture_skip_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
     if (uni_batchqkt_read_pending_.load(std::memory_order_acquire)) {
       return;  // this or another thread's step already has its read armed
     }
     ZeBatchQktPollRead pr;
     for (ZeCommand *command : local_device_submissions_.commands_submitted_) {
+      // HARDEN: never dereference a null submission entry (defensive; the
+      // submission vectors only hold collected commands by construction).
+      if (command == nullptr) {
+        continue;
+      }
       if (!BatchQktPollBatchable(command)) {
         continue;
       }
@@ -4594,6 +5012,15 @@ class ZeCollector {
     const size_t n = pr.cmds.size();
     if (n < kBatchQktMinCommands) {
       return;  // nothing worth a batch — the drain path handles it as usual
+    }
+    if (n > 0xFFFFFFFFull) {
+      // HARDEN: the append API takes uint32_t; leave the step to the drain.
+      uni_batchqkt_fallback_count_.fetch_add(1, std::memory_order_relaxed);
+      if (!uni_batchqkt_notice_invariant_.exchange(true, std::memory_order_relaxed) &&
+          BatchQktDiagEnabled()) {
+        std::cerr << "[BATCHQKT] skip poll arm: batch size overflows uint32 (n=" << n << ")" << std::endl;
+      }
+      return;
     }
     if (!ZE_HAVE_FUNC(zeCommandListCreateImmediate) ||
         !ZE_HAVE_FUNC(zeCommandListAppendQueryKernelTimestamps) ||
@@ -4621,12 +5048,17 @@ class ZeCollector {
       uni_batchqkt_in_batch_ = prev_guard;
       return;  // sticky per-context fallback, counted at the drain if it happens
     }
+    // T14/A5: the v4c arm issues the read inside a device-busy poll sweep --
+    // its append cost is real host work in that sweep, so it is self-admitted.
+    const bool meta = MetaOn();
+    const uint64_t mt0 = meta ? UniTimer::GetHostTimestamp() : 0;
     auto t0 = std::chrono::steady_clock::now();
     ze_result_t status = ZE_FUNC(zeCommandListAppendQueryKernelTimestamps)(
         imm, static_cast<uint32_t>(n), pr.events.data(), dst,
         /*pOffsets=*/nullptr, /*hSignalEvent=*/nullptr,
         /*numWaitEvents=*/static_cast<uint32_t>(n), /*phWaitEvents=*/pr.events.data());
     auto t1 = std::chrono::steady_clock::now();
+    const uint64_t mt1 = meta ? UniTimer::GetHostTimestamp() : 0;
     uni_batchqkt_in_batch_ = prev_guard;
     if (status != ZE_RESULT_SUCCESS) {
       // Driver refused the wait-events form (or the list): nothing was
@@ -4644,6 +5076,15 @@ class ZeCollector {
     pr.n = n;
     pr.append_us =
         static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
+    if (meta) {
+      // T14/A5: the poll-side half of the v4c split read. The slice lies in
+      // the poll sweep's host API slice (device busy), the drain-side half is
+      // the "poll_sync" record BatchQktCompletePollRead emits.
+      MetaRecord("unitrace.qkt_batch", mt0, mt1,
+                 "\"n\": " + std::to_string(n) +
+                 ", \"us\": " + std::to_string(pr.append_us) +
+                 ", \"at\": \"poll\"");
+    }
     pr.live = true;
     // E6-v4c: this sweep is the one that "saw" and collected the step's clones
     // now (the drain's BatchQktCollectStatusGated is skipped for an armed
@@ -4696,16 +5137,39 @@ class ZeCollector {
       // Cannot happen by construction; never let a desynchronized descriptor
       // reach the memcpy or the cursor match.
       uni_batchqkt_poll_read_ = ZeBatchQktPollRead();
+      if (!uni_batchqkt_notice_invariant_.exchange(true, std::memory_order_relaxed) &&
+          BatchQktDiagEnabled()) {
+        std::cerr << "[BATCHQKT] poll descriptor desynchronized (n=" << pr.n
+                  << " cmds=" << pr.cmds.size() << "), step falls back to the drain read" << std::endl;
+      }
       return false;
+    }
+    for (size_t i = 0; i < pr.n; i++) {
+      // HARDEN: a null command or event element must not reach the consumer
+      // (cursor match would deref the command) or the packet copy below.
+      if (pr.cmds[i] == nullptr || pr.events[i] == nullptr) {
+        batch.cmds.clear();
+        batch.ts.clear();
+        if (!uni_batchqkt_notice_invariant_.exchange(true, std::memory_order_relaxed) &&
+            BatchQktDiagEnabled()) {
+          std::cerr << "[BATCHQKT] poll descriptor has a null element (i=" << i
+                    << "), step falls back to the drain read" << std::endl;
+        }
+        return false;
+      }
     }
     const size_t n = pr.n;
     batch.cmds = std::move(pr.cmds);
     batch.ts.resize(n);
     const bool prev_guard = uni_batchqkt_in_batch_;
     uni_batchqkt_in_batch_ = true;  // our L0 calls must not re-enter the sweeps
+    // T14/A5: the drain-side half of the poll-armed read (sync + copy).
+    const bool meta = MetaOn();
+    const uint64_t mt0 = meta ? UniTimer::GetHostTimestamp() : 0;
     auto t0 = std::chrono::steady_clock::now();
     ze_result_t status = ZE_FUNC(zeCommandListHostSynchronize)(pr.list, UINT64_MAX);
     auto t1 = std::chrono::steady_clock::now();
+    const uint64_t mt1 = meta ? UniTimer::GetHostTimestamp() : 0;
     uni_batchqkt_in_batch_ = prev_guard;
     if (status != ZE_RESULT_SUCCESS) {
       // Nothing was consumed from dst and no clone state changed: the drain
@@ -4745,6 +5209,16 @@ class ZeCollector {
     uni_batchqkt_cmd_count_.fetch_add(n, std::memory_order_relaxed);
     uni_batchqkt_qkt_at_poll_.fetch_add(n, std::memory_order_relaxed);
     batch.ok = true;
+    if (meta) {
+      // T14/A5: "poll_sync" = the drain-side half of the poll-armed read: the
+      // wait resolved during the step, so this is only the sync + copy that
+      // landed at the staging drain. The poll-side append is the "poll"
+      // record; args carry both halves' costs.
+      MetaRecord("unitrace.qkt_batch", mt0, mt1,
+                 "\"n\": " + std::to_string(n) +
+                 ", \"us\": " + std::to_string(batch_us) +
+                 ", \"at\": \"poll_sync\", \"append_us\": " + std::to_string(pr.append_us) + "");
+    }
     if (BatchQktDiagEnabled()) {
       std::cerr << "[BATCHQKT] n=" << n << " poll_read_us=" << batch_us << std::endl;
     }
@@ -4808,6 +5282,9 @@ class ZeCollector {
     uni_batchqkt_emit_buf_ = batch.ts;  // packets must outlive this sweep
     for (size_t i = 0; i < n; i++) {
       ZeCommand *command = batch.cmds[i];
+      if (command == nullptr) {
+        continue;  // HARDEN: cannot happen (batches are element-validated), never write through null
+      }
       command->deferred_ts_ = &uni_batchqkt_emit_buf_[i];
       BatchQktReleaseArmedEvent(command);
     }
@@ -4863,6 +5340,11 @@ class ZeCollector {
     else if (!uni_batchqkt_flush_pending_.exchange(false, std::memory_order_acq_rel)) {
       return;  // nothing armed, or another sweep won this flush
     }
+    // T14/A5: the ~58ms/step record machinery this pass runs IS the emit debt
+    // v4b hid inside poll sweeps -- measure it and self-admit it as a child
+    // slice of whichever host API call this sweep runs inside.
+    const bool meta = MetaOn();
+    const uint64_t mt0 = meta ? UniTimer::GetHostTimestamp() : 0;
     const bool prev_guard = uni_batchqkt_in_batch_;
     uni_batchqkt_in_batch_ = true;  // the tails below must not re-enter a sweep
     uint64_t consumed = 0;
@@ -4870,6 +5352,12 @@ class ZeCollector {
       auto it = submissions.commands_submitted_.begin();
       while (it != submissions.commands_submitted_.end()) {
         ZeCommand *command = *it;
+        if (command == nullptr) {
+          // HARDEN: a null entry can never be dereferenced -- drop it (it is
+          // not a valid submitted command and would poison every later sweep).
+          it = submissions.commands_submitted_.erase(it);
+          continue;
+        }
         if (command->deferred_ts_ == nullptr) {
           ++it;
           continue;
@@ -4908,6 +5396,16 @@ class ZeCollector {
       else {
         uni_batchqkt_flush_at_poll_.fetch_add(consumed, std::memory_order_relaxed);
       }
+    }
+    if (meta && consumed > 0) {
+      // at="poll": the healthy overlapped emit (inside a device-busy sweep).
+      // at="drain": the staging drain, or the teardown backstop (which has no
+      // enclosing host API slice -- an expected, reported nesting exception).
+      const uint64_t mt1 = UniTimer::GetHostTimestamp();
+      MetaRecord("unitrace.emit", mt0, mt1,
+                 "\"n\": " + std::to_string(consumed) +
+                 ", \"us\": " + std::to_string(UniTimer::GetTimeInUs(mt1 - mt0)) +
+                 ", \"at\": \"" + (at_drain ? "drain" : "poll") + "\"");
     }
   }
 
@@ -4950,6 +5448,13 @@ class ZeCollector {
               << " qkt_batch_us=" << uni_batchqkt_qkt_batch_us_.load(std::memory_order_relaxed)
               << " qkt_append_us=" << uni_batchqkt_qkt_append_us_.load(std::memory_order_relaxed)
               << " qkt_sync_us=" << uni_batchqkt_qkt_sync_us_.load(std::memory_order_relaxed)
+              // HARDEN: graceful-skip accounting -- alloc/context-dead skips
+              // and batches suppressed during graph capture windows.
+              << " qkt_skip_alloc_fail=" << uni_batchqkt_alloc_fail_.load(std::memory_order_relaxed)
+              << " dead_ctx_skips=" << uni_batchqkt_dead_ctx_skips_.load(std::memory_order_relaxed)
+              << " ctx_releases=" << uni_batchqkt_ctx_releases_.load(std::memory_order_relaxed)
+              << " capture_skip=" << uni_batchqkt_capture_skip_.load(std::memory_order_relaxed)
+              << " capture_depth=" << uni_batchqkt_capture_depth_.load(std::memory_order_relaxed)
               << std::endl;
   }
 
@@ -4992,11 +5497,25 @@ class ZeCollector {
     std::vector<ze_event_handle_t> live;
     live.reserve(events.size());
     for (ze_event_handle_t event : events) {
+      if (event == nullptr) {
+        continue;  // HARDEN: a null handle never reaches an append
+      }
       if (event_cache_.QueryEvent(event)) {
         live.push_back(event);
       }
     }
     if (live.empty()) {
+      return;
+    }
+    // HARDEN: no device-side reset batch while a graph capture is open --
+    // the parked set is drained through the legacy host reset instead
+    // (identical semantics, just not batched for this sweep).
+    if (BatchQktCaptureHold()) {
+      uni_batchqkt_capture_skip_.fetch_add(1, std::memory_order_relaxed);
+      uni_batchqkt_reset_fallback_.fetch_add(live.size(), std::memory_order_relaxed);
+      for (ze_event_handle_t event : live) {
+        event_cache_.ResetEvent(event);
+      }
       return;
     }
     ze_command_list_handle_t imm = nullptr;
@@ -5024,6 +5543,9 @@ class ZeCollector {
       if (imm != nullptr) {
         const bool prev_guard = uni_batchqkt_in_batch_;
         uni_batchqkt_in_batch_ = true;  // our L0 calls must not re-enter the sweeps
+        // T14/A5: the batched event reset of this sweep's clones.
+        const bool meta = MetaOn();
+        const uint64_t mt0 = meta ? UniTimer::GetHostTimestamp() : 0;
         auto t0 = std::chrono::steady_clock::now();
         ze_result_t status = ZE_RESULT_SUCCESS;
         for (ze_event_handle_t event : live) {
@@ -5036,6 +5558,7 @@ class ZeCollector {
           status = ZE_FUNC(zeCommandListHostSynchronize)(imm, UINT64_MAX);
         }
         auto t1 = std::chrono::steady_clock::now();
+        const uint64_t mt1 = meta ? UniTimer::GetHostTimestamp() : 0;
         uni_batchqkt_in_batch_ = prev_guard;
         if (status == ZE_RESULT_SUCCESS) {
           const uint64_t n = static_cast<uint64_t>(live.size());
@@ -5051,6 +5574,12 @@ class ZeCollector {
           }
           uni_batchqkt_reset_batch_count_.fetch_add(1, std::memory_order_relaxed);
           uni_batchqkt_reset_batched_.fetch_add(n, std::memory_order_relaxed);
+          if (meta) {
+            // T14/A5: the sweep's batched reset, as one child slice.
+            MetaRecord("unitrace.reset_batch", mt0, mt1,
+                       "\"n\": " + std::to_string(n) +
+                       ", \"us\": " + std::to_string(batch_us) + "");
+          }
           if (!uni_batchqkt_notice_resetok_.exchange(true, std::memory_order_relaxed) &&
               BatchQktDiagEnabled()) {
             std::cerr << "[BATCHQKT] reset-batch=" << n
@@ -5075,11 +5604,150 @@ class ZeCollector {
     }
   }
 
+  // HARDEN (2026-09-30 audit + pairing review): destroy side of every
+  // collector allocation made from one context, called from the
+  // zeContextDestroy ENTER intercept -- the context is still ALIVE here, so
+  // every free below is legal and paired:
+  //   zeCommandListCreateImmediate -> zeCommandListDestroy (imm + poll lists)
+  //   zeMemAllocHost               -> zeMemFree (both staging buffers)
+  // Without this, L0 heap-reuses the context handle value and the collector
+  // keeps serving the DEAD list/buffer to the next engine's context -- the
+  // first batched read then programs a list bound to a torn-down VM into the
+  // CCS stream (GPU page fault at 0, the multi-boot wedge signature).
+  // The handle value is marked dead afterwards: never trusted again even if
+  // recycled (a reuse only costs the counted legacy-path fallback).
+  // Locking: uni_batchqkt_mutex_ is the same lock every batched append/sync
+  // holds, so an in-flight batch on another thread finishes (bounded by one
+  // HostSynchronize) before the frees run.
+  void ReleaseBatchQktContextResources(ze_context_handle_t context) {
+    if (context == nullptr) {
+      return;
+    }
+    {
+      std::lock_guard<std::shared_mutex> elk(events_mutex_);
+      // Parked (not yet reset) events of this context: drop them. Their
+      // context is going away; resetting them through any list is the hazard
+      // the v4 reset batching must never take.
+      graph_events_pending_reset_.erase(context);
+    }
+    std::lock_guard<std::mutex> lk(uni_batchqkt_mutex_);
+    // Retire an armed poll read of this context: bounded sync while its list
+    // is still alive, then discard the slot.
+    if (uni_batchqkt_read_pending_.load(std::memory_order_acquire) &&
+        uni_batchqkt_poll_read_.live && uni_batchqkt_poll_read_.context == context) {
+      if (uni_batchqkt_poll_read_.list != nullptr) {
+        ze_result_t status = ZE_FUNC(zeCommandListHostSynchronize)(uni_batchqkt_poll_read_.list, 1000000000ULL);
+        if (status != ZE_RESULT_SUCCESS) {
+          std::cerr << "[WARNING] Failed to synchronize armed poll read on context release (status = 0x"
+                    << std::hex << status << std::dec << ")" << std::endl;
+        }
+      }
+      uni_batchqkt_poll_read_ = ZeBatchQktPollRead();
+      uni_batchqkt_read_pending_.store(false, std::memory_order_release);
+    }
+    size_t freed = 0, failed = 0;
+    auto imm_it = uni_batchqkt_imm_lists_.find(context);
+    if (imm_it != uni_batchqkt_imm_lists_.end() && imm_it->second != nullptr) {
+      ze_result_t status = ZE_FUNC(zeCommandListDestroy)(imm_it->second);
+      if (status == ZE_RESULT_SUCCESS) {
+        freed++;
+      } else {
+        failed++;
+        std::cerr << "[WARNING] Failed to destroy BATCHQKT immediate list (status = 0x"
+                  << std::hex << status << std::dec << ")" << std::endl;
+      }
+    }
+    auto poll_it = uni_batchqkt_poll_lists_.find(context);
+    if (poll_it != uni_batchqkt_poll_lists_.end() && poll_it->second != nullptr) {
+      ze_result_t status = ZE_FUNC(zeCommandListDestroy)(poll_it->second);
+      if (status == ZE_RESULT_SUCCESS) {
+        freed++;
+      } else {
+        failed++;
+        std::cerr << "[WARNING] Failed to destroy BATCHQKT poll list (status = 0x"
+                  << std::hex << status << std::dec << ")" << std::endl;
+      }
+    }
+    auto buf_it = uni_batchqkt_bufs_.find(context);
+    if (buf_it != uni_batchqkt_bufs_.end() && buf_it->second != nullptr) {
+      ze_result_t status = ZE_FUNC(zeMemFree)(context, buf_it->second);
+      if (status == ZE_RESULT_SUCCESS) {
+        freed++;
+      } else {
+        failed++;
+        std::cerr << "[WARNING] Failed to free BATCHQKT staging buffer (status = 0x"
+                  << std::hex << status << std::dec << ")" << std::endl;
+      }
+    }
+    auto poll_buf_it = uni_batchqkt_poll_bufs_.find(context);
+    if (poll_buf_it != uni_batchqkt_poll_bufs_.end() && poll_buf_it->second != nullptr) {
+      ze_result_t status = ZE_FUNC(zeMemFree)(context, poll_buf_it->second);
+      if (status == ZE_RESULT_SUCCESS) {
+        freed++;
+      } else {
+        failed++;
+        std::cerr << "[WARNING] Failed to free BATCHQKT poll staging buffer (status = 0x"
+                  << std::hex << status << std::dec << ")" << std::endl;
+      }
+    }
+    uni_batchqkt_imm_lists_.erase(context);
+    uni_batchqkt_poll_lists_.erase(context);
+    uni_batchqkt_bufs_.erase(context);
+    uni_batchqkt_buf_caps_.erase(context);
+    uni_batchqkt_poll_bufs_.erase(context);
+    uni_batchqkt_poll_buf_caps_.erase(context);
+    // Remember the handle value as dead: never create/serve resources for it
+    // again, even if L0 hands a NEW context out at the same address.
+    uni_batchqkt_dead_contexts_.insert(context);
+    uni_batchqkt_ctx_releases_.fetch_add(1, std::memory_order_relaxed);
+    std::cerr << "[BATCHQKT] context 0x" << std::hex << context << std::dec
+              << " released: " << freed << " list/buffer resources freed";
+    if (failed != 0) {
+      std::cerr << ", " << failed << " FAILED (see warnings above)";
+    }
+    std::cerr << std::endl;
+  }
+
+  // HARDEN exit-path safety net, called from OnExitContextDestroy: at that
+  // point the driver has ALREADY destroyed the context, so the frees must
+  // NOT run here (use-after-destroy) -- if the enter intercept fired, every
+  // map is empty and this only re-marks the handle; if it did not fire, this
+  // still drops the dead context's resources from the maps so no sweep can
+  // resurrect them, and the teardown drain below falls back to the legacy
+  // per-event path instead of issuing device ops on the dying context.
+  void InvalidateBatchQktContext(ze_context_handle_t context) {
+    if (context == nullptr) {
+      return;
+    }
+    {
+      std::lock_guard<std::shared_mutex> elk(events_mutex_);
+      graph_events_pending_reset_.erase(context);
+    }
+    std::lock_guard<std::mutex> lk(uni_batchqkt_mutex_);
+    // Discard an armed poll read slot of this context WITHOUT device calls:
+    // its list may already be dead if the enter intercept did not run.
+    if (uni_batchqkt_read_pending_.load(std::memory_order_acquire) &&
+        uni_batchqkt_poll_read_.live && uni_batchqkt_poll_read_.context == context) {
+      uni_batchqkt_poll_read_ = ZeBatchQktPollRead();
+      uni_batchqkt_read_pending_.store(false, std::memory_order_release);
+    }
+    uni_batchqkt_imm_lists_.erase(context);
+    uni_batchqkt_poll_lists_.erase(context);
+    uni_batchqkt_bufs_.erase(context);
+    uni_batchqkt_buf_caps_.erase(context);
+    uni_batchqkt_poll_bufs_.erase(context);
+    uni_batchqkt_poll_buf_caps_.erase(context);
+    uni_batchqkt_dead_contexts_.insert(context);
+  }
+
   // Releases the collector-owned batch resources. Called at the end of
   // Finalize, after the tracer is gone and every submission is finalized, so
-  // the L0 calls below cannot re-enter a live sweep.
+  // the L0 calls below cannot re-enter a live sweep. Normally a backstop:
+  // per-context resources are already freed (paired) in
+  // ReleaseBatchQktContextResources when the app destroyed each context.
   void ReleaseBatchQktResources(void) {
     std::lock_guard<std::mutex> lk(uni_batchqkt_mutex_);
+    size_t freed = 0, failed = 0;
     // E6-v4c: drop a still-armed poll read first — its commands are back in
     // the free pool by now and its wait op (if any) must not outlive the poll
     // lists destroyed below. Best effort, bounded: the last step completed
@@ -5087,36 +5755,53 @@ class ZeCollector {
     // a bounded timeout keeps a wedged step from hanging the shutdown (the
     // descriptor is dropped either way).
     if (uni_batchqkt_poll_read_.live && uni_batchqkt_poll_read_.list != nullptr) {
-      ZE_FUNC(zeCommandListHostSynchronize)(uni_batchqkt_poll_read_.list, 5000000000ULL);
+      ze_result_t status = ZE_FUNC(zeCommandListHostSynchronize)(uni_batchqkt_poll_read_.list, 5000000000ULL);
+      if (status != ZE_RESULT_SUCCESS) {
+        std::cerr << "[WARNING] Failed to synchronize armed poll read at teardown (status = 0x"
+                  << std::hex << status << std::dec << ")" << std::endl;
+      }
       uni_batchqkt_poll_read_ = ZeBatchQktPollRead();
     }
     uni_batchqkt_read_pending_.store(false, std::memory_order_release);
     for (auto &kv : uni_batchqkt_bufs_) {
       if (kv.second != nullptr) {
-        ZE_FUNC(zeMemFree)(kv.first, kv.second);
+        ze_result_t status = ZE_FUNC(zeMemFree)(kv.first, kv.second);
+        (status == ZE_RESULT_SUCCESS) ? freed++ : failed++;
       }
     }
     uni_batchqkt_bufs_.clear();
     uni_batchqkt_buf_caps_.clear();
     for (auto &kv : uni_batchqkt_poll_bufs_) {
       if (kv.second != nullptr) {
-        ZE_FUNC(zeMemFree)(kv.first, kv.second);
+        ze_result_t status = ZE_FUNC(zeMemFree)(kv.first, kv.second);
+        (status == ZE_RESULT_SUCCESS) ? freed++ : failed++;
       }
     }
     uni_batchqkt_poll_bufs_.clear();
     uni_batchqkt_poll_buf_caps_.clear();
     for (auto &kv : uni_batchqkt_imm_lists_) {
       if (kv.second != nullptr) {
-        ZE_FUNC(zeCommandListDestroy)(kv.second);
+        ze_result_t status = ZE_FUNC(zeCommandListDestroy)(kv.second);
+        (status == ZE_RESULT_SUCCESS) ? freed++ : failed++;
       }
     }
     uni_batchqkt_imm_lists_.clear();
     for (auto &kv : uni_batchqkt_poll_lists_) {
       if (kv.second != nullptr) {
-        ZE_FUNC(zeCommandListDestroy)(kv.second);
+        ze_result_t status = ZE_FUNC(zeCommandListDestroy)(kv.second);
+        (status == ZE_RESULT_SUCCESS) ? freed++ : failed++;
       }
     }
     uni_batchqkt_poll_lists_.clear();
+    // Pairing audit line: nonzero on the healthy path only if the app never
+    // destroyed its contexts; failures carry their own [WARNING] lines above.
+    if (freed != 0 || failed != 0) {
+      std::cerr << "[BATCHQKT] teardown freed " << freed << " list/buffer resources";
+      if (failed != 0) {
+        std::cerr << ", " << failed << " FAILED";
+      }
+      std::cerr << std::endl;
+    }
   }
 
   inline void ProcessCommandSubmitted(ZeDeviceSubmissions& submissions, ZeCommand *command, std::vector<uint64_t> *kids, bool on_event, const ZePrefetchedTs *pre_ts = nullptr) {
@@ -5409,11 +6094,18 @@ class ZeCollector {
 
     if (immediate == false) {
       desc->timestamp_event_to_signal_ = event_cache_.GetEvent(context);
+      if (desc->timestamp_event_to_signal_ == nullptr) {
+        // HARDEN: event pool creation failed (reported by the cache); leave
+        // the event null (immediate command lists run without one) and keep
+        // the app alive instead of signalling a null handle.
+        std::cerr << "[ERROR] No timestamp event for command list, kernels on it will not be instrumented" << std::endl;
+      } else {
       // set to signal state to unblock first ZE_FUNC(zeCommandQueueExecuteCommandLists)() call
       auto status = ZE_FUNC(zeEventHostSignal)(desc->timestamp_event_to_signal_);
       if (status != ZE_RESULT_SUCCESS) {
         std::cerr << "[ERROR] Failed to signal timestamp event in command list" << std::endl;
         exit(-1);
+      }
       }
     }
     else {
@@ -5499,6 +6191,10 @@ class ZeCollector {
         ReleaseGraphResources(*it->second->pending_graph_capture_);
         delete it->second->pending_graph_capture_;
         it->second->pending_graph_capture_ = nullptr;
+      }
+      if (it->second->graph_capturing_) {  // HARDEN: list dies mid-capture
+        it->second->graph_capturing_ = false;
+        uni_batchqkt_capture_depth_.fetch_sub(1, std::memory_order_acq_rel);
       }
       command_lists_.erase(it);
     }
@@ -5975,6 +6671,9 @@ class ZeCollector {
     uint32_t num_wait_events = 0,
     ze_event_handle_t* wait_events = nullptr) {
 
+    // TAX-OPT: enter-side collector work of the eager kernel append path.
+    UniPhaseTimer ph_prepk(collector->uni_ph_prepk_us_, collector->uni_ph_prepk_n_);
+
     ze_context_handle_t context = nullptr;
     ze_device_handle_t device = nullptr;
     bool in_order = false;
@@ -6028,7 +6727,13 @@ class ZeCollector {
 
     if (signal_event == nullptr) {
       signal_event = collector->event_cache_.GetEvent(context);
-      PTI_ASSERT(signal_event != nullptr);
+      if (signal_event == nullptr) {
+        // HARDEN: pool creation failed (reported by the cache) -- skip the
+        // instrumentation of this append instead of asserting the process.
+        std::cerr << "[ERROR] No event for kernel instrumentation, command will not be instrumented" << std::endl;
+        ze_instance_data.instrument_ = false;
+        return;
+      }
     } else {
       collector->events_mutex_.lock();
       if (collector->counter_based_events_.find(signal_event) != collector->counter_based_events_.end()) {
@@ -6096,6 +6801,9 @@ class ZeCollector {
     zet_metric_query_handle_t& query,
     ze_command_list_handle_t command_list,
     std::vector<uint64_t> *kids) {
+
+    // TAX-OPT: exit-side collector work of the eager kernel append path.
+    UniPhaseTimer ph_appendk(uni_ph_appendk_us_, uni_ph_appendk_n_);
 
     uint64_t kernel_id;
     ZeKernelGroupSize group_size;
@@ -6174,8 +6882,17 @@ class ZeCollector {
         desc_query = local_device_submissions_.GetCommandMetricQuery();
 
         ze_event_handle_t metric_query_event = event_cache_.GetEvent(context);
+        if (metric_query_event == nullptr) {
+          // HARDEN: pool creation failed (reported by the cache) -- skip the
+          // metric query instrumentation instead of appending a null event.
+          std::cerr << "[ERROR] No event for metric query, query will not be instrumented" << std::endl;
+        } else {
         ze_result_t status = ZE_FUNC(zetCommandListAppendMetricQueryEnd)(command_list, query, metric_query_event, 0, nullptr);
-        PTI_ASSERT(status == ZE_RESULT_SUCCESS);
+        if (status != ZE_RESULT_SUCCESS) {
+          std::cerr << "[WARNING] Failed to append metric query end (status = 0x"
+                    << std::hex << status << std::dec << ")" << std::endl;
+        }
+        }
         desc_query->metric_query_event_ = metric_query_event;
         desc_query->metric_query_ = query;
         desc_query->device_ = it->second->device_;
@@ -6325,8 +7042,17 @@ class ZeCollector {
         desc_query = local_device_submissions_.GetCommandMetricQuery();
 
         ze_event_handle_t metric_query_event = event_cache_.GetEvent(context);
+        if (metric_query_event == nullptr) {
+          // HARDEN: pool creation failed (reported by the cache) -- skip the
+          // metric query instrumentation instead of appending a null event.
+          std::cerr << "[ERROR] No event for metric query, query will not be instrumented" << std::endl;
+        } else {
         ze_result_t status = ZE_FUNC(zetCommandListAppendMetricQueryEnd)(command_list, query, metric_query_event, 0, nullptr);
-        PTI_ASSERT(status == ZE_RESULT_SUCCESS);
+        if (status != ZE_RESULT_SUCCESS) {
+          std::cerr << "[WARNING] Failed to append metric query end (status = 0x"
+                    << std::hex << status << std::dec << ")" << std::endl;
+        }
+        }
         desc_query->metric_query_event_ = metric_query_event;
         desc_query->metric_query_ = query;
         desc_query->device_ = it->second->device_;
@@ -6461,8 +7187,17 @@ class ZeCollector {
         desc_query = local_device_submissions_.GetCommandMetricQuery();
 
         ze_event_handle_t metric_query_event = event_cache_.GetEvent(context);
+        if (metric_query_event == nullptr) {
+          // HARDEN: pool creation failed (reported by the cache) -- skip the
+          // metric query instrumentation instead of appending a null event.
+          std::cerr << "[ERROR] No event for metric query, query will not be instrumented" << std::endl;
+        } else {
         ze_result_t status = ZE_FUNC(zetCommandListAppendMetricQueryEnd)(command_list, query, metric_query_event, 0, nullptr);
-        PTI_ASSERT(status == ZE_RESULT_SUCCESS);
+        if (status != ZE_RESULT_SUCCESS) {
+          std::cerr << "[WARNING] Failed to append metric query end (status = 0x"
+                    << std::hex << status << std::dec << ")" << std::endl;
+        }
+        }
         desc_query->metric_query_ = query;
         desc_query->metric_query_event_ = metric_query_event;
       }
@@ -6599,8 +7334,17 @@ class ZeCollector {
         desc_query = local_device_submissions_.GetCommandMetricQuery();
 
         ze_event_handle_t metric_query_event = event_cache_.GetEvent(context);
+        if (metric_query_event == nullptr) {
+          // HARDEN: pool creation failed (reported by the cache) -- skip the
+          // metric query instrumentation instead of appending a null event.
+          std::cerr << "[ERROR] No event for metric query, query will not be instrumented" << std::endl;
+        } else {
         ze_result_t status = ZE_FUNC(zetCommandListAppendMetricQueryEnd)(command_list, query, metric_query_event, 0, nullptr);
-        PTI_ASSERT(status == ZE_RESULT_SUCCESS);
+        if (status != ZE_RESULT_SUCCESS) {
+          std::cerr << "[WARNING] Failed to append metric query end (status = 0x"
+                    << std::hex << status << std::dec << ")" << std::endl;
+        }
+        }
         desc_query->metric_query_ = query;
         desc_query->metric_query_event_ = metric_query_event;
       }
@@ -6725,8 +7469,17 @@ class ZeCollector {
         ze_event_handle_t metric_query_event = event_cache_.GetEvent(context);
         desc_query->metric_query_ = query;
         desc_query->metric_query_event_ = metric_query_event;
+        if (metric_query_event == nullptr) {
+          // HARDEN: pool creation failed (reported by the cache) -- skip the
+          // metric query instrumentation instead of appending a null event.
+          std::cerr << "[ERROR] No event for metric query, query will not be instrumented" << std::endl;
+        } else {
         ze_result_t status = ZE_FUNC(zetCommandListAppendMetricQueryEnd)(command_list, query, metric_query_event, 0, nullptr);
-        PTI_ASSERT(status == ZE_RESULT_SUCCESS);
+        if (status != ZE_RESULT_SUCCESS) {
+          std::cerr << "[WARNING] Failed to append metric query end (status = 0x"
+                    << std::hex << status << std::dec << ")" << std::endl;
+        }
+        }
       }
 
       uint64_t host_timestamp = ze_instance_data.timestamp_host;
@@ -6925,6 +7678,7 @@ class ZeCollector {
         auto fit = command_lists_.find(fork_cl);
         if (fit != command_lists_.end() && fit->second->graph_capturing_) {
           fit->second->graph_capturing_ = false;
+          uni_batchqkt_capture_depth_.fetch_sub(1, std::memory_order_acq_rel);  // HARDEN
           fit->second->graph_capture_target_ = nullptr;
         }
         target->forked_command_lists_.erase(fork_cl);
@@ -6948,6 +7702,7 @@ class ZeCollector {
       auto it = command_lists_.find(command_list);
       if (it != command_lists_.end() && !it->second->graph_capturing_) {
         it->second->graph_capturing_ = true;
+        uni_batchqkt_capture_depth_.fetch_add(1, std::memory_order_acq_rel);  // HARDEN
         it->second->graph_capture_target_ = target;
       }
     }
@@ -6968,7 +7723,10 @@ class ZeCollector {
         // Reset any command lists still referencing this graph
         for (auto& [cl_handle, cl] : command_lists_) {
           if (cl->graph_capture_target_ == g) {
-            cl->graph_capturing_ = false;
+            if (cl->graph_capturing_) {  // HARDEN
+              cl->graph_capturing_ = false;
+              uni_batchqkt_capture_depth_.fetch_sub(1, std::memory_order_acq_rel);
+            }
             cl->graph_capture_target_ = nullptr;
             cl->pending_graph_capture_ = nullptr;
           }
@@ -7085,6 +7843,7 @@ class ZeCollector {
     pending->primary_command_list_ = command_list;
 
     it->second->graph_capturing_ = true;
+    uni_batchqkt_capture_depth_.fetch_add(1, std::memory_order_acq_rel);  // HARDEN
     it->second->graph_capture_target_ = pending;
     it->second->pending_graph_capture_ = pending;  // Ownership tracked here
   }
@@ -7119,7 +7878,10 @@ class ZeCollector {
       std::lock_guard<std::shared_mutex> lock(command_lists_mutex_);
       auto it = command_lists_.find(command_list);
       if (it != command_lists_.end()) {
-        it->second->graph_capturing_ = true;
+        if (!it->second->graph_capturing_) {  // HARDEN: count each window once
+          it->second->graph_capturing_ = true;
+          uni_batchqkt_capture_depth_.fetch_add(1, std::memory_order_acq_rel);
+        }
         it->second->graph_capture_target_ = graph_info;
       }
     }
@@ -7137,7 +7899,10 @@ class ZeCollector {
       if (it != command_lists_.end()) {
         pending = it->second->pending_graph_capture_;
         ZeGraph* target = it->second->graph_capture_target_;
-        it->second->graph_capturing_ = false;
+        if (it->second->graph_capturing_) {  // HARDEN
+          it->second->graph_capturing_ = false;
+          uni_batchqkt_capture_depth_.fetch_sub(1, std::memory_order_acq_rel);
+        }
         it->second->graph_capture_target_ = nullptr;
         it->second->pending_graph_capture_ = nullptr;
 
@@ -7146,7 +7911,10 @@ class ZeCollector {
           for (auto forked_cl : target->forked_command_lists_) {
             auto fit = command_lists_.find(forked_cl);
             if (fit != command_lists_.end()) {
-              fit->second->graph_capturing_ = false;
+              if (fit->second->graph_capturing_) {  // HARDEN
+                fit->second->graph_capturing_ = false;
+                uni_batchqkt_capture_depth_.fetch_sub(1, std::memory_order_acq_rel);
+              }
               fit->second->graph_capture_target_ = nullptr;
             }
           }
@@ -7220,6 +7988,20 @@ class ZeCollector {
       return;  // Graph not tracked
     }
 
+    // T14/A5: the step landmark. An instant at every graph replay dispatch --
+    // the navigation band humans and scripts use to split the trace into
+    // steps -- plus the per-step debt counter sample (meta microseconds
+    // accumulated since the previous landmark, rendered as a Perfetto counter
+    // track). Runs inside the urEnqueueGraphExp host API slice, before this
+    // step's staging drain.
+    if (MetaOn()) {
+      const uint64_t step = uni_meta_step_.fetch_add(1, std::memory_order_relaxed) + 1;
+      const uint64_t mt0 = UniTimer::GetHostTimestamp();
+      const double debt_ms = static_cast<double>(uni_meta_debt_us_.exchange(0, std::memory_order_relaxed)) / 1000.0;
+      MetaRecord(("unitrace.step " + std::to_string(step)).c_str(), mt0, mt0,
+                 "\"step\": " + std::to_string(step), debt_ms);
+    }
+
     // Get command list info for execution context
     ze_device_handle_t device = nullptr;
     ze_context_handle_t context = nullptr;
@@ -7249,22 +8031,28 @@ class ZeCollector {
     // then process the drained commands before staging this replay.
     {
       std::set<ze_event_handle_t> graph_events;
-      graphs_mutex_.lock_shared();
-      for (auto cmd : graph_info->commands_) {
-        if (cmd->event_ != nullptr) {
-          graph_events.insert(cmd->event_);
-        }
-      }
-      graphs_mutex_.unlock_shared();
-
       std::set<ze_command_list_handle_t> lists_to_wait;
-      global_device_submissions_mutex_.lock_shared();
-      for (auto cmd : local_device_submissions_.commands_submitted_) {
-        if (cmd->command_list_ != nullptr && graph_events.count(cmd->event_)) {
-          lists_to_wait.insert(cmd->command_list_);
+      {
+        // TAX-OPT: collection phase (lock_shared + per-command iteration +
+        // set inserts). The sync loop below is a blocking device wait and is
+        // deliberately NOT inside this timer.
+        UniPhaseTimer ph_evcollect(uni_ph_evcollect_us_, uni_ph_evcollect_n_);
+        graphs_mutex_.lock_shared();
+        for (auto cmd : graph_info->commands_) {
+          if (cmd->event_ != nullptr) {
+            graph_events.insert(cmd->event_);
+          }
         }
+        graphs_mutex_.unlock_shared();
+
+        global_device_submissions_mutex_.lock_shared();
+        for (auto cmd : local_device_submissions_.commands_submitted_) {
+          if (cmd->command_list_ != nullptr && graph_events.count(cmd->event_)) {
+            lists_to_wait.insert(cmd->command_list_);
+          }
+        }
+        global_device_submissions_mutex_.unlock_shared();
       }
-      global_device_submissions_mutex_.unlock_shared();
 
       for (auto list : lists_to_wait) {
         ZE_FUNC(zeCommandListHostSynchronize)(list, UINT64_MAX);
@@ -7287,7 +8075,12 @@ class ZeCollector {
           event_cache_.ResetEvent(event);
         }
       }
-      ProcessAllCommandsSubmitted(nullptr);
+      {
+        // TAX-OPT: the staging drain (collect + execute + reset batch live
+        // here; qkt_batch/reset_batch already carry their own meta records).
+        UniPhaseTimer ph_drain(uni_ph_drain_us_, uni_ph_drain_n_);
+        ProcessAllCommandsSubmitted(nullptr, /*at_gexp=*/true);
+      }
     }
 
     // Get timestamp for submit time
@@ -7305,6 +8098,7 @@ class ZeCollector {
     }
 
     // Clone each captured command for this execution (similar to PrepareToExecuteCommandListsLocked)
+    UniPhaseTimer ph_clone(uni_ph_clone_us_, uni_ph_clone_n_);
     for (auto command : graph_info->commands_) {
       ZeCommand* cmd = local_device_submissions_.GetKernelCommand();
       ZeCommandMetricQuery* cmd_query = nullptr;
@@ -7348,6 +8142,35 @@ class ZeCollector {
     }
 
     graphs_mutex_.unlock_shared();
+
+    // TAX-OPT: per-replay enqueue-phase attribution. The snapshot-and-reset
+    // here covers this gexp call's collector phases plus the eager kernel
+    // append work accumulated since the previous replay (steady state:
+    // one decode iteration's worth).
+    if (MetaOn()) {
+      const uint64_t mtq = UniTimer::GetHostTimestamp();
+      MetaRecord("unitrace.enqueue", mtq, mtq,
+                 "\"evcollect_us\": " + std::to_string(uni_ph_evcollect_us_.exchange(0, std::memory_order_relaxed)) +
+                 ", \"drain_us\": " + std::to_string(uni_ph_drain_us_.exchange(0, std::memory_order_relaxed)) +
+                 ", \"clone_us\": " + std::to_string(uni_ph_clone_us_.exchange(0, std::memory_order_relaxed)) +
+                 ", \"appendk_us\": " + std::to_string(uni_ph_appendk_us_.exchange(0, std::memory_order_relaxed)) +
+                 ", \"prepk_us\": " + std::to_string(uni_ph_prepk_us_.exchange(0, std::memory_order_relaxed)) +
+                 ", \"appendk_n\": " + std::to_string(uni_ph_appendk_n_.exchange(0, std::memory_order_relaxed)) +
+                 ", \"prepk_n\": " + std::to_string(uni_ph_prepk_n_.exchange(0, std::memory_order_relaxed)) +
+                 ", \"d_flush1_us\": " + std::to_string(uni_pd_flush1_us_.exchange(0, std::memory_order_relaxed)) +
+                 ", \"d_lock_us\": " + std::to_string(uni_pd_lock_us_.exchange(0, std::memory_order_relaxed)) +
+                 ", \"d_consume_us\": " + std::to_string(uni_pd_consume_us_.exchange(0, std::memory_order_relaxed)) +
+                 ", \"d_pollread_us\": " + std::to_string(uni_pd_pollread_us_.exchange(0, std::memory_order_relaxed)) +
+                 ", \"d_loop_us\": " + std::to_string(uni_pd_loop_us_.exchange(0, std::memory_order_relaxed)) +
+                 ", \"d_resets_us\": " + std::to_string(uni_pd_resets_us_.exchange(0, std::memory_order_relaxed)) +
+                 ", \"d_flush2_us\": " + std::to_string(uni_pd_flush2_us_.exchange(0, std::memory_order_relaxed)) +
+                 ", \"d_loop_n\": " + std::to_string(uni_pd_loop_n_.exchange(0, std::memory_order_relaxed)) +
+                 ", \"d_outer_n\": " + std::to_string(uni_pd_outer_n_.exchange(0, std::memory_order_relaxed)) +
+                 ", \"d_iter_n\": " + std::to_string(uni_pd_iter_n_.exchange(0, std::memory_order_relaxed)) +
+                 ", \"d_take_n\": " + std::to_string(uni_pd_take_n_.exchange(0, std::memory_order_relaxed)) +
+                 ", \"d_acc_n\": " + std::to_string(uni_pd_acc_n_.exchange(0, std::memory_order_relaxed)) +
+                 ", \"d_lq_n\": " + std::to_string(uni_pd_lq_n_.exchange(0, std::memory_order_relaxed)));
+    }
   }
 
   static void OnEnterCommandListAppendLaunchKernel(
@@ -8192,6 +9015,13 @@ class ZeCollector {
     if (it != collector->command_lists_.end()) {
       int num_events = it->second->event_to_timestamp_seq_.size();
       if (num_events) {
+        // HARDEN: a failed event-pool creation at list creation time (reported
+        // there) leaves the timestamp event null -- close this list
+        // uninstrumented instead of appending null signal/query events.
+        if (it->second->timestamp_event_to_signal_ == nullptr) {
+          std::cerr << "[ERROR] No timestamp event for command list, closing uninstrumented" << std::endl;
+        }
+        else {
         std::vector<ze_event_handle_t> events(num_events);
 
         int i = 0;
@@ -8223,8 +9053,9 @@ class ZeCollector {
         if (status != ZE_RESULT_SUCCESS){
           std::cerr << "[ERROR] Failed to get kernel timestamps (status = 0x" << std::hex << status << std::dec << ")" << std::endl;
         }
+        }
       }
-      else {
+      else if (it->second->timestamp_event_to_signal_ != nullptr) {
         // signal event if events were reset earlier
         auto status = ZE_FUNC(zeCommandListAppendSignalEvent)(*(params->phCommandList), it->second->timestamp_event_to_signal_);
         if (status != ZE_RESULT_SUCCESS){
@@ -8589,9 +9420,32 @@ typedef struct _zex_kernel_register_file_size_exp_t {
     }
   }
 
-  static void OnExitContextDestroy(ze_context_destroy_params_t* params, ze_result_t result, void* global_data, void** /* instance_data */) {
-    if (result == ZE_RESULT_SUCCESS) {
+  // HARDEN (pairing review): runs BEFORE the driver destroys the context --
+  // the only point where the collector's per-context allocations can be
+  // legally freed (lists/buffers/events/pools). Mirrors the pattern of
+  // OnEnterModuleDestroy.
+  static void OnEnterContextDestroy(ze_context_destroy_params_t* params, void* global_data, void** /* instance_data */) {
+    if (global_data != nullptr && params->phContext != nullptr) {
       ZeCollector* collector = reinterpret_cast<ZeCollector*>(global_data);
+      ze_context_handle_t context = *(params->phContext);
+      // Paired teardown of the BATCHQKT lists/buffers (marks the handle
+      // dead), then of the event cache pools/events for this context.
+      collector->ReleaseBatchQktContextResources(context);
+      collector->event_cache_.ReleaseContext(context);
+    }
+  }
+
+  static void OnExitContextDestroy(ze_context_destroy_params_t* params, ze_result_t result, void* global_data, void** /* instance_data */) {
+    if (result == ZE_RESULT_SUCCESS && params->phContext != nullptr) {
+      ZeCollector* collector = reinterpret_cast<ZeCollector*>(global_data);
+      // HARDEN: the driver has ALREADY destroyed the context when this exit
+      // callback runs. If the enter intercept above fired, every BATCHQKT
+      // map entry is already freed and this only re-marks the handle as
+      // dead; if it did not fire, this drops the resources from the maps
+      // (unfreeable at this point) so the teardown drain below cannot
+      // program device work on the dead context and the handle value can
+      // never be served to a recycled context.
+      collector->InvalidateBatchQktContext(*(params->phContext));
       collector->ProcessAllCommandsSubmitted(nullptr);
       collector->event_cache_.ReleaseContext(*(params->phContext));
     }
@@ -8865,6 +9719,7 @@ typedef struct _zex_kernel_register_file_size_exp_t {
   CollectorOptions options_;
   OnZeKernelFinishCallback kcallback_ = nullptr;
   OnZeFunctionFinishCallback fcallback_ = nullptr;
+  OnZeMetaRecordCallback mcallback_ = nullptr;  // T14/A5 self-annotation
   bool reset_event_on_device_; // support event reset on device
   ZeEventCache event_cache_;
 
@@ -8937,6 +9792,23 @@ typedef struct _zex_kernel_register_file_size_exp_t {
   std::map<ze_context_handle_t, void *> uni_batchqkt_bufs_;      // per-context host staging buffer
   std::map<ze_context_handle_t, size_t> uni_batchqkt_buf_caps_;  // capacities in bytes
   std::map<ze_device_handle_t, std::pair<uint32_t, bool>> uni_batchqkt_ordinals_;  // device -> {ordinal, has compute}
+  // HARDEN: context handle values whose context the app already destroyed.
+  // A value here is NEVER trusted again -- L0 heap-reuses handles, so a new
+  // context can land on the same address; refusing it only costs a graceful
+  // fallback, trusting it puts device work on a dead context (CCS fault).
+  std::set<ze_context_handle_t> uni_batchqkt_dead_contexts_;
+  // HARDEN: pairing/retry accounting -- per-context resource releases (the
+  // paired frees at zeContextDestroy enter) and requests refused because the
+  // context handle was already destroyed.
+  std::atomic<uint64_t> uni_batchqkt_ctx_releases_{0};
+  std::atomic<uint64_t> uni_batchqkt_dead_ctx_skips_{0};
+  // HARDEN: number of command lists currently inside a graph capture window
+  // (graph_capturing_ == true). Device-side BATCHQKT work is suppressed
+  // while > 0: capture appends create no clones, so mid-capture device work
+  // can only be leftovers of an earlier replay, and the sweeps that would
+  // issue it fire exactly from the list/queue/context teardown intercepts
+  // that run between capture pieces.
+  std::atomic<int> uni_batchqkt_capture_depth_{0};
   // Diagnostics (relaxed atomics; env UNITRACE_DEBUG_BATCHQKT)
   std::atomic<uint64_t> uni_batchqkt_batch_count_{0};
   std::atomic<uint64_t> uni_batchqkt_cmd_count_{0};
@@ -8955,6 +9827,16 @@ typedef struct _zex_kernel_register_file_size_exp_t {
   std::atomic<bool> uni_batchqkt_notice_ctx_{false};
   std::atomic<bool> uni_batchqkt_notice_mixed_{false};
   std::atomic<bool> uni_batchqkt_notice_notsig_{false};
+  // HARDEN (2026-09-30 audit): graceful-skip accounting. alloc_fail counts
+  // every batch/batch-read skipped because a collector allocation (host
+  // staging buffer, immediate command list) failed or its context handle is
+  // known destroyed; capture_skip counts batches suppressed while a graph
+  // capture window is open. Both are visible in the [BATCHQKT] summary line.
+  std::atomic<bool> uni_batchqkt_notice_allocfail_{false};
+  std::atomic<bool> uni_batchqkt_notice_deadctx_{false};
+  std::atomic<bool> uni_batchqkt_notice_invariant_{false};
+  std::atomic<uint64_t> uni_batchqkt_alloc_fail_{0};
+  std::atomic<uint64_t> uni_batchqkt_capture_skip_{0};
 
   // ---- E6-v4: batched reset of the graph clones' shared events ----
   std::atomic<uint64_t> uni_batchqkt_reset_batch_count_{0};  // device-side reset batches run
