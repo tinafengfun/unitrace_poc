@@ -170,6 +170,7 @@ UNITRACE_GRAPH_BATCH_QKT=0 UNITRACE_GRAPH_QKT_AT_POLL=0 UNITRACE_DEFERRED_TS=0 <
 | 产物 | md5 | 位置 |
 |---|---|---|
 | build9 源 ze_collector.h（默认全开版） | `a651610ca1849a7eeccf3def1cae3508` | git + cri2 staging |
+| build9 lib（出货默认全开版） | `903bad204865f92dbde791bf849e6109` | node3 `bq_staging/build9/` + repro_node3 ULIB |
 | build8 lib（上一版，需 env 开 BQ/AT_POLL/DT） | `a67920db`（lib）/ `0469e260`（源） | node3 `bq_staging/build8/` |
 | build3 lib（V2/V3 加固版） | `9f4b8db4` | node3 `bq_staging/build3/` |
 | launcher（unitrace bin） | `4f33542a` | 随构建 |
