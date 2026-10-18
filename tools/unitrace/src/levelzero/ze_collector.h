@@ -26,6 +26,8 @@
 #include <string>
 #include <vector>
 #include <cmath>
+#include <cinttypes>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -3377,16 +3379,15 @@ class ZeCollector {
     start = command->submit_time_ + time_shift;
     end = start + duration;
 
-    if (std::getenv("UNITRACE_DEBUG_TS") != nullptr) {
-      std::cerr << "[TSCONV] inst=" << command->instance_id_
-                << " dev_start=" << device_start
-                << " dev_end=" << device_end
-                << " dev_submit=" << device_submit_time
-                << " shift_ns=" << time_shift
-                << " dur_ns=" << duration
-                << " host_start=" << start
-                << " host_end=" << end
-                << std::endl;
+    if (TsDiagEnabled()) {
+      char buf[384];
+      int len = std::snprintf(buf, sizeof(buf),
+          "[TSCONV] inst=%" PRIu64 " dev_start=%" PRIu64 " dev_end=%" PRIu64
+          " dev_submit=%" PRIu64 " shift_ns=%" PRIu64 " dur_ns=%" PRIu64
+          " host_start=%" PRIu64 " host_end=%" PRIu64 "\n",
+          command->instance_id_, device_start, device_end, device_submit_time,
+          time_shift, duration, start, end);
+      TsDiagWrite(buf, static_cast<size_t>(len));
     }
   }
 
@@ -4244,6 +4245,25 @@ class ZeCollector {
     return enabled;
   }
 
+  // TS diag hot-path writer (tslog write-path fix, 2026-10): the legacy
+  // diagnostic sites stream ~9 fragments through unit-buffered std::cerr
+  // (one write syscall per fragment) from BOTH the deferred completer thread
+  // and the app-side poll sweeps, so lines interleave mid-line under load and
+  // ~2% of records are mangled or lost. Build the whole line first, then emit
+  // it with a single fwrite under a lock: atomic line, one syscall, no
+  // allocation, no PTI_ASSERT on the hot path. Same lines, same per-thread
+  // order. Callers must build the full line (including '\n') before calling.
+  static void TsDiagWrite(const char *buf, size_t len) {
+    static std::mutex uni_ts_diag_mutex;
+    std::lock_guard<std::mutex> lock(uni_ts_diag_mutex);
+    std::fwrite(buf, 1, len, stderr);
+  }
+  // Cached gate: the legacy sites called std::getenv per command.
+  static bool TsDiagEnabled(void) {
+    static const bool enabled = (std::getenv("UNITRACE_DEBUG_TS") != nullptr);
+    return enabled;
+  }
+
   // HARDEN (UNITRACE_TEST_ALLOC_FAIL=1): force every BATCHQKT allocation
   // (host staging buffer, immediate command list) to fail so the
   // graceful-skip path can be exercised on a healthy node. Read once.
@@ -4331,6 +4351,30 @@ class ZeCollector {
   std::atomic<uint64_t> uni_ph_drain_n_{0};
   std::atomic<uint64_t> uni_ph_clone_n_{0};
 
+  // TAX-OPT prepk attribution (build10): the enter-side eager kernel append
+  // path costs a flat ~13.5us per call on node3 (steady 36 calls/step, spike
+  // 1237 calls/step at request boundaries) while its known tenants (map finds,
+  // EventHistoryBumpSignal, GetEvent) only explain 0.2-1us. Split the phase
+  // into its four candidate tenants so the residual (suspected
+  // zeDeviceGetGlobalTimestamps driver call) can be pinned down. All relaxed
+  // -- attribution only. pk_maps_n counts timed segments (<=2 per call: the
+  // kernel-properties find and the command-lists find are timed separately).
+  std::atomic<uint64_t> uni_pk_maps_us_{0};   // kernel props find + command-lists find
+  std::atomic<uint64_t> uni_pk_getev_us_{0};  // signal_event GetEvent / counter-based check
+  std::atomic<uint64_t> uni_pk_hist_us_{0};   // EventHistoryBumpSignal
+  std::atomic<uint64_t> uni_pk_gts_us_{0};    // zeDeviceGetGlobalTimestamps
+  std::atomic<uint64_t> uni_pk_maps_n_{0};
+  std::atomic<uint64_t> uni_pk_getev_n_{0};
+  std::atomic<uint64_t> uni_pk_hist_n_{0};
+  std::atomic<uint64_t> uni_pk_gts_n_{0};
+  // build11 (UNITRACE_TS_INTERP): with the anchor-based interpolation the
+  // pk_gts_* counters above keep their exact build9/build10 semantics (only
+  // real zeDeviceGetGlobalTimestamps calls on the prepk path), while these two
+  // carry the new signal: interp_n counts appends served from the thread-local
+  // anchor (expect ~35/step), gts_err_n counts GTS failures (expect 0).
+  std::atomic<uint64_t> uni_pk_interp_n_{0};   // timestamps interpolated from the sync anchor
+  std::atomic<uint64_t> uni_pk_gts_err_n_{0};  // zeDeviceGetGlobalTimestamps failures
+
   // TAX-OPT drain2 (sub-drain attribution): the drain itself is 1.41ms/step
   // on node3 while its known tenants (reset batch ~0.51, qkt read ~0.37) leave
   // ~0.53ms unexplained. Time each statement group inside
@@ -4380,6 +4424,348 @@ class ZeCollector {
     UniPhaseTimer(const UniPhaseTimer&) = delete;
     UniPhaseTimer& operator=(const UniPhaseTimer&) = delete;
   };
+
+  // -----------------------------------------------------------------------
+  // build11 (UNITRACE_TS_INTERP): GTS amortization via CPU/GPU interpolation.
+  // Faithful port of PTI innersource CPUGPUTimeInterpolationHelper +
+  // ZeCollector::GetDeviceTimestamps (sdk/src/levelzero/ze_timer_helper.h and
+  // ze_collector.h:212-289, PTI-336, validated on real silicon): keep one
+  // CPU/GPU sync anchor pair per thread per device and amortize the ~13us
+  // zeDeviceGetGlobalTimestamps KMD ioctl over a 300us window by
+  // interpolating device ticks from CLOCK_MONOTONIC_RAW host time
+  // (UniTimer::GetHostTimestamp -- measured in the same clock domain as the
+  // GTS host timestamp, -609ns bias, and ~15ns to read). Integer arithmetic
+  // only, for the PTI-stated reasons: precision on large ns/tick numbers
+  // (FP conversion loses the low digits we care about), FP cost in the
+  // critical path (denormals), and run-to-run reproducibility.
+  // 32-bit GPU counters wrap every few seconds -- the delta must stay well
+  // below the wrap period (PTI's original caveat, kept verbatim in spirit);
+  // at 19.199MHz on this platform it is a non-issue.
+  // No PTI_ASSERT enters this path: every failure has an explicit counted +
+  // one-shot-logged fallback (driver-review rules: pairing / exceptions /
+  // logging). The anchor is a pure value type -- no heap allocation, no
+  // handle, nothing to pair or leak.
+  //
+  // r3 portability fix (timerResolution unit trap, PTI POC on node1 BMG):
+  // drivers disagree on the semantics of props.timerResolution (node3 fills
+  // ~19.2e6 = Hz shape, node1 BMG fills 52 = the PERIOD in ns), so the field
+  // is never trusted for the rate. First use of a slot MEASURES the rate
+  // on-device: two GTS reads ~1.5ms apart -> rate as 32.32 fixed point
+  // ticks/ns (POC --tickmode=fixed: residual p99=104ns quantization floor,
+  // no drift; the integer ns/tick guess carries +1672ppm truncation). The
+  // field is only the fallback guess (one-shot [WARN] on calibration failure).
+  // -----------------------------------------------------------------------
+  struct UniTsAnchor {
+    static constexpr uint64_t kSyncDeltaDefault = 300000;   // 300000 ns == 300 us == 0.3 ms (PTI kSyncDeltaDefault)
+    static constexpr uint64_t kThresholdForMissync = 1500;  // device ticks (PTI same value)
+    static constexpr uint64_t kCalibrationSpinNs = 1500000; // ~1.5ms between the two rate-calibration GTS reads
+    ze_device_handle_t device_;
+    // UNIT TRAP (r3, must-read: BQ_PTI_INTERP_NODE1_POC.md "发现 1"): this is
+    // the RAW props.timerResolution field and it is UNTRUSTED -- the L0 spec
+    // defines it as Hz, but drivers disagree on what they put in it: node3's
+    // driver fills ~19.2e6 (Hz shape), while the node1 BMG driver fills 52,
+    // i.e. the PERIOD in ns (real measured rate 19.1986MHz = 52.087 ns/tick).
+    // PTI's 1e9/timerResolution therefore interpolates garbage on node1
+    // (POC residual 10^4~10^6 ticks). Kept only for the fallback guess and
+    // diagnostics; the rate actually used is MEASURED on-device (rate_q32_).
+    uint64_t timer_freq_hz_;
+    uint64_t cpu_ts_;                 // anchor host time, MONO_RAW ns (same domain as GTS host time)
+    uint64_t gpu_ts_;                 // anchor device time, raw ticks (unmasked; consumers mask)
+    uint64_t delta_;
+    uint64_t ns_per_tick_;            // fallback guess only: 1e9/v if v>=1e6 (Hz shape), else v (ns/tick shape, +1672ppm truncation known)
+    uint64_t rate_q32_;               // measured ticks/ns rate as 32.32 fixed point (0 = not calibrated)
+    bool calibrated_;                 // rate measured on-device (else ns_per_tick_ guess)
+    bool calib_done_;                 // calibration attempted for this slot (one-shot, never retried)
+    bool valid_;                      // slot usable for interpolation (false while calibrating / anchor build failure -> bare GTS)
+    // Explicit default constructor instead of default member initializers:
+    // the static thread_local slot below is declared inside its enclosing
+    // class, and nested-class NSDMIs are not usable there.
+    UniTsAnchor()
+        : device_(nullptr), timer_freq_hz_(0), cpu_ts_(0), gpu_ts_(0),
+          delta_(kSyncDeltaDefault), ns_per_tick_(0), rate_q32_(0),
+          calibrated_(false), calib_done_(false), valid_(false) {}
+  };
+
+  // Per-thread single-slot anchor (PTI's per-thread-per-device helper shape,
+  // collapsed to one slot: steady-state single-device workloads hit it with a
+  // single pointer compare). thread_local is what makes it lock-free and
+  // tear-free -- no mutex, no shared map. A device change degrades to a
+  // per-call true GTS and refreshes the slot (correctness unaffected, only
+  // the amortization rate suffers). Thread churn: thread_local destruction
+  // reclaims the slot, nothing leaks.
+  static inline thread_local UniTsAnchor uni_tls_ts_anchor_;
+
+  // Shipping default ON: prepk (the eager-kernel append enter side) serves its
+  // timestamp from the anchor instead of paying the GTS ioctl per call
+  // (build10 attribution: 13.2us/13.5us = 94.6% of that phase). Set
+  // UNITRACE_TS_INTERP=0 to restore the build9 per-call GTS shape for A/B.
+  static bool TsInterpEnvEnabled(void) {
+    static const bool enabled = []() {
+      const char *e = std::getenv("UNITRACE_TS_INTERP");
+      return (e == nullptr || !(e[0] == '0' && e[1] == '\0'));
+    }();
+    return enabled;
+  }
+
+  static bool TsInterpDiagEnabled(void) {
+    static const bool enabled = (std::getenv("UNITRACE_DEBUG_TSINTERP") != nullptr);
+    return enabled;
+  }
+
+  // Anchor refresh window in ns (PTI kSyncDeltaDefault). Overridable for
+  // experiments; unparsable or zero values fall back to the default.
+  static uint64_t TsInterpDeltaNs(void) {
+    static const uint64_t delta = []() -> uint64_t {
+      const char *e = std::getenv("UNITRACE_TS_INTERP_DELTA");
+      if (e != nullptr && e[0] != '\0') {
+        char *end = nullptr;
+        const unsigned long long v = std::strtoull(e, &end, 10);
+        if (end != e && *end == '\0' && v > 0) {
+          return static_cast<uint64_t>(v);
+        }
+      }
+      return UniTsAnchor::kSyncDeltaDefault;
+    }();
+    return delta;
+  }
+
+  // HARDEN (build11): explicit failure reporting replacing the PTI_ASSERTs on
+  // the GTS paths. One visible line per failure class, then the counters
+  // carry the signal (pk_gts_err_n in the unitrace.enqueue meta record).
+  static void UniTsLogGtsFailureOnce(ze_result_t status) {
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true, std::memory_order_relaxed)) {
+      std::cerr << "[ERROR] zeDeviceGetGlobalTimestamps failed (status=0x" << std::hex << status
+                << std::dec << "); degrading to the last sync anchor / skipping this staging "
+                << "(counted in pk_gts_err_n)" << std::endl;
+    }
+  }
+
+  // Missync (PTI kThresholdForMissync): the device counter went backwards
+  // across an anchor refresh. Accept the new pair (PTI behaviour), leave one
+  // visible line behind; NOT counted in pk_gts_err_n (the GTS call succeeded).
+  static void UniTsLogMissyncOnce(uint64_t old_gpu_ts, uint64_t new_gpu_ts) {
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true, std::memory_order_relaxed)) {
+      std::cerr << "[WARN] GPU timer counter went backwards across anchor resync (old=" << old_gpu_ts
+                << " new=" << new_gpu_ts << " threshold=" << UniTsAnchor::kThresholdForMissync
+                << " ticks); accepting the new pair" << std::endl;
+    }
+  }
+
+  // HARDEN (r3): the on-device rate calibration could not run (GTS failure or
+  // unusable deltas) -- fall back to interpreting the untrusted
+  // timerResolution field. One visible line; the guess carries the known
+  // integer-rate truncation error (+1672ppm on the ns/tick-shape driver).
+  static void UniTsLogCalibFallbackOnce(ze_device_handle_t device, uint64_t field_res,
+                                        const char *reason, ze_result_t status) {
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true, std::memory_order_relaxed)) {
+      std::cerr << "[WARN] TSINTERP rate calibration failed (dev=" << static_cast<void*>(device)
+                << " " << reason << ", status=0x" << std::hex << status << std::dec
+                << "); falling back to the untrusted timerResolution field (raw=" << field_res
+                << " -> " << (field_res >= 1000000 ? "Hz shape" : "ns/tick shape")
+                << ", known +1672ppm int-rate truncation)" << std::endl;
+    }
+  }
+
+  // Feed a freshly read (host, device) pair into this thread's anchor slot.
+  // Used by the submit / graph-replay paths (which keep a true GTS call) and
+  // by the prepk resync path. First use for a device runs a ONE-SHOT on-device
+  // rate calibration (unit trap, see UniTsAnchor above): the fresh pair is
+  // calibration point #1, the thread busy-waits ~1.5ms, then a second GTS
+  // read -- inside the pk_gts phase timers, counted in pk_gts_n -- gives
+  // point #2 and the real ticks/ns rate as 32.32 fixed point. The slot stays
+  // invalid during the spin, so any interpolation user falls back to bare
+  // GTS. Calibration runs once per thread per device; if it fails (GTS error
+  // or unusable deltas) the slot falls back to a guess from the untrusted
+  // timerResolution field with a one-shot [WARN]. No allocation; the shared
+  // devices_ read lock is taken only when the slot does not already match.
+  static void UniTsFeedAnchor(ZeCollector* collector, ze_device_handle_t device,
+                              uint64_t host_ts, uint64_t device_ts) {
+    if (!TsInterpEnvEnabled() || device == nullptr) {
+      return;
+    }
+    UniTsAnchor &slot = uni_tls_ts_anchor_;
+    if (slot.device_ != device) {
+      // New device on this thread: reset the single slot for it.
+      slot = UniTsAnchor();
+      slot.device_ = device;
+      slot.delta_ = TsInterpDeltaNs();
+      devices_mutex_.lock_shared();
+      if (devices_ != nullptr) {
+        auto it = devices_->find(device);
+        if (it != devices_->end()) {
+          slot.timer_freq_hz_ = it->second.device_timer_frequency_;
+        }
+      }
+      devices_mutex_.unlock_shared();
+    }
+    if (!slot.calib_done_) {
+      // ---- first-use rate calibration, one-shot per thread per device ----
+      slot.calib_done_ = true;  // never retried
+      slot.valid_ = false;      // bare-GTS fallback while calibrating
+      if (slot.timer_freq_hz_ == 0) {
+        // HARDEN: no device descriptor (or a zero timerResolution field) ->
+        // not even the fallback guess is possible; leave the slot invalid,
+        // callers keep the bare-GTS path.
+        static std::atomic<bool> nodesc_warned{false};
+        if (!nodesc_warned.exchange(true, std::memory_order_relaxed)) {
+          std::cerr << "[WARN] TSINTERP: no device descriptor / zero timerResolution for dev="
+                    << static_cast<void*>(device) << "; anchor disabled, staying on bare GTS"
+                    << std::endl;
+        }
+        return;
+      }
+      const uint64_t spin_until = UniTimer::GetHostTimestamp() + UniTsAnchor::kCalibrationSpinNs;
+      while (UniTimer::GetHostTimestamp() < spin_until) {
+        // busy-wait the calibration window (~1.5ms, once per thread/device)
+      }
+      uint64_t host2 = 0, dev2 = 0;
+      ze_result_t st = ZE_RESULT_NOT_READY;
+      bool measured = false;
+      {
+        UniPhaseTimer pk_gts(collector->uni_pk_gts_us_, collector->uni_pk_gts_n_);
+        st = ZE_FUNC(zeDeviceGetGlobalTimestamps)(device, &host2, &dev2);
+        if (st == ZE_RESULT_SUCCESS) {
+          const uint64_t ns_delta = host2 - host_ts;
+          const uint64_t ticks_delta = dev2 - device_ts;
+          if (ns_delta > 0 && ticks_delta > 0) {
+            // 32.32 fixed point ticks/ns (POC --tickmode=fixed): kills the
+            // integer-rate truncation error (+1672ppm measured on the
+            // ns/tick-shape driver); POC residual p99=104ns (quantization
+            // floor), no drift over 5 minutes.
+            slot.rate_q32_ = static_cast<uint64_t>(
+                (static_cast<__uint128_t>(ticks_delta) << 32) / ns_delta);
+            slot.calibrated_ = true;
+            measured = true;
+          }
+        }
+      }
+      if (!measured) {
+        // HARDEN: calibration GTS failed or the pair deltas are unusable --
+        // fall back to the field guess instead of asserting or retrying.
+        UniTsLogCalibFallbackOnce(device, slot.timer_freq_hz_,
+                                  (st == ZE_RESULT_SUCCESS) ? "unusable calibration deltas"
+                                                            : "calibration GTS read failed",
+                                  st);
+        // Field guess from the UNTRUSTED timerResolution (unit trap): drivers
+        // disagree on semantics -- treat >= 1e6 as Hz (ns/tick = 1e9/v, PTI's
+        // form), smaller values as ns/tick (v). The node1 BMG driver reports
+        // the PERIOD (52) in a field the L0 spec defines as Hz; node3 reports
+        // ~19.2e6 (Hz shape).
+        if (slot.timer_freq_hz_ >= 1000000ull) {
+          slot.ns_per_tick_ = 1000000000ull / slot.timer_freq_hz_;  // integer, PTI same form
+        } else {
+          slot.ns_per_tick_ = slot.timer_freq_hz_;
+        }
+      }
+    }
+    slot.cpu_ts_ = host_ts;
+    slot.gpu_ts_ = device_ts;
+    slot.valid_ = true;
+  }
+
+  // 32.32 fixed-point interpolation (POC --tickmode=fixed): device ticks =
+  // gpu_ts + age_ns * rate_q32_ / 2^32, pure integer. __uint128_t keeps the
+  // product overflow-free even on the unbounded-age degrade path (GTS failure
+  // with a stale anchor); cost is one mul+shift, same class as the integer
+  // divide it replaces. Uncalibrated slots (field-guess fallback) use PTI's
+  // integer ns/tick form.
+  static uint64_t UniTsInterpDeviceTime(const UniTsAnchor &slot, uint64_t now) {
+    const uint64_t age = now - slot.cpu_ts_;
+    if (slot.calibrated_) {
+      return slot.gpu_ts_ + static_cast<uint64_t>(
+          (static_cast<__uint128_t>(age) * slot.rate_q32_) >> 32);
+    }
+    return slot.gpu_ts_ + age / slot.ns_per_tick_;
+  }
+
+  // Amortized timestamp read, shared by the two prepk paths (eager kernel
+  // append metric/plain variants). PTI GetDeviceTimestamps semantics:
+  //  - anchor younger than delta_ -> interpolate device ticks from the anchor
+  //    and return the CURRENT host time (not the anchor's) alongside;
+  //  - anchor older / device mismatched / invalid -> one true GTS resync.
+  // Failure handling (replaces PTI_ASSERT): pk_gts_err_n + one-shot [ERROR],
+  // then degrade -- with a previous anchor keep interpolating from it rather
+  // than dropping the append; with no anchor at all return the error so the
+  // caller skips this append (instrument_ = false, GetEvent-failure shape).
+  static ze_result_t UniTsGetTimestamps(ZeCollector* collector, ze_device_handle_t device,
+                                        uint64_t* host_time, uint64_t* device_time) {
+    if (!TsInterpEnvEnabled()) {
+      // A/B gate: build9 per-call GTS shape. Still inside the pk_gts phase
+      // timers so the counter semantics hold across the A/B pair.
+      UniPhaseTimer pk_gts(collector->uni_pk_gts_us_, collector->uni_pk_gts_n_);
+      return ZE_FUNC(zeDeviceGetGlobalTimestamps)(device, host_time, device_time);
+    }
+
+    UniTsAnchor &slot = uni_tls_ts_anchor_;
+    const uint64_t now0 = UniTimer::GetHostTimestamp();
+
+    if (slot.device_ != device || !slot.valid_ || (now0 - slot.cpu_ts_ > slot.delta_)) {
+      // Resync: one true GTS call, kept inside the pk_gts phase timers so the
+      // build9/build10 counter semantics (only real GTS calls) hold.
+      uint64_t host_ts = 0, device_ts = 0;
+      ze_result_t status;
+      {
+        UniPhaseTimer pk_gts(collector->uni_pk_gts_us_, collector->uni_pk_gts_n_);
+        status = ZE_FUNC(zeDeviceGetGlobalTimestamps)(device, &host_ts, &device_ts);
+      }
+      if (status == ZE_RESULT_SUCCESS) {
+        const uint64_t age_ns = (slot.device_ == device && slot.valid_) ? (now0 - slot.cpu_ts_) : 0;
+        if (slot.device_ == device && slot.valid_ &&
+            device_ts < slot.gpu_ts_ - UniTsAnchor::kThresholdForMissync) {
+          UniTsLogMissyncOnce(slot.gpu_ts_, device_ts);
+        }
+        // May run the one-shot rate calibration (~1.5ms spin) on first use.
+        UniTsFeedAnchor(collector, device, host_ts, device_ts);
+        if (TsInterpDiagEnabled()) {
+          std::cerr << "[TSINTERP] resync dev=" << static_cast<void*>(device)
+                    << " anchor_age_ns=" << age_ns
+                    << " delta_ns=" << slot.delta_
+                    << " field_timerResolution=" << slot.timer_freq_hz_
+                    << " calibrated=" << slot.calibrated_
+                    << " rate_q32=" << slot.rate_q32_
+                    << " fallback_ns_per_tick=" << slot.ns_per_tick_
+                    << std::endl;
+        }
+        if (slot.device_ == device && slot.valid_) {
+          // PTI re-reads the host clock after the sync; interpolation uses the
+          // freshest host time so *host_time and *device_time stay a
+          // consistent pair (host_time is current time, never the anchor's).
+          const uint64_t now = UniTimer::GetHostTimestamp();
+          *host_time = now;
+          *device_time = UniTsInterpDeviceTime(slot, now);
+        } else {
+          // HARDEN (r3): the anchor could not be built (no descriptor / zero
+          // timerResolution field) -- serve the bare pair just read, same
+          // shape as build9, instead of dividing by a zero rate.
+          *host_time = host_ts;
+          *device_time = device_ts;
+        }
+        return ZE_RESULT_SUCCESS;
+      }
+      // HARDEN: count + one-shot line, then degrade instead of asserting.
+      collector->uni_pk_gts_err_n_.fetch_add(1, std::memory_order_relaxed);
+      UniTsLogGtsFailureOnce(status);
+      if (slot.device_ == device && slot.valid_) {
+        // Degrade: keep interpolating from the previous anchor (possibly
+        // stale) rather than dropping the append.
+        const uint64_t now = UniTimer::GetHostTimestamp();
+        *host_time = now;
+        *device_time = UniTsInterpDeviceTime(slot, now);
+        return ZE_RESULT_SUCCESS;
+      }
+      return status;  // never had a pair: caller skips this append
+    }
+
+    // Interpolate from the anchor (32.32 fixed point, PTI-POC verified;
+    // uncalibrated fallback uses PTI's integer form -- see PTI-336).
+    collector->uni_pk_interp_n_.fetch_add(1, std::memory_order_relaxed);
+    *host_time = now0;
+    *device_time = UniTsInterpDeviceTime(slot, now0);
+    return ZE_RESULT_SUCCESS;
+  }
 
   // E6-v4c knob, shipping default ON: arm the step's batch read at a
   // device-busy poll sweep (device-side wait on the step's own events)
@@ -4940,7 +5326,11 @@ class ZeCollector {
                  ", \"at\": \"drain\"");
     }
     if (BatchQktDiagEnabled()) {
-      std::cerr << "[BATCHQKT] n=" << n << " batch_us=" << batch_us << std::endl;
+      char buf[128];
+      int len = std::snprintf(buf, sizeof(buf),
+          "[BATCHQKT] n=%" PRIu64 " batch_us=%" PRIu64 "\n",
+          static_cast<uint64_t>(n), batch_us);
+      TsDiagWrite(buf, static_cast<size_t>(len));
     }
     return true;
   }
@@ -5220,7 +5610,11 @@ class ZeCollector {
                  ", \"at\": \"poll_sync\", \"append_us\": " + std::to_string(pr.append_us) + "");
     }
     if (BatchQktDiagEnabled()) {
-      std::cerr << "[BATCHQKT] n=" << n << " poll_read_us=" << batch_us << std::endl;
+      char buf[128];
+      int len = std::snprintf(buf, sizeof(buf),
+          "[BATCHQKT] n=%" PRIu64 " poll_read_us=%" PRIu64 "\n",
+          static_cast<uint64_t>(n), batch_us);
+      TsDiagWrite(buf, static_cast<size_t>(len));
     }
     return true;
   }
@@ -5903,17 +6297,19 @@ class ZeCollector {
           LogTsAnomalyV2(command, true, timestamp, ts_snap);
         }
         bad_read = TsReadIsBad(command, timestamp);
-        if (std::getenv("UNITRACE_DEBUG_TS") != nullptr) {
-          std::cerr << "[TSLOG] on_event inst=" << command->instance_id_
-                    << " ev=" << static_cast<const void*>(command->event_)
-                    << " graph=" << command->graph_command_
-                    << " raw_start=" << timestamp.global.kernelStart
-                    << " raw_end=" << timestamp.global.kernelEnd
-                    << " submit_host=" << command->submit_time_
-                    << " submit_dev=" << command->submit_time_device_
-                    << " freq=" << command->device_timer_frequency_
-                    << " mask=" << std::hex << command->device_timer_mask_ << std::dec
-                    << std::endl;
+        if (TsDiagEnabled()) {
+          char buf[384];
+          int len = std::snprintf(buf, sizeof(buf),
+              "[TSLOG] on_event inst=%" PRIu64 " ev=%p graph=%d"
+              " raw_start=%" PRIu64 " raw_end=%" PRIu64
+              " submit_host=%" PRIu64 " submit_dev=%" PRIu64
+              " freq=%" PRIu64 " mask=%" PRIx64 "\n",
+              command->instance_id_, static_cast<const void*>(command->event_),
+              static_cast<int>(command->graph_command_),
+              timestamp.global.kernelStart, timestamp.global.kernelEnd,
+              command->submit_time_, command->submit_time_device_,
+              command->device_timer_frequency_, command->device_timer_mask_);
+          TsDiagWrite(buf, static_cast<size_t>(len));
         }
       }
     }
@@ -5922,13 +6318,19 @@ class ZeCollector {
       // Graph replay fix: never emit a timeline record from an unusable packet
       // read (erased start / torn / stale). The record for this instance is
       // dropped; [TSLOG2] (anomaly mode) carries the full state for diagnosis.
-      std::cerr << "[TSBAD] dropped record inst=" << command->instance_id_
-                << " ev=" << static_cast<const void*>(command->event_)
-                << " graph=" << command->graph_command_
-                << " submit_dev=" << command->submit_time_device_
-                << " raw_start=" << timestamp.global.kernelStart
-                << " raw_end=" << timestamp.global.kernelEnd
-                << std::endl;
+      // Ungated exactly as before (TSBAD visibility must not change); only
+      // the write shape moved to the atomic single-fwrite helper.
+      {
+        char buf[320];
+        int len = std::snprintf(buf, sizeof(buf),
+            "[TSBAD] dropped record inst=%" PRIu64 " ev=%p graph=%d"
+            " submit_dev=%" PRIu64 " raw_start=%" PRIu64 " raw_end=%" PRIu64 "\n",
+            command->instance_id_, static_cast<const void*>(command->event_),
+            static_cast<int>(command->graph_command_),
+            command->submit_time_device_, timestamp.global.kernelStart,
+            timestamp.global.kernelEnd);
+        TsDiagWrite(buf, static_cast<size_t>(len));
+      }
     }
     else {
     ZeKernelProfileRecord r;
@@ -6297,7 +6699,19 @@ class ZeCollector {
     ze_result_t status;
 
     status = ZE_FUNC(zeDeviceGetGlobalTimestamps)(device, &host_timestamp, &device_timestamp);
-    PTI_ASSERT(status == ZE_RESULT_SUCCESS);
+    if (status != ZE_RESULT_SUCCESS) {
+      // HARDEN (build11): replaces PTI_ASSERT -- counted + one-shot [ERROR],
+      // then stop before staging so no command is recorded with a garbage
+      // submit pair (the failure-free shape is unchanged).
+      uni_pk_gts_err_n_.fetch_add(1, std::memory_order_relaxed);
+      UniTsLogGtsFailureOnce(status);
+      return;
+    }
+    // build11: feed the fresh pair into this thread's sync anchor -- the
+    // submission thread runs the next prepk, which then finds a fresh anchor
+    // and skips its own GTS call (UNITRACE_TS_INTERP). First feed on a thread
+    // runs the one-shot rate calibration (~1.5ms busy-wait, see UniTsAnchor).
+    UniTsFeedAnchor(this, device, host_timestamp, device_timestamp);
 
     for (uint32_t i = 0; i < count; i++) {
       ze_command_list_handle_t cmdlist = cmdlists[i];
@@ -6689,28 +7103,34 @@ class ZeCollector {
         ze_instance_data.instrument_ = false;
         return;
       }
-      kernel_command_properties_mutex_.lock_shared();
-      auto kit = active_kernel_properties_->find(kernel);
-      if (kit != active_kernel_properties_->end()) {
-          if (kit->second.skip_) {
-            ze_instance_data.instrument_ = false;
-            kernel_command_properties_mutex_.unlock_shared();
-            return;
-          }
+      {
+        UniPhaseTimer pk_maps(collector->uni_pk_maps_us_, collector->uni_pk_maps_n_);
+        kernel_command_properties_mutex_.lock_shared();
+        auto kit = active_kernel_properties_->find(kernel);
+        if (kit != active_kernel_properties_->end()) {
+            if (kit->second.skip_) {
+              ze_instance_data.instrument_ = false;
+              kernel_command_properties_mutex_.unlock_shared();
+              return;
+            }
+        }
+        kernel_command_properties_mutex_.unlock_shared();
       }
-      kernel_command_properties_mutex_.unlock_shared();
     }
 
-    collector->command_lists_mutex_.lock_shared();
+    {
+      UniPhaseTimer pk_maps(collector->uni_pk_maps_us_, collector->uni_pk_maps_n_);
+      collector->command_lists_mutex_.lock_shared();
 
-    auto it = collector->command_lists_.find(command_list);
-    if (it != collector->command_lists_.end()) {
-      context = it->second->context_;
-      device = it->second->device_;
-      in_order = it->second->in_order_;
+      auto it = collector->command_lists_.find(command_list);
+      if (it != collector->command_lists_.end()) {
+        context = it->second->context_;
+        device = it->second->device_;
+        in_order = it->second->in_order_;
+      }
+
+      collector->command_lists_mutex_.unlock_shared();
     }
-
-    collector->command_lists_mutex_.unlock_shared();
 
     if ((context == nullptr) || (device == nullptr)) {
       // should never get here
@@ -6725,37 +7145,43 @@ class ZeCollector {
       collector->CheckAndApplyForkTransition(command_list, num_wait_events, wait_events);
     }
 
-    if (signal_event == nullptr) {
-      signal_event = collector->event_cache_.GetEvent(context);
+    {
+      UniPhaseTimer pk_getev(collector->uni_pk_getev_us_, collector->uni_pk_getev_n_);
       if (signal_event == nullptr) {
-        // HARDEN: pool creation failed (reported by the cache) -- skip the
-        // instrumentation of this append instead of asserting the process.
-        std::cerr << "[ERROR] No event for kernel instrumentation, command will not be instrumented" << std::endl;
-        ze_instance_data.instrument_ = false;
-        return;
-      }
-    } else {
-      collector->events_mutex_.lock();
-      if (collector->counter_based_events_.find(signal_event) != collector->counter_based_events_.end()) {
-        if (in_order) {
-          ze_instance_data.in_order_counter_event_ = signal_event;
-          signal_event = collector->event_cache_.GetEvent(context);
-        } else {
-          // This is an error that should never happen since counter based events can be
-          // used only in in-order command lists.
-          std::cerr << "[ERROR] Counter based events are used in non immediate command list - command will not be instrumented" << std::endl;
+        signal_event = collector->event_cache_.GetEvent(context);
+        if (signal_event == nullptr) {
+          // HARDEN: pool creation failed (reported by the cache) -- skip the
+          // instrumentation of this append instead of asserting the process.
+          std::cerr << "[ERROR] No event for kernel instrumentation, command will not be instrumented" << std::endl;
           ze_instance_data.instrument_ = false;
-          collector->events_mutex_.unlock();
           return;
         }
+      } else {
+        collector->events_mutex_.lock();
+        if (collector->counter_based_events_.find(signal_event) != collector->counter_based_events_.end()) {
+          if (in_order) {
+            ze_instance_data.in_order_counter_event_ = signal_event;
+            signal_event = collector->event_cache_.GetEvent(context);
+          } else {
+            // This is an error that should never happen since counter based events can be
+            // used only in in-order command lists.
+            std::cerr << "[ERROR] Counter based events are used in non immediate command list - command will not be instrumented" << std::endl;
+            ze_instance_data.instrument_ = false;
+            collector->events_mutex_.unlock();
+            return;
+          }
+        }
+        collector->events_mutex_.unlock();
       }
-      collector->events_mutex_.unlock();
     }
 
     // TSLOG v2: register the signal this command will produce on signal_event.
     // Covers collector-owned events and app-owned signal events (e.g. events
     // the app passes during graph capture).
-    ze_instance_data.signal_gen_ = collector->EventHistoryBumpSignal(signal_event, /*path=*/0, 0);
+    {
+      UniPhaseTimer pk_hist(collector->uni_pk_hist_us_, collector->uni_pk_hist_n_);
+      ze_instance_data.signal_gen_ = collector->EventHistoryBumpSignal(signal_event, /*path=*/0, 0);
+    }
 
     ze_result_t status;
     if (collector->options_.metric_query && iskernel) {
@@ -6775,20 +7201,36 @@ class ZeCollector {
     uint64_t host_timestamp;
     uint64_t device_timestamp;  // in ticks
 
-    status = ZE_FUNC(zeDeviceGetGlobalTimestamps)(device, &host_timestamp, &device_timestamp);
-    PTI_ASSERT(status == ZE_RESULT_SUCCESS);
+    // build11: amortized GTS via the thread-local sync anchor
+    // (UNITRACE_TS_INTERP, PTI-336 port). The true-GTS branch stays inside
+    // the pk_gts phase timers inside UniTsGetTimestamps; the interpolated
+    // branch counts uni_pk_interp_n_ instead. No PTI_ASSERT on this path.
+    status = UniTsGetTimestamps(collector, device, &host_timestamp, &device_timestamp);
+    if (status != ZE_RESULT_SUCCESS) {
+      // HARDEN: GTS failed with no usable anchor at all -- skip the
+      // instrumentation of this append (same shape as the GetEvent failure
+      // above) instead of asserting the process.
+      ze_instance_data.instrument_ = false;
+      return;
+    }
 
     ze_instance_data.timestamp_host = host_timestamp;
     ze_instance_data.timestamp_device = device_timestamp;
   }
 
-  static void PrepareToAppendKernelCommand(ZeCommandList *cl) {
-    ze_result_t status;
+  static void PrepareToAppendKernelCommand(ZeCollector* collector, ZeCommandList *cl) {
     uint64_t host_timestamp;
     uint64_t device_timestamp;  // in ticks
 
-    status = ZE_FUNC(zeDeviceGetGlobalTimestamps)(cl->device_, &host_timestamp, &device_timestamp);
-    PTI_ASSERT(status == ZE_RESULT_SUCCESS);
+    // build11: amortized GTS via the thread-local sync anchor; this variant
+    // has no collector in scope, so the single call site passes it in.
+    ze_result_t status = UniTsGetTimestamps(collector, cl->device_, &host_timestamp, &device_timestamp);
+    if (status != ZE_RESULT_SUCCESS) {
+      // HARDEN: GTS failed with no usable anchor at all -- mark this append
+      // as not instrumented instead of asserting the process.
+      ze_instance_data.instrument_ = false;
+      return;
+    }
 
     ze_instance_data.timestamp_host = host_timestamp;
     ze_instance_data.timestamp_device = device_timestamp;
@@ -8088,7 +8530,19 @@ class ZeCollector {
     uint64_t device_timestamp = 0;
 
     ze_result_t status = ZE_FUNC(zeDeviceGetGlobalTimestamps)(device, &host_timestamp, &device_timestamp);
-    PTI_ASSERT(status == ZE_RESULT_SUCCESS);
+    if (status != ZE_RESULT_SUCCESS) {
+      // HARDEN (build11): replaces PTI_ASSERT -- counted + one-shot [ERROR],
+      // then stop before cloning so this replay is not recorded with a
+      // garbage submit pair (the failure-free shape is unchanged).
+      uni_pk_gts_err_n_.fetch_add(1, std::memory_order_relaxed);
+      UniTsLogGtsFailureOnce(status);
+      return;
+    }
+    // build11: feed the fresh pair into this thread's sync anchor (replay
+    // steps are ~38ms apart, always past the delta window, so the prepk after
+    // the drain would resync anyway -- this only keeps the slot warm). First
+    // feed on a thread runs the one-shot rate calibration (~1.5ms busy-wait).
+    UniTsFeedAnchor(this, device, host_timestamp, device_timestamp);
 
     // Get graph captured commands and clone them for this execution
     graphs_mutex_.lock_shared();
@@ -8157,6 +8611,16 @@ class ZeCollector {
                  ", \"prepk_us\": " + std::to_string(uni_ph_prepk_us_.exchange(0, std::memory_order_relaxed)) +
                  ", \"appendk_n\": " + std::to_string(uni_ph_appendk_n_.exchange(0, std::memory_order_relaxed)) +
                  ", \"prepk_n\": " + std::to_string(uni_ph_prepk_n_.exchange(0, std::memory_order_relaxed)) +
+                 ", \"pk_maps_us\": " + std::to_string(uni_pk_maps_us_.exchange(0, std::memory_order_relaxed)) +
+                 ", \"pk_getev_us\": " + std::to_string(uni_pk_getev_us_.exchange(0, std::memory_order_relaxed)) +
+                 ", \"pk_hist_us\": " + std::to_string(uni_pk_hist_us_.exchange(0, std::memory_order_relaxed)) +
+                 ", \"pk_gts_us\": " + std::to_string(uni_pk_gts_us_.exchange(0, std::memory_order_relaxed)) +
+                 ", \"pk_maps_n\": " + std::to_string(uni_pk_maps_n_.exchange(0, std::memory_order_relaxed)) +
+                 ", \"pk_getev_n\": " + std::to_string(uni_pk_getev_n_.exchange(0, std::memory_order_relaxed)) +
+                 ", \"pk_hist_n\": " + std::to_string(uni_pk_hist_n_.exchange(0, std::memory_order_relaxed)) +
+                 ", \"pk_gts_n\": " + std::to_string(uni_pk_gts_n_.exchange(0, std::memory_order_relaxed)) +
+                 ", \"pk_interp_n\": " + std::to_string(uni_pk_interp_n_.exchange(0, std::memory_order_relaxed)) +
+                 ", \"pk_gts_err_n\": " + std::to_string(uni_pk_gts_err_n_.exchange(0, std::memory_order_relaxed)) +
                  ", \"d_flush1_us\": " + std::to_string(uni_pd_flush1_us_.exchange(0, std::memory_order_relaxed)) +
                  ", \"d_lock_us\": " + std::to_string(uni_pd_lock_us_.exchange(0, std::memory_order_relaxed)) +
                  ", \"d_consume_us\": " + std::to_string(uni_pd_consume_us_.exchange(0, std::memory_order_relaxed)) +
@@ -8875,7 +9339,7 @@ class ZeCollector {
           exit(-1);
         }
 
-        collector->PrepareToAppendKernelCommand(it->second);
+        collector->PrepareToAppendKernelCommand(collector, it->second);
 
         *instance_data = reinterpret_cast<void *>(&(dts[idx]) + 1);
         it->second->num_device_global_timestamps_ += 2; // start timestamp and end timestamp
