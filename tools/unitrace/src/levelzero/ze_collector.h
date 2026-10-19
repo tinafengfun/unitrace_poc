@@ -3561,6 +3561,11 @@ class ZeCollector {
     for (auto &ctx : pending) {
       BatchQktResetEvents(ctx.first, ctx.second);
     }
+    // BQ-S2: destroy the shadow W's staged by the drain's release calls —
+    // this is the post-unlock point of every sweep (all five flush sites run
+    // after their submission lock is released), so the zeEventDestroy here
+    // can never re-enter a lock its caller still holds.
+    BatchQktFreeStagedShadowWs();
   }
 
   // ================= Fix B: deferred timestamp completion =================
@@ -4270,6 +4275,19 @@ class ZeCollector {
   static bool BatchQktTestAllocFail(void) {
     static const bool enabled = []() {
       const char *e = std::getenv("UNITRACE_TEST_ALLOC_FAIL");
+      return (e != nullptr && e[0] == '1' && e[1] == '\0');
+    }();
+    return enabled;
+  }
+
+  // HARDEN (UNITRACE_TEST_SHADOW_W_FAIL=1): force the shadow W injection to
+  // "fail" on every submission, so the no-W degrade (arm skips, step takes
+  // the v4b drain read with the shared events left latched) is exercised end
+  // to end on a healthy node — the acceptance condition-4 test entry. Read
+  // once.
+  static bool BatchQktTestShadowWFail(void) {
+    static const bool enabled = []() {
+      const char *e = std::getenv("UNITRACE_TEST_SHADOW_W_FAIL");
       return (e != nullptr && e[0] == '1' && e[1] == '\0');
     }();
     return enabled;
@@ -5243,6 +5261,7 @@ class ZeCollector {
           std::cerr << "[BATCHQKT] skip: mixed context/device in one sweep" << std::endl;
         }
         batch.cmds.clear();
+        BatchQktReleaseShadowWs(context, /*device_ok=*/true);
         return false;
       }
       // HARDEN: a null event handle must never reach
@@ -5253,6 +5272,7 @@ class ZeCollector {
       if (batch.cmds[i]->event_ == nullptr) {
         uni_batchqkt_alloc_fail_.fetch_add(1, std::memory_order_relaxed);
         batch.cmds.clear();
+        BatchQktReleaseShadowWs(context, /*device_ok=*/true);
         return false;
       }
       events[i] = batch.cmds[i]->event_;
@@ -5265,6 +5285,7 @@ class ZeCollector {
     if (BatchQktCaptureHold()) {
       uni_batchqkt_capture_skip_.fetch_add(1, std::memory_order_relaxed);
       batch.cmds.clear();
+      BatchQktReleaseShadowWs(context, /*device_ok=*/true);
       return false;
     }
 
@@ -5274,6 +5295,7 @@ class ZeCollector {
     if (imm == nullptr || dst == nullptr) {
       batch.cmds.clear();
       uni_batchqkt_fallback_count_.fetch_add(1, std::memory_order_relaxed);
+      BatchQktReleaseShadowWsLocked(context, /*device_ok=*/true);
       return false;
     }
 
@@ -5301,11 +5323,16 @@ class ZeCollector {
                   << "), this step falls back to the per-event path" << std::endl;
       }
       batch.cmds.clear();
+      // BQ-S2: no device op of this read referenced the W's (the drain read
+      // waits on nothing), so they can be returned to the pool even here.
+      BatchQktReleaseShadowWsLocked(context, /*device_ok=*/true);
       return false;
     }
 
     batch.ts.resize(n);
     std::memcpy(batch.ts.data(), dst, n * sizeof(ze_kernel_timestamp_result_t));
+    // BQ-S2: the drain read consumed this window's packets — release the W's.
+    BatchQktReleaseShadowWsLocked(context, /*device_ok=*/true);
     uint64_t batch_us = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
     uint64_t prev = uni_batchqkt_max_batch_us_.load(std::memory_order_relaxed);
@@ -5423,6 +5450,28 @@ class ZeCollector {
       return;
     }
     std::lock_guard<std::mutex> lk(uni_batchqkt_mutex_);
+    // BQ-S2: the wait set is the current window's shadow W's for this context
+    // (pushed by the OnExit graph submit, cleared by the drain). Empty means
+    // this submission got no W (inject failed/degraded, or the arm is racing
+    // an unfinished cycle): NEVER park on the shared events themselves — under
+    // the W mode they stay latched from the previous generation and such a
+    // wait would resolve immediately with stale packets. The step then takes
+    // the drain's v4b read, which only runs after the graph lists' host-
+    // synchronize proved the generation complete. This empty-set early return
+    // is also what keeps the starvation constraint (POC §7): no W, no armed
+    // wait — the park window stays byte-identical to the healthy shape.
+    std::vector<ze_event_handle_t> shadow_ws;
+    if (BatchQktShadowWActive()) {
+      for (auto &entry : uni_batchqkt_pending_ws_) {
+        if (entry.first == pr.context) {
+          shadow_ws.push_back(entry.second);
+        }
+      }
+      if (shadow_ws.empty()) {
+        uni_batchqkt_w_degrade_.fetch_add(1, std::memory_order_relaxed);
+        return;
+      }
+    }
     // The guard covers the list/buffer creation too (first-time zeMemAllocHost
     // / zeCommandListCreateImmediate also come back through the tracing layer),
     // so no nested sweep can observe the half-published arm: the slot flag is
@@ -5446,7 +5495,9 @@ class ZeCollector {
     ze_result_t status = ZE_FUNC(zeCommandListAppendQueryKernelTimestamps)(
         imm, static_cast<uint32_t>(n), pr.events.data(), dst,
         /*pOffsets=*/nullptr, /*hSignalEvent=*/nullptr,
-        /*numWaitEvents=*/static_cast<uint32_t>(n), /*phWaitEvents=*/pr.events.data());
+        /*numWaitEvents=*/(shadow_ws.empty()
+            ? static_cast<uint32_t>(n) : static_cast<uint32_t>(shadow_ws.size())),
+        /*phWaitEvents=*/(shadow_ws.empty() ? pr.events.data() : shadow_ws.data()));
     auto t1 = std::chrono::steady_clock::now();
     const uint64_t mt1 = meta ? UniTimer::GetHostTimestamp() : 0;
     uni_batchqkt_in_batch_ = prev_guard;
@@ -5527,6 +5578,8 @@ class ZeCollector {
       // Cannot happen by construction; never let a desynchronized descriptor
       // reach the memcpy or the cursor match.
       uni_batchqkt_poll_read_ = ZeBatchQktPollRead();
+      // BQ-S2: the armed read never ran — release this context's W's safely.
+      BatchQktReleaseShadowWsLocked(pr.context, /*device_ok=*/true);
       if (!uni_batchqkt_notice_invariant_.exchange(true, std::memory_order_relaxed) &&
           BatchQktDiagEnabled()) {
         std::cerr << "[BATCHQKT] poll descriptor desynchronized (n=" << pr.n
@@ -5540,6 +5593,8 @@ class ZeCollector {
       if (pr.cmds[i] == nullptr || pr.events[i] == nullptr) {
         batch.cmds.clear();
         batch.ts.clear();
+        // BQ-S2: the armed read never ran — release this context's W's safely.
+        BatchQktReleaseShadowWsLocked(pr.context, /*device_ok=*/true);
         if (!uni_batchqkt_notice_invariant_.exchange(true, std::memory_order_relaxed) &&
             BatchQktDiagEnabled()) {
           std::cerr << "[BATCHQKT] poll descriptor has a null element (i=" << i
@@ -5566,6 +5621,10 @@ class ZeCollector {
       // falls through to the v4b collect + execute for these same clones.
       batch.cmds.clear();
       batch.ts.clear();
+      // BQ-S2: the sync failed (device-lost class) — the W's may still be
+      // referenced by the stuck wait op, so drop them WITHOUT device calls
+      // and WITHOUT returning them to the pool (counted abandon).
+      BatchQktReleaseShadowWsLocked(pr.context, /*device_ok=*/false);
       uni_batchqkt_fallback_count_.fetch_add(1, std::memory_order_relaxed);
       if (BatchQktDiagEnabled()) {
         std::cerr << "[BATCHQKT] poll read synchronize failed (status=0x" << std::hex << status
@@ -5616,6 +5675,9 @@ class ZeCollector {
           static_cast<uint64_t>(n), batch_us);
       TsDiagWrite(buf, static_cast<size_t>(len));
     }
+    // BQ-S2: the read resolved (the wait on the shadow W's completed), so the
+    // W's are done — host-destroy/recreate them back into the pool.
+    BatchQktReleaseShadowWsLocked(pr.context, /*device_ok=*/true);
     return true;
   }
 
@@ -5707,6 +5769,16 @@ class ZeCollector {
       reset_now = true;
     }
     if (reset_now) {
+      if (BatchQktShadowWActive() && command->graph_command_) {
+        // BQ-S2: the shared event stays latched by design — the armed read
+        // waits on the submission's shadow W, not on the event, and the next
+        // replay re-signals the event before anyone else can observe the
+        // latch (same-window correlation, §6.1 audit C5). The accounting
+        // above is kept so the pending counters stay sane; only the physical
+        // reset is skipped — that is the reset batch's ~557us/step this
+        // design removes.
+        return;
+      }
       if (BatchQktResetBatchActive()) {
         EventHistoryDeferGraphEventReset(command->context_, command->event_);
       }
@@ -5716,6 +5788,241 @@ class ZeCollector {
     }
     // else: clones of this event are still queued — they must read their
     // packet; the last one to be armed performs the reset.
+  }
+
+  // -----------------------------------------------------------------------
+  // BQ-S2: shadow completion event W. Mechanism and lifecycle:
+  //
+  // One W per graph submission, from a collector-owned HOST_VISIBLE pool
+  // (shadow_w_cache_, flags = none — W is signaled/waited/host-destroyed,
+  // never queried for packets). OnExit of a successful graph append appends
+  // one zeCommandListAppendSignalEvent(W) INTO THE SAME list, right after the
+  // driver's graph append: the signal is stream-ordered behind the graph, so
+  // W signals exactly when the replay's last kernel has signaled the shared
+  // events — with no cross-queue ordering assumption (POC §7 item (b)).
+  // BatchQktArmPollRead then waits on {W} instead of the shared events, and
+  // the shared events are never reset in this mode (BatchQktReleaseArmedEvent
+  // gate above): nothing waits on them, their latch is harmless, and the next
+  // replay re-signals them before anything can read a stale packet (the read
+  // resolves at the drain, which runs before the next append).
+  //
+  // The W is released after the read resolved: BatchQktReleaseShadowWs
+  // destroys/recreates it back into the pool (ReleaseEvent — the destroy
+  // alone already guarantees a stale re-signal can never hit the recreated
+  // object, and the pop-time QueryStatus gate below is the second line of
+  // defense, POC §7 item (d)/R7).
+  // -----------------------------------------------------------------------
+
+  // Pops one clean (not signaled) W for this context. The R7 gate: a W found
+  // SIGNALLED at pop means a stale re-signal reached it while it sat checked
+  // out or in the pool — self-heal by destroying/recreating it and taking
+  // another; two strikes in a row gives up on this submission (the step then
+  // degrades to the v4b drain read, counted).
+  ze_event_handle_t BatchQktGetShadowW(ze_context_handle_t context) {
+    if (uni_batchqkt_dead_contexts_.count(context) != 0) {
+      return nullptr;
+    }
+    for (int tries = 0; tries < 2; tries++) {
+      ze_event_handle_t w = shadow_w_cache_.GetEvent(context);
+      if (w == nullptr) {
+        return nullptr;
+      }
+      if (ZE_FUNC(zeEventQueryStatus)(w) == ZE_RESULT_SUCCESS) {
+        // R7: latched W in the pool. Destroy+recreate (never a bare host
+        // reset: this pop cannot attribute the signal it just saw) and take
+        // another. ReleaseEvent hands a clean NOT_READY event back to the
+        // pool's free list.
+        shadow_w_cache_.ReleaseEvent(w);
+        uni_batchqkt_w_latched_pop_.fetch_add(1, std::memory_order_relaxed);
+        if (!uni_batchqkt_notice_w_latched_.exchange(true, std::memory_order_relaxed) &&
+            BatchQktDiagEnabled()) {
+          std::cerr << "[BATCHQKT] shadow W popped SIGNALLED (stale re-signal), recreated and retaken" << std::endl;
+        }
+        continue;
+      }
+      uni_batchqkt_w_pops_.fetch_add(1, std::memory_order_relaxed);
+      return w;
+    }
+    return nullptr;
+  }
+
+  // OnExit of a successful graph append: append the submission's W in-stream.
+  // Called after SubmitStagedKernelCommandAndMetricQueries so the signal is
+  // enqueued directly behind the driver's graph ops (in-order list). Every
+  // failure here degrades THIS submission to the v4b drain read — never to a
+  // wait on the shared events (they may be latched from the previous
+  // generation under this mode; a wait on them can resolve immediately with
+  // stale packets, mode-b in the design doc's §2 race analysis).
+  void BatchQktInjectShadowW(ze_command_list_handle_t command_list) {
+    if (!BatchQktShadowWActive() || command_list == nullptr) {
+      return;
+    }
+    // HARDEN: never inject while a graph capture window is open (defensive;
+    // graph appends are replay-only, capture goes through the Begin/End APIs).
+    if (BatchQktCaptureHold()) {
+      return;
+    }
+    ze_context_handle_t context = nullptr;
+    bool in_order = false;
+    command_lists_mutex_.lock_shared();
+    auto it = command_lists_.find(command_list);
+    if (it != command_lists_.end()) {
+      context = it->second->context_;
+      in_order = it->second->in_order_;
+    }
+    command_lists_mutex_.unlock_shared();
+    if (context == nullptr) {
+      return;
+    }
+    if (!in_order) {
+      // An out-of-order list may reorder the W signal ahead of the graph: the
+      // armed read would then resolve early and read the previous generation
+      // (mode-b). Never inject there; the step degrades to the v4b drain read.
+      uni_batchqkt_w_degrade_.fetch_add(1, std::memory_order_relaxed);
+      if (!uni_batchqkt_notice_w_ooo_.exchange(true, std::memory_order_relaxed) &&
+          BatchQktDiagEnabled()) {
+        std::cerr << "[BATCHQKT] shadow W not injected: out-of-order command list"
+                  << " (steps degrade to the drain read)" << std::endl;
+      }
+      return;
+    }
+    if (BatchQktTestShadowWFail()) {
+      // HARDEN: forced failure (UNITRACE_TEST_SHADOW_W_FAIL=1) — validates the
+      // no-W degrade path end to end without a driver fault.
+      uni_batchqkt_w_inject_fail_.fetch_add(1, std::memory_order_relaxed);
+      uni_batchqkt_w_degrade_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+    ze_event_handle_t w = BatchQktGetShadowW(context);
+    if (w == nullptr) {
+      uni_batchqkt_w_inject_fail_.fetch_add(1, std::memory_order_relaxed);
+      uni_batchqkt_w_degrade_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+    ze_result_t status = ZE_FUNC(zeCommandListAppendSignalEvent)(command_list, w);
+    if (status != ZE_RESULT_SUCCESS) {
+      // Nothing was enqueued: return the W (clean NOT_READY back in the pool)
+      // and leave this submission without a W.
+      shadow_w_cache_.ReleaseEvent(w);
+      uni_batchqkt_w_inject_fail_.fetch_add(1, std::memory_order_relaxed);
+      uni_batchqkt_w_degrade_.fetch_add(1, std::memory_order_relaxed);
+      if (!uni_batchqkt_notice_pollappend_.exchange(true, std::memory_order_relaxed) &&
+          BatchQktDiagEnabled()) {
+        std::cerr << "[BATCHQKT] shadow W signal append failed (status=0x" << std::hex << status
+                  << std::dec << "), this step degrades to the drain read" << std::endl;
+      }
+      return;
+    }
+    std::lock_guard<std::mutex> lk(uni_batchqkt_mutex_);
+    if (uni_batchqkt_dead_contexts_.count(context) != 0) {
+      // The context died between the successful graph append and this push
+      // (another thread's teardown released the W's and marked the handle
+      // dead): abandon the W — never push a dead context's event into the
+      // window, the arm could park on it.
+      uni_batchqkt_w_abandoned_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+    uni_batchqkt_pending_ws_.push_back({context, w});
+  }
+
+  // Core release (uni_batchqkt_mutex_ already held): erase this context's
+  // pending entries and STAGE the W's for destruction — never destroy here.
+  // Why staged: destroying an event (zeEventDestroy inside ReleaseEvent)
+  // re-enters OnEnterEventDestroy, whose not-signaled branch takes the
+  // submission lock SHARED — a self-deadlock when the caller is the staging
+  // drain, which holds that lock EXCLUSIVE (the signaled branch is guarded by
+  // uni_batchqkt_in_batch_, the not-signaled branch is not; a W can be
+  // not-signaled on the arm-failed/desync exits). The staged W's are
+  // destroyed by BatchQktFreeStagedShadowWs, called at the end of
+  // FlushGraphEventResets — which every sweep runs AFTER releasing its
+  // submission lock (all five sites verified).
+  // device_ok=false (device-lost class): drop the entries WITHOUT staging —
+  // a bounded, counted leak (the context's pool dies with ReleaseContext).
+  void BatchQktReleaseShadowWsLocked(ze_context_handle_t context, bool device_ok) {
+    if (context == nullptr || uni_batchqkt_pending_ws_.empty()) {
+      return;
+    }
+    auto it = uni_batchqkt_pending_ws_.begin();
+    while (it != uni_batchqkt_pending_ws_.end()) {
+      if (it->first == context) {
+        if (device_ok) {
+          uni_batchqkt_ws_to_free_.push_back(it->second);
+        }
+        else {
+          uni_batchqkt_w_abandoned_.fetch_add(1, std::memory_order_relaxed);
+        }
+        it = uni_batchqkt_pending_ws_.erase(it);
+      }
+      else {
+        ++it;
+      }
+    }
+  }
+
+  // Destroys the staged W's (destroy+recreate: the pool's free list gets a
+  // clean NOT_READY event back — a latched W needs no host reset before this,
+  // destroying it already guarantees the recreated object is fresh). Called
+  // outside the submission locks and WITHOUT uni_batchqkt_mutex_ held.
+  void BatchQktFreeStagedShadowWs(void) {
+    std::vector<ze_event_handle_t> free_now;
+    {
+      std::lock_guard<std::mutex> lk(uni_batchqkt_mutex_);
+      if (uni_batchqkt_ws_to_free_.empty()) {
+        return;
+      }
+      free_now.swap(uni_batchqkt_ws_to_free_);
+    }
+    for (ze_event_handle_t w : free_now) {
+      if (shadow_w_cache_.QueryEvent(w)) {
+        shadow_w_cache_.ReleaseEvent(w);
+      }
+      else {
+        uni_batchqkt_w_abandoned_.fetch_add(1, std::memory_order_relaxed);
+      }
+      uni_batchqkt_w_released_.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
+  // In-place destroy of one context's pending W's, for the paired context
+  // teardown (OnEnterContextDestroy: the context dies right after us, so the
+  // destroys MUST run here, not at a later flush). uni_batchqkt_mutex_ held;
+  // the lock exposure is the same one the adjacent zeCommandListDestroy /
+  // zeMemFree calls already carry (their intercepts take the submission lock
+  // SHARED under this very mutex — the exclusive holder is the in_batch_
+  // guarded drain, the shared holders are compatible).
+  void BatchQktDestroyContextShadowWsLocked(ze_context_handle_t context) {
+    if (context == nullptr || uni_batchqkt_pending_ws_.empty()) {
+      return;
+    }
+    std::vector<ze_event_handle_t> dead;
+    auto it = uni_batchqkt_pending_ws_.begin();
+    while (it != uni_batchqkt_pending_ws_.end()) {
+      if (it->first == context) {
+        dead.push_back(it->second);
+        it = uni_batchqkt_pending_ws_.erase(it);
+      }
+      else {
+        ++it;
+      }
+    }
+    for (ze_event_handle_t w : dead) {
+      if (shadow_w_cache_.QueryEvent(w)) {
+        shadow_w_cache_.ReleaseEvent(w);
+      }
+      else {
+        uni_batchqkt_w_abandoned_.fetch_add(1, std::memory_order_relaxed);
+      }
+      uni_batchqkt_w_released_.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
+  // Public release: idempotent, callable from any sweep/teardown thread.
+  void BatchQktReleaseShadowWs(ze_context_handle_t context, bool device_ok) {
+    if (context == nullptr || uni_batchqkt_pending_ws_.empty()) {
+      return;
+    }
+    std::lock_guard<std::mutex> lk(uni_batchqkt_mutex_);
+    BatchQktReleaseShadowWsLocked(context, device_ok);
   }
 
   // Emit pass for the deferred clones: consumes every deferred_ts_ command of
@@ -5849,6 +6156,19 @@ class ZeCollector {
               << " ctx_releases=" << uni_batchqkt_ctx_releases_.load(std::memory_order_relaxed)
               << " capture_skip=" << uni_batchqkt_capture_skip_.load(std::memory_order_relaxed)
               << " capture_depth=" << uni_batchqkt_capture_depth_.load(std::memory_order_relaxed)
+              // BQ-S2 (all zero unless the shadow W mode is active): W pops,
+              // R7 latched-pop self-heals, submissions that got no W, steps
+              // that degraded to the v4b drain read for lack of a W, W's
+              // returned to the pool, and W's dropped without pool return
+              // (device-lost class). Healthy shape: w_pops == w_released ==
+              // submissions, w_latched == w_inject_fail == w_degrade ==
+              // w_abandoned == 0.
+              << " w_pops=" << uni_batchqkt_w_pops_.load(std::memory_order_relaxed)
+              << " w_latched=" << uni_batchqkt_w_latched_pop_.load(std::memory_order_relaxed)
+              << " w_inject_fail=" << uni_batchqkt_w_inject_fail_.load(std::memory_order_relaxed)
+              << " w_degrade=" << uni_batchqkt_w_degrade_.load(std::memory_order_relaxed)
+              << " w_released=" << uni_batchqkt_w_released_.load(std::memory_order_relaxed)
+              << " w_abandoned=" << uni_batchqkt_w_abandoned_.load(std::memory_order_relaxed)
               << std::endl;
   }
 
@@ -5877,6 +6197,28 @@ class ZeCollector {
   // the untouched inline host-reset path.
   inline bool BatchQktResetBatchActive(void) {
     return BatchQktActive() && BatchQktResetBatchEnvEnabled();
+  }
+
+  // BQ-S2 knob, shipping default ON: replace the reset batch with a per-
+  // submission shadow completion event W (the armed read waits on W, the
+  // shared events stay latched across replays). Set
+  // UNITRACE_GRAPH_QKT_SHADOW_W=0 to keep the v4c shape (reset batch at the
+  // sweep end) for A/B testing.
+  static bool ShadowWEnvEnabled(void) {
+    static const bool enabled = []() {
+      const char *e = std::getenv("UNITRACE_GRAPH_QKT_SHADOW_W");
+      return (e == nullptr || !(e[0] == '0' && e[1] == '\0'));
+    }();
+    return enabled;
+  }
+
+  // Master gate of the BQ-S2 shadow W. Requires the batch gate + the reset
+  // batch + the poll-armed read: the W replaces exactly the reset batch's
+  // work and is only consumed by the armed read, so with any of the three off
+  // the collector keeps the exact pre-W behavior byte for byte (TSLOG2
+  // diagnosis modes inherit the same force-off through BatchQktActive).
+  inline bool BatchQktShadowWActive(void) {
+    return BatchQktResetBatchActive() && BatchQktAtPollActive() && ShadowWEnvEnabled();
   }
 
   // Resets one context's parked events: batched when the immediate list for
@@ -6039,6 +6381,11 @@ class ZeCollector {
       uni_batchqkt_poll_read_ = ZeBatchQktPollRead();
       uni_batchqkt_read_pending_.store(false, std::memory_order_release);
     }
+    // BQ-S2: destroy this context's pending W's IN PLACE (the context dies
+    // right after us — a staged destroy would be a use-after-destroy) and
+    // then the shadow W pools, exactly like the main event cache's paired
+    // release.
+    BatchQktDestroyContextShadowWsLocked(context);
     size_t freed = 0, failed = 0;
     auto imm_it = uni_batchqkt_imm_lists_.find(context);
     if (imm_it != uni_batchqkt_imm_lists_.end() && imm_it->second != nullptr) {
@@ -6090,6 +6437,9 @@ class ZeCollector {
     uni_batchqkt_buf_caps_.erase(context);
     uni_batchqkt_poll_bufs_.erase(context);
     uni_batchqkt_poll_buf_caps_.erase(context);
+    // BQ-S2: paired teardown of the shadow W pools for this context (the
+    // context is still alive here — this is the enter intercept).
+    shadow_w_cache_.ReleaseContext(context);
     // Remember the handle value as dead: never create/serve resources for it
     // again, even if L0 hands a NEW context out at the same address.
     uni_batchqkt_dead_contexts_.insert(context);
@@ -6125,6 +6475,10 @@ class ZeCollector {
       uni_batchqkt_poll_read_ = ZeBatchQktPollRead();
       uni_batchqkt_read_pending_.store(false, std::memory_order_release);
     }
+    // BQ-S2: drop this context's pending W entries WITHOUT device calls (the
+    // context may already be destroyed — counted abandon; the pools are
+    // destroyed by the paired enter release above, or best effort at exit).
+    BatchQktReleaseShadowWsLocked(context, /*device_ok=*/false);
     uni_batchqkt_imm_lists_.erase(context);
     uni_batchqkt_poll_lists_.erase(context);
     uni_batchqkt_bufs_.erase(context);
@@ -6187,6 +6541,26 @@ class ZeCollector {
       }
     }
     uni_batchqkt_poll_lists_.clear();
+    // BQ-S2 backstop: destroy any W's the per-context paired release missed
+    // (pending entries plus staged ones — the app never destroyed its
+    // contexts), then destroy every shadow W pool/event the cache still owns.
+    // Best effort: the contexts may be gone; a failed destroy carries its own
+    // [WARNING] and ReleaseAll drops the tracking either way.
+    for (auto &entry : uni_batchqkt_pending_ws_) {
+      uni_batchqkt_ws_to_free_.push_back(entry.second);
+    }
+    uni_batchqkt_pending_ws_.clear();
+    for (ze_event_handle_t w : uni_batchqkt_ws_to_free_) {
+      if (shadow_w_cache_.QueryEvent(w)) {
+        shadow_w_cache_.ReleaseEvent(w);
+      }
+      else {
+        uni_batchqkt_w_abandoned_.fetch_add(1, std::memory_order_relaxed);
+      }
+      uni_batchqkt_w_released_.fetch_add(1, std::memory_order_relaxed);
+    }
+    uni_batchqkt_ws_to_free_.clear();
+    shadow_w_cache_.ReleaseAll();
     // Pairing audit line: nonzero on the healthy path only if the app never
     // destroyed its contexts; failures carry their own [WARNING] lines above.
     if (freed != 0 || failed != 0) {
@@ -8511,12 +8885,19 @@ class ZeCollector {
       // collect+execute reads the whole step's packets in one batch (~500us)
       // and the consuming loop resets the shared events before the clone
       // loop below re-bumps and re-signals them for this replay.
-      for (auto event : graph_events) {
-        if (!EventHistoryHasPending(event) &&
-            ZE_FUNC(zeEventQueryStatus)(event) == ZE_RESULT_SUCCESS) {
-          event_cache_.ResetEvent(event);
+      if (!BatchQktShadowWActive()) {
+        for (auto event : graph_events) {
+          if (!EventHistoryHasPending(event) &&
+              ZE_FUNC(zeEventQueryStatus)(event) == ZE_RESULT_SUCCESS) {
+            event_cache_.ResetEvent(event);
+          }
         }
       }
+      // BQ-S2: with the shadow W active the shared events are deliberately
+      // left latched across replays (the armed read waits on the per-
+      // submission W, nothing waits on the events) — clearing a latch here
+      // would both waste a QueryStatus per event per step and fight the
+      // wait-on-W semantics this mode is built on.
       {
         // TAX-OPT: the staging drain (collect + execute + reset batch live
         // here; qkt_batch/reset_batch already carry their own meta records).
@@ -9896,6 +10277,7 @@ typedef struct _zex_kernel_register_file_size_exp_t {
       // dead), then of the event cache pools/events for this context.
       collector->ReleaseBatchQktContextResources(context);
       collector->event_cache_.ReleaseContext(context);
+      collector->shadow_w_cache_.ReleaseContext(context);
     }
   }
 
@@ -9912,6 +10294,7 @@ typedef struct _zex_kernel_register_file_size_exp_t {
       collector->InvalidateBatchQktContext(*(params->phContext));
       collector->ProcessAllCommandsSubmitted(nullptr);
       collector->event_cache_.ReleaseContext(*(params->phContext));
+      collector->shadow_w_cache_.ReleaseContext(*(params->phContext));
     }
   }
 
@@ -9978,7 +10361,8 @@ typedef struct _zex_kernel_register_file_size_exp_t {
   }
 
   static void SubmitGraphExecution(ze_result_t result, void* global_data,
-                                   std::vector<uint64_t> *kids) {
+                                   std::vector<uint64_t> *kids,
+                                   ze_command_list_handle_t command_list) {
     if (result != ZE_RESULT_SUCCESS || !UniController::IsCollectionEnabled()) {
       local_device_submissions_.RevertStagedKernelCommandAndMetricQueries();
       return;
@@ -9986,6 +10370,13 @@ typedef struct _zex_kernel_register_file_size_exp_t {
     ZeCollector* collector = reinterpret_cast<ZeCollector*>(global_data);
     // kids let the host-side flow callback emit FLOW_H2D to each replayed kernel.
     local_device_submissions_.SubmitStagedKernelCommandAndMetricQueries(collector->event_cache_, kids);
+    // BQ-S2: with the graph append proven successful, enqueue this
+    // submission's shadow completion event W in-stream (right behind the
+    // graph ops on this in-order list) so the armed read can wait on {W}
+    // instead of parking on the shared events. A failed/absent W leaves the
+    // step on the v4b drain read (counted) — never a wait on the shared
+    // events, which stay latched from the previous generation in this mode.
+    collector->BatchQktInjectShadowW(command_list);
   }
 
   static void OnEnterCommandListAppendGraphExp(
@@ -9995,10 +10386,10 @@ typedef struct _zex_kernel_register_file_size_exp_t {
   }
 
   static void OnExitCommandListAppendGraphExp(
-      ze_command_list_append_graph_exp_params_t* /* params */,
+      ze_command_list_append_graph_exp_params_t* params,
       ze_result_t result, void* global_data, void** /* instance_data */,
       std::vector<uint64_t> *kids) {
-    SubmitGraphExecution(result, global_data, kids);
+    SubmitGraphExecution(result, global_data, kids, *(params->phCommandList));
   }
 
   // Stable (Ext) graph APIs, which SYCL uses when the driver reports them. They
@@ -10059,10 +10450,10 @@ typedef struct _zex_kernel_register_file_size_exp_t {
   }
 
   static void OnExitCommandListAppendGraphExt(
-      ze_command_list_append_graph_ext_params_t* /* params */,
+      ze_command_list_append_graph_ext_params_t* params,
       ze_result_t result, void* global_data, void** /* instance_data */,
       std::vector<uint64_t> *kids) {
-    SubmitGraphExecution(result, global_data, kids);
+    SubmitGraphExecution(result, global_data, kids, *(params->phCommandList));
   }
 
   #include <tracing.gen> // Auto-generated callbacks
@@ -10353,6 +10744,39 @@ typedef struct _zex_kernel_register_file_size_exp_t {
   std::atomic<bool> uni_batchqkt_notice_polllist_{false};
   std::atomic<bool> uni_batchqkt_notice_pollmixed_{false};
   std::atomic<bool> uni_batchqkt_notice_pollappend_{false};
+
+  // ---- BQ-S2: per-submission shadow completion event W ----
+  // (design doc BQ_S2_DESIGN.md §3, §6.1; POC build11/poc_bqs2/ ALL-PASS.)
+  // A HOST_VISIBLE-only event pool per context (flags_=0 below: W is signaled/
+  // waited/host-destroyed, never queried for packets), releasing the reset
+  // batch's ~557us/step from the drain. The W of one graph submission is
+  // appended IN-STREAM right after the driver's graph append (same list =>
+  // stream-ordered => no cross-queue ordering assumption); the armed read
+  // waits on {W} instead of the shared events, which are deliberately left
+  // latched across replays under this mode.
+  ZeEventCache shadow_w_cache_{0};
+  // W's staged since the last drain of their context (the current window).
+  // Written at the OnExit graph submit, read by the arm, released at the
+  // drain/teardown -- all under uni_batchqkt_mutex_. Cleared per context by
+  // BatchQktReleaseShadowWs; the drain runs before the next submission's W is
+  // pushed, so the window correlation with the pending clones is by
+  // construction.
+  std::vector<std::pair<ze_context_handle_t, ze_event_handle_t>> uni_batchqkt_pending_ws_;
+  // W's whose entries were released but whose destruction is deferred to the
+  // post-unlock flush (FlushGraphEventResets -> BatchQktFreeStagedShadowWs):
+  // destroying an event re-enters OnEnterEventDestroy, which can take the
+  // submission lock SHARED — illegal under the drain's EXCLUSIVE hold, and
+  // self-deadlocking there. Guarded by uni_batchqkt_mutex_.
+  std::vector<ze_event_handle_t> uni_batchqkt_ws_to_free_;
+  // Counters (see the [BATCHQKT] summary line).
+  std::atomic<uint64_t> uni_batchqkt_w_pops_{0};       // clean W pops
+  std::atomic<uint64_t> uni_batchqkt_w_latched_pop_{0};  // R7 gate: pops that found a SIGNALLED W
+  std::atomic<uint64_t> uni_batchqkt_w_inject_fail_{0};  // submissions that got no W (alloc/append failed)
+  std::atomic<uint64_t> uni_batchqkt_w_degrade_{0};      // steps that skipped the arm for lack of a W (v4b drain read)
+  std::atomic<uint64_t> uni_batchqkt_w_released_{0};     // W's returned to the pool
+  std::atomic<uint64_t> uni_batchqkt_w_abandoned_{0};    // W's dropped WITHOUT pool return (device-lost class)
+  std::atomic<bool> uni_batchqkt_notice_w_latched_{false};
+  std::atomic<bool> uni_batchqkt_notice_w_ooo_{false};
 
 };
 

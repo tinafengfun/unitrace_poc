@@ -267,6 +267,46 @@ class ZeEventCache {
     }
   }
 
+  // Destroys every pool/event this cache still owns, whatever the context.
+  // Teardown backstop (BQ-S2 shadow W cache): the per-context paired release
+  // handles the healthy path; this covers contexts the app never destroyed.
+  // Same semantics as the destructor, without ending the object's life.
+  void ReleaseAll(void) {
+#ifdef _WIN32
+    return;
+#else /* _WIN32 */
+    bool destroyed = true;
+    const std::lock_guard<std::shared_mutex> lock(lock_);
+
+    for (auto& value : event_map_) {
+      for (auto event : value.second) {
+        ze_result_t status = ZE_FUNC(zeEventDestroy)(event);
+        if (status != ZE_RESULT_SUCCESS) {
+          destroyed = false;
+        }
+      }
+    }
+    event_map_.clear();
+    if (!destroyed) {
+      std::cerr << "[WARNING] Event in event cache is not destroyed" << std::endl;
+    }
+    event_info_map_.clear();
+    destroyed = true;
+    for (auto& value : event_pools_) {
+      for (auto pool : value.second) {
+        ze_result_t status = ZE_FUNC(zeEventPoolDestroy)(pool);
+        if (status != ZE_RESULT_SUCCESS) {
+          destroyed = false;
+        }
+      }
+    }
+    event_pools_.clear();
+    if (!destroyed) {
+      std::cerr << "[WARNING] Event pool in event cache is not destroyed" << std::endl;
+    }
+#endif /* _WIN32 */
+  }
+
   // Releases every pool/event this cache owns for one context. Called from
   // the zeContextDestroy ENTER intercept, while the context is still alive:
   // zeEventDestroy/zeEventPoolDestroy below are exactly the destroy side of

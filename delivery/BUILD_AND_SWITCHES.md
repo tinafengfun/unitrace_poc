@@ -111,6 +111,7 @@ footer 前 flush 时序风险（详见 TSLOG_FIX 报告 §2）。
 | `UNITRACE_TRACE_META` | **ON** | `unitrace.*` meta 记录（enqueue/emit/qkt_batch/reset_batch/step/final_flush） | 无 meta 记录，其余字节等同（逃生门） | ≈0（纯 host 侧） |
 | `UNITRACE_GRAPH_BATCH_QKT_RESET` | **ON** | 事件批量 reset（290×append + 1×sync） | 逐事件 fallback reset（`reset_fallback` 计数升高） | 批量版更省 |
 | `UNITRACE_TS_INTERP` | **ON** | prepk 高频 GTS 摊销插值：thread_local 锚点（每线程每 device 单槽）+ 300µs 窗内 MONO_RAW 插值（PTI-336 忠实移植）；submit/replay 真读喂槽。**r3：速率首用自校准**（每线程每 device 一次性：双 GTS 对 ~1.5ms 间隔实测真实速率，32.32 定点）。timerResolution 字段仅作校准失败时的回退猜值——**字段单位由 props.stype 决定（unitrace 恒走 1_2 stype=Hz 形态），自校准对字段完全免疫** | 逐调用真 `zeDeviceGetGlobalTimestamps`（build9 形态） | collector CPU：prepk GTS **472→86µs/步**（6 worker 线程 × 每步 1 次重同步地板）、capture 尖刺步 **261→37ms**；ITL 中性（node3 −0.13%；node1 GPU0 正式臂 vt1 vs vt0 Mean −1.04% ±3% 内，82.5% GTS 事件走插值、pk_gts_us_med 降 4×）；保真度门全绿（负 duration=0、哨兵=0、err=0）；r3 额外收益：消除整数速率 +1672ppm 截断（node1 card2 实测校准速率 19.1986MHz 与 POC 逐位吻合） |
+| `UNITRACE_GRAPH_QKT_SHADOW_W` | **ON** | **BQ-S2 影子完成事件 W**（设计 `BQ_S2_DESIGN.md`）：每次成功 graph replay 在同 list in-stream append 1×signal(W)，armed read wait 集 {W} 替代 {307×E}，共享事件按设计保持 latched、reset batch 整体消除（557µs/步→0）。pop 时 QueryStatus 门（R7：陈旧 re-signal 自愈，destroy+recreate 另取）；乱序 list 不注入（mode-b 预防）；六计数器 w_pops/w_latched/w_inject_fail/w_degrade/w_released/w_abandoned（健康形态=pops==released==submissions、其余全 0） | =0 回 v4c 形态（reset batch 回归） | node3 税 +2.64%→**+1.4%**（38.43→37.8x）；node1 税 +4.0%→**+2.9~3.8%**（37.9x→37.55~37.88）；capture 代残差 reset 批一次性 551-683µs（登记偏差） |
 
 **build11 子开关**（默认值即出货形态）：
 
@@ -145,6 +146,7 @@ footer 前 flush 时序风险（详见 TSLOG_FIX 报告 §2）。
 | 开关 | 效果 |
 |---|---|
 | `UNITRACE_TEST_ALLOC_FAIL` | 强制每个 BATCHQKT 分配失败 → 验证优雅降级（预期 batches=0 + `qkt_skip_alloc_fail>0` + 无 fault） |
+| `UNITRACE_TEST_SHADOW_W_FAIL` | 强制每次 graph 提交的 W 注入"失败" → 端到端验证无 W 降级（arm 跳过、步走 v4b drain 读、w_inject_fail/w_degrade 计数升高、无 fault） |
 
 ### 2.5 launcher 侧
 
@@ -221,7 +223,10 @@ UNITRACE_GRAPH_BATCH_QKT=0 UNITRACE_GRAPH_QKT_AT_POLL=0 UNITRACE_DEFERRED_TS=0 <
 
 | 产物 | md5 | 位置 |
 |---|---|---|
-| **tsfix 源 ze_collector.h（build11r3 + tslog 写修复，出货候选）** | `9382952fce5567242aceed9243f0147b` | 本地树 + build11/tslogfix_src/ + git commit #4 |
+| **bqs2 源 ze_collector.h（build11r3 + tslog fix + BQ-S2 影子 W，出货候选）** | `fbee9b26360a7a00d0be09826c879e1a` | 本地树 + build11/tslogfix_src/ + git commit #5 |
+| **bqs2 源 ze_event_cache.h（+ReleaseAll teardown backstop）** | `ab293b3c195f3cc52dfc3988d792c393` | 同上 |
+| bqs2 lib（node1 编） | `5e3a243f…` | node1 bqs2_stage/bin/ + rg1s2/s2 各臂门实测 |
+| tsfix 源 ze_collector.h（build11r3 + tslog 写修复，被 bqs2 取代） | `9382952fce5567242aceed9243f0147b` | 本地树 + build11/tslogfix_src/ + git commit #4 |
 | **tsfix lib** | `782fd14ee9b6c46b9f5a981df067879c` | node1 tsfix_stage/bin/ + build11/m1fix_raw/ 记录 |
 | build11r3 源 ze_collector.h（TS_INTERP 定标版，被 tsfix 取代） | `0a6d1c2822dc6993a3d61cfa80a0bdf9` | 本地树 + build11/（备份 `ze_collector.h.pre_tsdiag`） |
 | build11r3 lib（icx 工具链） | `7a3a6b139f9a747203d4decff7019560` | 本地 build11/ + node1 容器 staging /root/staging_build11/ |
