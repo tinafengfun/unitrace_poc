@@ -113,6 +113,17 @@ footer 前 flush 时序风险（详见 TSLOG_FIX 报告 §2）。
 | `UNITRACE_TS_INTERP` | **ON** | prepk 高频 GTS 摊销插值：thread_local 锚点（每线程每 device 单槽）+ 300µs 窗内 MONO_RAW 插值（PTI-336 忠实移植）；submit/replay 真读喂槽。**r3：速率首用自校准**（每线程每 device 一次性：双 GTS 对 ~1.5ms 间隔实测真实速率，32.32 定点）。timerResolution 字段仅作校准失败时的回退猜值——**字段单位由 props.stype 决定（unitrace 恒走 1_2 stype=Hz 形态），自校准对字段完全免疫** | 逐调用真 `zeDeviceGetGlobalTimestamps`（build9 形态） | collector CPU：prepk GTS **472→86µs/步**（6 worker 线程 × 每步 1 次重同步地板）、capture 尖刺步 **261→37ms**；ITL 中性（node3 −0.13%；node1 GPU0 正式臂 vt1 vs vt0 Mean −1.04% ±3% 内，82.5% GTS 事件走插值、pk_gts_us_med 降 4×）；保真度门全绿（负 duration=0、哨兵=0、err=0）；r3 额外收益：消除整数速率 +1672ppm 截断（node1 card2 实测校准速率 19.1986MHz 与 POC 逐位吻合） |
 | `UNITRACE_GRAPH_QKT_SHADOW_W` | **ON** | **BQ-S2 影子完成事件 W**（设计 `BQ_S2_DESIGN.md`）：每次成功 graph replay 在同 list in-stream append 1×signal(W)，armed read wait 集 {W} 替代 {307×E}，共享事件按设计保持 latched、reset batch 整体消除（557µs/步→0）。pop 时 QueryStatus 门（R7：陈旧 re-signal 自愈，destroy+recreate 另取）；乱序 list 不注入（mode-b 预防）；六计数器 w_pops/w_latched/w_inject_fail/w_degrade/w_released/w_abandoned（健康形态=pops==released==submissions、其余全 0） | =0 回 v4c 形态（reset batch 回归） | node3 税 +2.64%→**+1.4%**（38.43→37.8x）；node1 税 +4.0%→**+2.9~3.8%**（37.9x→37.55~37.88）；capture 代残差 reset 批一次性 551-683µs（登记偏差） |
 
+**开销标注原则**（时间轴真实性的设计约定）：
+
+- **时间轴必须是真实的**：不从时间轴上把采集开销减掉——开销是真实发生的（node3 +1.4%、node1 +2.4%），减掉会造成异步 GPU 场景下的因果倒置（与已修复的错误代时间戳同风险类），且隐藏开销等于放弃自校验（reset batch 尖刺、cerr 爆量都是靠开销可见才发现的）。
+- **开销要可见、可归因、可过滤**：时间轴保持真实，「净耗时」通过查询字段提供，不通过篡改时间戳实现。分层：
+  - **A GPU kernel 时长**：设备时间戳，可信，不加不减。
+  - **B host API 切片**：被采集拉伸的部分以 args 标注——`collector_us`（本切片窗口内完全包含的 `unitrace.*` meta 子窗口之和，直接父归属、不重复计）与 `api_net_us`（切片总长 − collector_us）。有债才写字段，干净切片字节不变（META=0 仍字节等同）。
+  - **C 设备侧插入操作**：影子 W 刻意不 emit chrome op（对 kernel 时长统计正确）；设备侧标注轨道（UNITRACE_TRACE_META=2）是独立后续战役。
+  - **D 端到端**：trace 末尾一条 instant `unitrace.overhead_total` meta 记录（`collector_total_us` = 生命周期 meta 债累计、`meta_records_n`），meta 记录自身的开销不虚报（instant 不入窗口）。bench ITL 差值仍是外部端到端标尺。
+- **META=0 的定位是回归工具**，不是用户模式：META=0 下开销仍在（BQ 在跑）但无解释——那是最差状态；带 meta 的标准形态才是默认。
+- **最终目标是降开销**（BQ-S2 路线），标注只是让税可观测、可归因、可过滤。
+
 **build11 子开关**（默认值即出货形态）：
 
 | 开关 | 默认 | 说明 |

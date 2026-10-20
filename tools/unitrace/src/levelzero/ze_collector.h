@@ -1643,6 +1643,25 @@ class ZeCollector {
       metric_contexts_.clear();
     }
 
+    // D (overhead annotation): lifetime overhead summary as the trace's last
+    // meta record. Runs after all submissions are finalized (per-step debt
+    // has stopped flowing), so the totals are final. The emitting thread's
+    // thread-local buffer may already be gone (a teardown thread can have its
+    // buffer finalized by an earlier thread exit) -- MetaLoggingCallback's
+    // finalized-buffer fallback then writes the record directly to the trace
+    // logger, which is still open here (the chrome logger destructor, the
+    // bracket writer, runs after this in UniTracer's teardown). An instant, so
+    // it renders without a window and consumes no meta window in
+    // TakeContainedMetaDebtUs.
+    if (MetaOn()) {
+      const uint64_t mt = UniTimer::GetHostTimestamp();
+      MetaRecord("unitrace.overhead_total", mt, mt,
+                 "\"collector_total_us\": " +
+                     std::to_string(uni_meta_debt_total_us_.load(std::memory_order_relaxed)) +
+                 ", \"meta_records_n\": " +
+                     std::to_string(uni_meta_records_n_.load(std::memory_order_relaxed)));
+    }
+
     // T6'/E6: release the collector-owned immediate command list and staging
     // buffer. Runs after the tracer is destroyed and all submissions are
     // finalized, so these L0 calls cannot re-enter a live sweep.
@@ -4356,10 +4375,16 @@ class ZeCollector {
   inline void MetaRecord(const char* name, uint64_t mt0, uint64_t mt1,
                          const std::string& args, double counter_ms = -1.0) {
     if (MetaOn()) {
-      // Debt ledger: every meta slice feeds the per-step overhead counter.
-      if (mt1 > mt0) {
-        uni_meta_debt_us_.fetch_add((mt1 - mt0) / 1000, std::memory_order_relaxed);
+      // Debt ledger: every meta slice feeds the per-step overhead counter and
+      // the lifetime total (D: the trace carries its own collection-cost
+      // estimate; lifetime totals are loaded, never exchanged, so the
+      // per-step exchange in PrepareGraphExecution is unaffected).
+      const uint64_t debt_us = (mt1 > mt0) ? ((mt1 - mt0) / 1000) : 0;
+      if (debt_us > 0) {
+        uni_meta_debt_us_.fetch_add(debt_us, std::memory_order_relaxed);
+        uni_meta_debt_total_us_.fetch_add(debt_us, std::memory_order_relaxed);
       }
+      uni_meta_records_n_.fetch_add(1, std::memory_order_relaxed);
       mcallback_(name, mt0, mt1, args.c_str(), counter_ms);
     }
   }
@@ -4368,6 +4393,12 @@ class ZeCollector {
   // and the meta microseconds accumulated since the last step sample.
   std::atomic<uint64_t> uni_meta_step_{0};
   std::atomic<uint64_t> uni_meta_debt_us_{0};
+  // D (overhead annotation): lifetime meta-record count and debt total, fed
+  // from MetaRecord and rendered as the final "unitrace.overhead_total" meta
+  // record at teardown. The bench ITL delta remains the external end-to-end
+  // caliber; this is the in-trace, per-run attribution.
+  std::atomic<uint64_t> uni_meta_records_n_{0};
+  std::atomic<uint64_t> uni_meta_debt_total_us_{0};
 
   // TAX-OPT (enqueue-phase attribution): the exposed tax lives in the
   // urEnqueueGraphExp enqueue phase (node3 trim24L: 1.53ms/step in the device

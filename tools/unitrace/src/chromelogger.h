@@ -88,6 +88,11 @@ static std::shared_ptr<Logger> logger_ = nullptr;
 
 std::recursive_mutex logger_lock_; //lock to synchronize file write
 
+// T14/A5 r2: set once the closing brackets are written (ChromeLogger::Flush()
+// or the destructor) -- after this, a late meta record must not Log() directly
+// or it would land after the brackets and corrupt the JSON.
+static std::atomic<bool> chrome_json_closed_{false};
+
 static bool device_logging_no_thread_ = (utils::GetEnv("UNITRACE_ChromeNoThreadOnDevice") == "1") ? true : false;
 static bool device_logging_no_engine_ = (utils::GetEnv("UNITRACE_ChromeNoEngineOnDevice") == "1") ? true : false;
 
@@ -699,9 +704,14 @@ inline uint64_t HostProcessTrackUuid(uint32_t pid) {
 // uuid is constant for a buffer (pid/tid fixed), so the descriptor is emitted on
 // the first host event only, avoiding a global-locked MarkTrackEmitted probe per
 // event.
+// |collector_debt_us|: the unitrace.* meta child windows fully contained in
+// this slice (ZE buffers compute it via TakeContainedMetaDebtUs; buffers with
+// no meta plumbing pass 0). Emitted as annotations only when non-zero, so a
+// META=0 proto stays byte-identical.
 inline void PerfettoEmitHostEvent(HostEventRecord& rec, uint32_t pid, uint32_t tid,
                                   uint32_t seq_id, PendingFlows& pending,
-                                  bool& host_track_emitted) {
+                                  bool& host_track_emitted,
+                                  uint64_t collector_debt_us = 0) {
   // "HOST" marker keeps host uuids off device uuids; +mpi_rank scopes per rank.
   constexpr uint64_t kHostTrackMarker = 0x484f5354;
   uint64_t track_uuid = perfetto_emit::MakeUuid(pid, tid, kHostTrackMarker + mpi_rank);
@@ -783,6 +793,14 @@ inline void PerfettoEmitHostEvent(HostEventRecord& rec, uint32_t pid, uint32_t t
   // The JSON path emits a top-level "id" only when there are no args.
   if (!has_args) {
     opts.annotations.push_back(perfetto_emit::Annotation::Uint("id", rec.id_));
+  }
+
+  if (rec.type_ == EVENT_COMPLETE && collector_debt_us > 0) {
+    // T14/A5 r2 (review): same net-view fields as the JSON path -- the
+    // timeline stays real, the debt rides as queryable annotations.
+    opts.annotations.push_back(perfetto_emit::Annotation::Uint("collector_us", collector_debt_us));
+    opts.annotations.push_back(perfetto_emit::Annotation::Uint(
+        "api_net_us", static_cast<uint64_t>(UniTimer::GetTimeInUs(rec.end_time_ - rec.start_time_)) - collector_debt_us));
   }
 
   if (rec.type_ == EVENT_COMPLETE) {
@@ -1452,8 +1470,82 @@ class TraceBuffer {
     // (~6 per graph replay step), so the per-record string build is
     // irrelevant next to the work they measure.
     // -----------------------------------------------------------------------
+    // T14/A5 r2 (review): shared JSON-line builder, split out of
+    // EmitMetaRecord so the teardown fallback (MetaLoggingCallback's
+    // finalized-buffer branch) can build the identical line without buffer
+    // state. Static; tid/pid passed in (the fallback uses the current
+    // thread's). Emits the main record line and, when |counter_ms| >= 0, the
+    // ph=C debt-counter line after it.
+    static std::string MetaRecordJsonLine(const char* name, uint64_t start_ns,
+                                          uint64_t end_ns, const char* args_json,
+                                          double counter_ms, uint32_t tid, uint32_t pid) {
+      const bool instant = (end_ns <= start_ns);
+      std::string str = ",\n{";
+      str += "\"ph\": \"";
+      str += (instant ? "R" : "X");
+      str += "\"";
+      str += ", \"tid\": " + std::to_string(tid);
+      str += ", \"pid\": " + std::to_string(pid);
+      str += ", \"name\": \"" + std::string(name) + "\"";
+      str += ", \"cat\": \"unitrace_meta\"";
+      if (!instant) {
+        // cname is cosmetic (Perfetto slice colour: grey = "not app work");
+        // prefix + cat + nesting carry the semantics, this only helps the eye.
+        str += ", \"cname\": \"grey\"";
+      }
+      str += ", \"ts\": " + std::to_string(UniTimer::GetEpochTimeInUs(start_ns));
+      if (!instant) {
+        str += ", \"dur\": " + std::to_string(UniTimer::GetTimeInUs(end_ns - start_ns));
+      }
+      std::string str_args;
+      if (args_json != nullptr) {
+        str_args = args_json;
+      }
+      if (!instant && (std::strcmp(name, "unitrace.emit") == 0)) {
+        // The emit record reports how much of the burst the async emitter
+        // lost; the ring lives here, so the writer owns the number.
+        if (!str_args.empty()) {
+          str_args += ", ";
+        }
+        str_args += "\"dropped\": " +
+                    std::to_string(ChromeTraceEmitter::Get().DroppedCount());
+      }
+      if (!str_args.empty()) {
+        str += ", \"args\": {" + str_args + "}";
+      }
+      str += "}";
+      if (counter_ms >= 0.0) {
+        // BONUS: the debt curve. A separate ph=C record so Perfetto renders a
+        // counter track (its own lane) instead of overloading the slice args.
+        std::string cstr = ",\n{";
+        cstr += "\"ph\": \"C\"";
+        cstr += ", \"tid\": " + std::to_string(tid);
+        cstr += ", \"pid\": " + std::to_string(pid);
+        cstr += ", \"name\": \"unitrace_overhead_ms\"";
+        cstr += ", \"cat\": \"unitrace_meta\"";
+        cstr += ", \"ts\": " + std::to_string(UniTimer::GetEpochTimeInUs(start_ns));
+        cstr += ", \"args\": {\"unitrace_overhead_ms\": " + std::to_string(counter_ms) + "}";
+        cstr += "}";
+        str += cstr;
+      }
+      return str;
+    }
+
     void EmitMetaRecord(const char* name, uint64_t start_ns, uint64_t end_ns,
                         const char* args_json, double counter_ms) {
+      if (end_ns > start_ns) {
+        // T14/A5 r2 (review): register the window for host-slice debt
+        // attribution (TakeContainedMetaDebtUs). Capped so windows that never
+        // fall inside an API slice (completer-thread records) cannot grow the
+        // buffer unboundedly; the cap cannot drop a live window because a
+        // window is only buffered here on the same thread that renders the
+        // containing slices at flush time.
+        if (meta_windows_.size() >= 64) {
+          meta_windows_.erase(meta_windows_.begin());
+          meta_windows_dropped_++;
+        }
+        meta_windows_.push_back({start_ns, end_ns});
+      }
 #if BUILD_WITH_PERFETTO
       if (UseProtobufOutput()) {
         // Protobuf output cannot take JSON lines: emit TrackEvent packets
@@ -1487,58 +1579,8 @@ class TraceBuffer {
         return;
       }
 #endif /* BUILD_WITH_PERFETTO */
-      const bool instant = (end_ns <= start_ns);
-      const bool counter = (counter_ms >= 0.0);
-      std::string str = ",\n{";
-      str += "\"ph\": \"";
-      str += (instant ? "R" : "X");
-      str += "\"";
-      str += ", \"tid\": " + std::to_string(tid_);
-      str += ", \"pid\": " + std::to_string(pid_);
-      str += ", \"name\": \"" + std::string(name) + "\"";
-      str += ", \"cat\": \"unitrace_meta\"";
-      if (!instant) {
-        // cname is cosmetic (Perfetto slice colour: grey = "not app work");
-        // prefix + cat + nesting carry the semantics, this only helps the eye.
-        str += ", \"cname\": \"grey\"";
-      }
-      str += ", \"ts\": " + std::to_string(UniTimer::GetEpochTimeInUs(start_ns));
-      if (!instant) {
-        str += ", \"dur\": " + std::to_string(UniTimer::GetTimeInUs(end_ns - start_ns));
-      }
-      std::string str_args;
-      if (args_json != nullptr) {
-        str_args = args_json;
-      }
-      if (!instant && (std::strcmp(name, "unitrace.emit") == 0)) {
-        // The emit record reports how much of the burst the async emitter
-        // lost; the ring lives here, so the writer owns the number.
-        if (!str_args.empty()) {
-          str_args += ", ";
-        }
-        str_args += "\"dropped\": " +
-                    std::to_string(ChromeTraceEmitter::Get().DroppedCount());
-      }
-      if (!str_args.empty()) {
-        str += ", \"args\": {" + str_args + "}";
-      }
-      str += "}";
-      meta_records_.push_back(std::move(str));
-
-      if (counter) {
-        // BONUS: the debt curve. A separate ph=C record so Perfetto renders a
-        // counter track (its own lane) instead of overloading the slice args.
-        std::string cstr = ",\n{";
-        cstr += "\"ph\": \"C\"";
-        cstr += ", \"tid\": " + std::to_string(tid_);
-        cstr += ", \"pid\": " + std::to_string(pid_);
-        cstr += ", \"name\": \"unitrace_overhead_ms\"";
-        cstr += ", \"cat\": \"unitrace_meta\"";
-        cstr += ", \"ts\": " + std::to_string(UniTimer::GetEpochTimeInUs(start_ns));
-        cstr += ", \"args\": {\"unitrace_overhead_ms\": " + std::to_string(counter_ms) + "}";
-        cstr += "}";
-        meta_records_.push_back(std::move(cstr));
-      }
+      meta_records_.push_back(MetaRecordJsonLine(name, start_ns, end_ns,
+                                                 args_json, counter_ms, tid_, pid_));
     }
 
     // File-write half: called by Finalize(), by the destructor and by
@@ -1742,6 +1784,24 @@ class TraceBuffer {
 #endif /* BUILD_WITH_OMP */
       }
 
+      if (rec.type_ == EVENT_COMPLETE && TraceMetaEnabled()) {
+        // T14/A5 r2 (review): the net view as queryable fields, not a rewritten
+        // timeline -- collector_us = the unitrace.* meta child windows fully
+        // contained in this slice (TakeContainedMetaDebtUs, direct-parent
+        // semantics), api_net_us = the remainder. Emitted only when there is
+        // debt, so clean slices keep their exact bytes (META=0 stays
+        // byte-identical).
+        const uint64_t collector_us = TakeContainedMetaDebtUs(rec.start_time_, rec.end_time_);
+        if (collector_us > 0) {
+          const uint64_t slice_us = UniTimer::GetTimeInUs(rec.end_time_ - rec.start_time_);
+          if (!str_args.empty()) {
+            str_args += ", ";
+          }
+          str_args += "\"collector_us\": " + std::to_string(collector_us);
+          str_args += ", \"api_net_us\": " + std::to_string(slice_us - collector_us);
+        }
+      }
+
       if (!str_args.empty()) {
         str += ", \"args\": {" + str_args + "}";
       } else {
@@ -1813,7 +1873,7 @@ class TraceBuffer {
     // T5/E7b: the original emission path, kept verbatim (see SyncFlushDeviceEvent).
     void SyncFlushHostEvent(HostEventRecord& rec) {
 #if BUILD_WITH_PERFETTO
-      if (UseProtobufOutput()) { PerfettoEmitHostEvent(rec, pid_, tid_, seq_id_, pending_flows_, host_track_emitted_); return; }
+      if (UseProtobufOutput()) { PerfettoEmitHostEvent(rec, pid_, tid_, seq_id_, pending_flows_, host_track_emitted_, TakeContainedMetaDebtUs(rec.start_time_, rec.end_time_)); return; }
 #endif /* BUILD_WITH_PERFETTO */
       logger_->Log(StringifyHostEvent(rec));
     }
@@ -1903,6 +1963,35 @@ class TraceBuffer {
     // beside the host/device records of this thread and written by
     // FlushMetaRecords under the same locks and in the same teardown pass.
     std::vector<std::string> meta_records_;
+    // T14/A5 r2 (review): meta windows for host-slice debt attribution --
+    // every non-instant unitrace_meta record registers its [start,end) here,
+    // and a flushed host EVENT_COMPLETE slice consumes the windows it fully
+    // contains as collector_us (see TakeContainedMetaDebtUs). Bounded:
+    // windows no API slice ever contains (completer-thread records) are
+    // dropped oldest-first, counted.
+    std::vector<std::pair<uint64_t, uint64_t>> meta_windows_;
+    size_t meta_windows_dropped_ = 0;
+
+    // Sums the meta windows fully contained in [start_ns, end_ns) and erases
+    // them, so the direct parent slice (the first one rendered that contains
+    // the window) takes the debt and enclosing slices do not double count.
+    uint64_t TakeContainedMetaDebtUs(uint64_t start_ns, uint64_t end_ns) {
+      if (meta_windows_.empty() || end_ns <= start_ns) {
+        return 0;
+      }
+      uint64_t debt_ns = 0;
+      size_t w = 0;
+      for (size_t i = 0; i < meta_windows_.size(); i++) {
+        if (meta_windows_[i].first >= start_ns && meta_windows_[i].second <= end_ns) {
+          debt_ns += meta_windows_[i].second - meta_windows_[i].first;
+        } else {
+          meta_windows_[w++] = meta_windows_[i];
+        }
+      }
+      meta_windows_.resize(w);
+      return debt_ns / 1000;
+    }
+
     // device event timestampes cached are <device, engine_ordinal, engine_index> specific
     std::map<std::tuple<ze_device_handle_t, uint32_t, uint32_t>, std::vector<std::set<std::pair<uint64_t, uint64_t>, DeviceTimestampComparator>>> recent_device_timestamps_;
     bool flush_immediately_;
@@ -2661,6 +2750,7 @@ class ChromeLogger {
           if (!UseProtobufOutput() && !logger_->IsEmpty()) {
             logger_->Log("\n]\n}\n");
             logger_->Flush();
+            chrome_json_closed_.store(true, std::memory_order_release);
           }
           flushed_ = true;
         }
@@ -2741,6 +2831,7 @@ class ChromeLogger {
           }
           logger_->Log("\n]\n}\n");
           logger_->Flush();
+          chrome_json_closed_.store(true, std::memory_order_release);
         }
         flushed_ = true;
       }
@@ -2918,6 +3009,23 @@ class ChromeLogger {
         return;
       }
       if (thread_local_buffer_.IsFinalized()) {
+        // The owning thread already exited: its thread_local buffer destructed
+        // (finalized + flushed + erased), so a record fired on a teardown
+        // thread -- e.g. the D "unitrace.overhead_total" instant -- would
+        // silently vanish here. Same trap as unitrace.final_flush, which
+        // cannot ride the buffers it is about to drain. JSON mode writes the
+        // identical line directly to the trace logger under the same lock the
+        // buffer flushes use; valid while the file is still open (teardown
+        // ordering puts the chrome logger destructor -- the bracket writer --
+        // after every collector teardown step). Protobuf mode keeps the drop:
+        // the stream is sequenced per writer thread, a late packet has none.
+        if (UseProtobufOutput() || logger_ == nullptr || chrome_json_closed_.load(std::memory_order_acquire)) {
+          return;
+        }
+        std::string str = TraceBuffer::MetaRecordJsonLine(
+            name, start_ns, end_ns, args_json, counter_ms, utils::GetTid(), utils::GetPid());
+        std::lock_guard<std::recursive_mutex> lock(logger_lock_);
+        logger_->Log(str);
         return;
       }
       thread_local_buffer_.EmitMetaRecord(name, start_ns, end_ns, args_json, counter_ms);
