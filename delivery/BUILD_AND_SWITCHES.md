@@ -15,29 +15,29 @@
 
 ### 1.1 推荐路径：cri2 容器构建（与全部已验证产物同链路）
 
-构建机 = <build-host> (tfeng@<build-host>, sudo 密码 <pwd>)，容器 `tf_unitrace_v4c2`
+构建机 = <build-host> (<user>@<build-host>, sudo 密码见内部凭据台账（不入库）)，容器 `tf_unitrace_v4c2`
 内做 fresh configure（cmake 4.x 绝不复用陈旧 build 目录）：
 
 ```bash
 # ① 源文件 scp 到 cri2，再 docker cp 进容器源树
 scp tools/unitrace/src/levelzero/ze_collector.h \
-    tfeng@<build-host>:/mnt/disk3/home/tfeng/staging_ze_collector_buildN.h
-ssh tfeng@<build-host>
-sudo docker cp /mnt/disk3/home/tfeng/staging_ze_collector_buildN.h \
-    tf_unitrace_v4c2:/mnt/disk3/home/tfeng/unitrace_sdk_v4c2/unitrace_sdk/tools/unitrace/src/levelzero/ze_collector.h
+    <user>@<build-host>:/mnt/disk3/home/<user>/staging_ze_collector_buildN.h
+ssh <user>@<build-host>
+sudo docker cp /mnt/disk3/home/<user>/staging_ze_collector_buildN.h \
+    tf_unitrace_v4c2:/mnt/disk3/home/<user>/unitrace_sdk_v4c2/unitrace_sdk/tools/unitrace/src/levelzero/ze_collector.h
 
 # ② 容器内 fresh configure + ninja（必须 bash -lc 登录 shell，ninja 在 oneAPI env 里）
 sudo docker exec tf_unitrace_v4c2 bash -lc \
- "SDK=/mnt/disk3/home/tfeng/unitrace_sdk_v4c2/unitrace_sdk; B=\$SDK/tools/unitrace/build; \
+ "SDK=/mnt/disk3/home/<user>/unitrace_sdk_v4c2/unitrace_sdk; B=\$SDK/tools/unitrace/build; \
   cd \$B && rm -rf CMakeCache.txt CMakeFiles && \
   cmake .. -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo > cmake_config.log 2>&1 && \
   ninja unitrace unitrace_tool > make.log 2>&1; echo rc=\$?; \
   md5sum \$B/unitrace \$B/libunitrace_tool.so"
 
 # ③ 取出产物（docker cp 出来再 scp；docker cp 出的文件需 sudo chmod 644）
-sudo docker cp tf_unitrace_v4c2:$B/libunitrace_tool.so /mnt/disk3/home/tfeng/staging_lib_buildN.so
-sudo chmod 644 /mnt/disk3/home/tfeng/staging_lib_buildN.so
-scp tfeng@<build-host>:/mnt/disk3/home/tfeng/staging_lib_buildN.so <目标机 staging>/buildN/
+sudo docker cp tf_unitrace_v4c2:$B/libunitrace_tool.so /mnt/disk3/home/<user>/staging_lib_buildN.so
+sudo chmod 644 /mnt/disk3/home/<user>/staging_lib_buildN.so
+scp <user>@<build-host>:/mnt/disk3/home/<user>/staging_lib_buildN.so <目标机 staging>/buildN/
 ```
 
 参考脚本：`poc_scripts/build/build_c2.sh`（含 strings 自检：`qkt_at_poll`/`GRAPH_BATCH_QKT` 计数 ≥1）。

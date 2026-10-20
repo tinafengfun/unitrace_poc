@@ -315,7 +315,7 @@ kspin.cl、kspin_bmg.spv、bq_s2_poc_run.log md5 ba8664b8；node3 侧 /tmp/bqs2/
 - `build11/ze_event_cache.78c7c0e_to_bqs2.diff`（+ReleaseAll；20478073 → ab293b3c）
 
 **实施源树**
-- node1：`/mnt/disk3/home/tfeng/unitrace/src/unitrace_src/tools/unitrace/src/levelzero/`
+- node1：`/mnt/disk3/home/<user>/unitrace/src/unitrace_src/tools/unitrace/src/levelzero/`
   （W 版现役；原基线备份 `*.78c7c0e_bak` 同目录）
 - 本地：`build11/tslogfix_src/src/levelzero/`（同 md5 双写）
 - node1 build 产物：`build11r3/bin/` lib `5e3a243f` + launcher `50a3810f`（pins.env）
@@ -433,7 +433,7 @@ unexplained 为字面变差停止项，如实上报待裁决（不自行补跑�
 ② **bare 臂 "footer=0" 假 FAIL**：runner_bq_node3.sh 的 bare 分支 footer 计数查
   `python*.json`，bare 无 unitrace 永远 0（历史 PASS 都来自 phase 脚本）。bqs2 runner
   已改为 ut 臂才查 footer。
-③ **node1 build（tfeng_build11r3, icx 2026.x）产物只用于 node1**；node3 验证链每代
+③ **node1 build（<user>_build11r3, icx 2026.x）产物只用于 node1**；node3 验证链每代
   lib 都是 cri2（tf_unitrace_v4c2, icx 2026.3.0）build 的（本战役 BQ-S2 lib 亦为
   node1 build，node3 probe 现已验证可加载——前述"node1 build 不能上 node3"是踩坑①
   的误判，已撤回）。

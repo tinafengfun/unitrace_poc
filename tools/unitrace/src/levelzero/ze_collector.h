@@ -3387,7 +3387,7 @@ class ZeCollector {
           " host_start=%" PRIu64 " host_end=%" PRIu64 "\n",
           command->instance_id_, device_start, device_end, device_submit_time,
           time_shift, duration, start, end);
-      TsDiagWrite(buf, static_cast<size_t>(len));
+      TsDiagWrite(buf, TsDiagClamp(len, sizeof(buf)));
     }
   }
 
@@ -3833,7 +3833,14 @@ class ZeCollector {
     if (command->graph_command_ && command->event_ != nullptr &&
         EventHistoryConsumePending(command->event_)) {
       if (BatchQktResetBatchActive()) {
-        EventHistoryDeferGraphEventReset(command->context_, command->event_);
+        // BQ-S2 (review, design §13): under the shadow-W mode the shared
+        // events stay latched by design and nothing waits on them (the armed
+        // read waits on the W's; the degraded drain read host-syncs without
+        // waiting) -- skipping the reset here removes the residual
+        // capture-generation reset batch, making reset_batches strictly 0.
+        if (!BatchQktShadowWActive()) {
+          EventHistoryDeferGraphEventReset(command->context_, command->event_);
+        }
       }
       else {
         event_cache_.ResetEvent(command->event_);
@@ -4263,6 +4270,16 @@ class ZeCollector {
     std::lock_guard<std::mutex> lock(uni_ts_diag_mutex);
     std::fwrite(buf, 1, len, stderr);
   }
+  // HARDEN (review): clamp an snprintf result to its buffer. The return value
+  // is the UNTRUNCATED length when the output did not fit (> cap -> fwrite
+  // would read past the stack buffer) and negative on an encoding error
+  // (negative -> size_t wraps huge). Either must never reach fwrite as-is.
+  static size_t TsDiagClamp(int len, size_t cap) {
+    if (len < 0) {
+      return 0;
+    }
+    return (static_cast<size_t>(len) < cap) ? static_cast<size_t>(len) : cap - 1;
+  }
   // Cached gate: the legacy sites called std::getenv per command.
   static bool TsDiagEnabled(void) {
     static const bool enabled = (std::getenv("UNITRACE_DEBUG_TS") != nullptr);
@@ -4392,6 +4409,13 @@ class ZeCollector {
   // anchor (expect ~35/step), gts_err_n counts GTS failures (expect 0).
   std::atomic<uint64_t> uni_pk_interp_n_{0};   // timestamps interpolated from the sync anchor
   std::atomic<uint64_t> uni_pk_gts_err_n_{0};  // zeDeviceGetGlobalTimestamps failures
+  // Records LOST to "GTS failed with no usable anchor": the append is skipped
+  // (instrument_ = false), so no record is ever produced for it. The popped
+  // signal_event (if any) was already handed to the caller and will be
+  // signaled by the append -- it is never read or released, so the event pool
+  // shrinks by one per occurrence (bounded by this counter; the event is
+  // never handed out again while latched, so there is no stale-latch hazard).
+  std::atomic<uint64_t> uni_pk_gts_lost_n_{0};
 
   // TAX-OPT drain2 (sub-drain attribution): the drain itself is 1.41ms/step
   // on node3 while its known tenants (reset batch ~0.51, qkt read ~0.37) leave
@@ -4487,6 +4511,7 @@ class ZeCollector {
     // (POC residual 10^4~10^6 ticks). Kept only for the fallback guess and
     // diagnostics; the rate actually used is MEASURED on-device (rate_q32_).
     uint64_t timer_freq_hz_;
+    uint64_t timer_mask_;             // device_timer_mask_ (kernelTimestampValidBits): masks calibration deltas against counter wrap
     uint64_t cpu_ts_;                 // anchor host time, MONO_RAW ns (same domain as GTS host time)
     uint64_t gpu_ts_;                 // anchor device time, raw ticks (unmasked; consumers mask)
     uint64_t delta_;
@@ -4499,7 +4524,7 @@ class ZeCollector {
     // the static thread_local slot below is declared inside its enclosing
     // class, and nested-class NSDMIs are not usable there.
     UniTsAnchor()
-        : device_(nullptr), timer_freq_hz_(0), cpu_ts_(0), gpu_ts_(0),
+        : device_(nullptr), timer_freq_hz_(0), timer_mask_(0), cpu_ts_(0), gpu_ts_(0),
           delta_(kSyncDeltaDefault), ns_per_tick_(0), rate_q32_(0),
           calibrated_(false), calib_done_(false), valid_(false) {}
   };
@@ -4615,6 +4640,7 @@ class ZeCollector {
         auto it = devices_->find(device);
         if (it != devices_->end()) {
           slot.timer_freq_hz_ = it->second.device_timer_frequency_;
+          slot.timer_mask_ = it->second.device_timer_mask_;
         }
       }
       devices_mutex_.unlock_shared();
@@ -4635,6 +4661,14 @@ class ZeCollector {
         }
         return;
       }
+      // NOTE (review): this ~1.5ms spin runs once per thread per device on the
+      // submit path (PrepareToAppendKernelCommand <- the append intercepts),
+      // which holds the submission lock SHARED -- the first submit of every
+      // thread therefore stalls the exclusive drain for up to ~1.5ms. Bounded
+      // (one-shot), already included in the measured tax (+2.4% bench);
+      // deliberately NOT moved to device init -- the anchor logic stays
+      // self-contained and the one-shot cost keeps its lazily-measured
+      // accuracy (a device-init calibration would measure an idle clock).
       const uint64_t spin_until = UniTimer::GetHostTimestamp() + UniTsAnchor::kCalibrationSpinNs;
       while (UniTimer::GetHostTimestamp() < spin_until) {
         // busy-wait the calibration window (~1.5ms, once per thread/device)
@@ -4647,8 +4681,16 @@ class ZeCollector {
         st = ZE_FUNC(zeDeviceGetGlobalTimestamps)(device, &host2, &dev2);
         if (st == ZE_RESULT_SUCCESS) {
           const uint64_t ns_delta = host2 - host_ts;
-          const uint64_t ticks_delta = dev2 - device_ts;
-          if (ns_delta > 0 && ticks_delta > 0) {
+          // HARDEN (review): mask the tick delta with the device's timestamp
+          // width -- a counter wrap inside the ~1.5ms window would otherwise
+          // produce a garbage rate. A wrap-in-window delta is still correct
+          // after masking (real deltas stay far below half the counter
+          // width); anything wider fails the sanity bound below and falls
+          // back to the field guess.
+          const uint64_t ticks_delta = (dev2 - device_ts) & slot.timer_mask_;
+          // Sanity bound: real device clocks are < 8 ticks/ns (8GHz); a wider
+          // delta means wrap garbage -- treat the pair as unusable.
+          if (ns_delta > 0 && ticks_delta > 0 && ticks_delta <= ns_delta * 8ull) {
             // 32.32 fixed point ticks/ns (POC --tickmode=fixed): kills the
             // integer-rate truncation error (+1672ppm measured on the
             // ns/tick-shape driver); POC residual p99=104ns (quantization
@@ -4676,6 +4718,17 @@ class ZeCollector {
           slot.ns_per_tick_ = 1000000000ull / slot.timer_freq_hz_;  // integer, PTI same form
         } else {
           slot.ns_per_tick_ = slot.timer_freq_hz_;
+        }
+        // HARDEN (review): a >=1GHz field guess rounds 1e9/v down to 0 --
+        // interpolating through it would divide by zero and crash. Drop the
+        // anchor (valid_ stays false) and stay on the bare-GTS path, the same
+        // shape as the no-descriptor case above. (UniTsLogCalibFallbackOnce
+        // may already have fired for the underlying failure; this call only
+        // adds the reason when it is the first.)
+        if (slot.ns_per_tick_ == 0) {
+          UniTsLogCalibFallbackOnce(device, slot.timer_freq_hz_,
+                                    "field guess rounds to zero ns/tick", st);
+          return;
         }
       }
     }
@@ -4732,7 +4785,10 @@ class ZeCollector {
       if (status == ZE_RESULT_SUCCESS) {
         const uint64_t age_ns = (slot.device_ == device && slot.valid_) ? (now0 - slot.cpu_ts_) : 0;
         if (slot.device_ == device && slot.valid_ &&
-            device_ts < slot.gpu_ts_ - UniTsAnchor::kThresholdForMissync) {
+            // HARDEN (review): underflow-safe form -- "gpu_ts_ - threshold"
+            // wraps huge when gpu_ts_ < 1500 and would flag any device_ts as
+            // a missync; adding the threshold instead cannot underflow.
+            device_ts + UniTsAnchor::kThresholdForMissync < slot.gpu_ts_) {
           UniTsLogMissyncOnce(slot.gpu_ts_, device_ts);
         }
         // May run the one-shot rate calibration (~1.5ms spin) on first use.
@@ -4774,6 +4830,8 @@ class ZeCollector {
         *device_time = UniTsInterpDeviceTime(slot, now);
         return ZE_RESULT_SUCCESS;
       }
+      // HARDEN (review): this record is lost (see uni_pk_gts_lost_n_).
+      collector->uni_pk_gts_lost_n_.fetch_add(1, std::memory_order_relaxed);
       return status;  // never had a pair: caller skips this append
     }
 
@@ -5031,12 +5089,31 @@ class ZeCollector {
     return found;
   }
 
+  // HARDEN (review, r2): lock-free read of the dead-context slots (see the
+  // member declaration for the shape). Safe from any thread, with or without
+  // uni_batchqkt_mutex_ held: no lock, no RMW; the acquire-load of the
+  // published count makes the slot stores visible and bounds the scan.
+  bool BatchQktContextDead(ze_context_handle_t context) {
+    if (uni_batchqkt_dead_overflow_.load(std::memory_order_acquire)) {
+      // Overflow: safe side -- every context is treated as dead, BATCHQKT
+      // degrades to the legacy per-event path (never serve a recycled handle).
+      return true;
+    }
+    const size_t n = uni_batchqkt_dead_n_.load(std::memory_order_acquire);
+    for (size_t i = 0; i < n; i++) {
+      if (uni_batchqkt_dead_ctx_[i].load(std::memory_order_relaxed) == context) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   // Collector-owned persistent immediate command list, lazily created per
   // context. A nullptr entry means creation failed: permanently fall back to
   // the legacy per-event path for that context (no retry storm, one line).
   ze_command_list_handle_t BatchQktEnsureImmList(ze_context_handle_t context, ze_device_handle_t device) {
     // HARDEN: a destroyed context's handle value is never trusted again.
-    if (uni_batchqkt_dead_contexts_.count(context) != 0) {
+    if (BatchQktContextDead(context)) {
       BatchQktNoteDeadContext();
       return nullptr;
     }
@@ -5084,7 +5161,7 @@ class ZeCollector {
   ze_command_list_handle_t BatchQktEnsurePollList(ze_context_handle_t context,
                                                   ze_device_handle_t device) {
     // HARDEN: a destroyed context's handle value is never trusted again.
-    if (uni_batchqkt_dead_contexts_.count(context) != 0) {
+    if (BatchQktContextDead(context)) {
       BatchQktNoteDeadContext();
       return nullptr;
     }
@@ -5138,7 +5215,7 @@ class ZeCollector {
     // HARDEN: a destroyed context's handle value is never trusted again (its
     // host allocations died with the context; serving them to a recycled
     // handle would hand the device a dangling dst).
-    if (uni_batchqkt_dead_contexts_.count(context) != 0) {
+    if (BatchQktContextDead(context)) {
       BatchQktNoteDeadContext();
       return nullptr;
     }
@@ -5289,6 +5366,11 @@ class ZeCollector {
       return false;
     }
 
+    // LOCK BOUNDARY (review): every early return above called the self-locking
+    // BatchQktReleaseShadowWs; from this line on uni_batchqkt_mutex_ is HELD
+    // and only the ...Locked variants (which assume the caller's lock) may be
+    // used. Do not call the self-locking wrapper below this line -- std::mutex
+    // is not recursive, that would self-deadlock.
     std::lock_guard<std::mutex> lk(uni_batchqkt_mutex_);
     ze_command_list_handle_t imm = BatchQktEnsureImmList(context, device);
     void *dst = (imm != nullptr) ? BatchQktEnsureBuffer(context, n * sizeof(ze_kernel_timestamp_result_t)) : nullptr;
@@ -5357,7 +5439,7 @@ class ZeCollector {
       int len = std::snprintf(buf, sizeof(buf),
           "[BATCHQKT] n=%" PRIu64 " batch_us=%" PRIu64 "\n",
           static_cast<uint64_t>(n), batch_us);
-      TsDiagWrite(buf, static_cast<size_t>(len));
+      TsDiagWrite(buf, TsDiagClamp(len, sizeof(buf)));
     }
     return true;
   }
@@ -5673,7 +5755,7 @@ class ZeCollector {
       int len = std::snprintf(buf, sizeof(buf),
           "[BATCHQKT] n=%" PRIu64 " poll_read_us=%" PRIu64 "\n",
           static_cast<uint64_t>(n), batch_us);
-      TsDiagWrite(buf, static_cast<size_t>(len));
+      TsDiagWrite(buf, TsDiagClamp(len, sizeof(buf)));
     }
     // BQ-S2: the read resolved (the wait on the shadow W's completed), so the
     // W's are done — host-destroy/recreate them back into the pool.
@@ -5819,7 +5901,7 @@ class ZeCollector {
   // another; two strikes in a row gives up on this submission (the step then
   // degrades to the v4b drain read, counted).
   ze_event_handle_t BatchQktGetShadowW(ze_context_handle_t context) {
-    if (uni_batchqkt_dead_contexts_.count(context) != 0) {
+    if (BatchQktContextDead(context)) {
       return nullptr;
     }
     for (int tries = 0; tries < 2; tries++) {
@@ -5906,7 +5988,7 @@ class ZeCollector {
       shadow_w_cache_.ReleaseEvent(w);
       uni_batchqkt_w_inject_fail_.fetch_add(1, std::memory_order_relaxed);
       uni_batchqkt_w_degrade_.fetch_add(1, std::memory_order_relaxed);
-      if (!uni_batchqkt_notice_pollappend_.exchange(true, std::memory_order_relaxed) &&
+      if (!uni_batchqkt_notice_w_append_.exchange(true, std::memory_order_relaxed) &&
           BatchQktDiagEnabled()) {
         std::cerr << "[BATCHQKT] shadow W signal append failed (status=0x" << std::hex << status
                   << std::dec << "), this step degrades to the drain read" << std::endl;
@@ -5914,7 +5996,7 @@ class ZeCollector {
       return;
     }
     std::lock_guard<std::mutex> lk(uni_batchqkt_mutex_);
-    if (uni_batchqkt_dead_contexts_.count(context) != 0) {
+    if (BatchQktContextDead(context)) {
       // The context died between the successful graph append and this push
       // (another thread's teardown released the W's and marked the handle
       // dead): abandon the W — never push a dead context's event into the
@@ -6017,8 +6099,13 @@ class ZeCollector {
   }
 
   // Public release: idempotent, callable from any sweep/teardown thread.
+  // HARDEN (review): no lock-free early return on pending_ws_.empty() -- the
+  // vector is written under uni_batchqkt_mutex_ by other threads, so even an
+  // empty() read outside the lock is a data race. The Locked callee re-checks
+  // emptiness under the lock; the only cost is a mutex acquire on the error
+  // paths that reach here.
   void BatchQktReleaseShadowWs(ze_context_handle_t context, bool device_ok) {
-    if (context == nullptr || uni_batchqkt_pending_ws_.empty()) {
+    if (context == nullptr) {
       return;
     }
     std::lock_guard<std::mutex> lk(uni_batchqkt_mutex_);
@@ -6442,7 +6529,29 @@ class ZeCollector {
     shadow_w_cache_.ReleaseContext(context);
     // Remember the handle value as dead: never create/serve resources for it
     // again, even if L0 hands a NEW context out at the same address.
-    uni_batchqkt_dead_contexts_.insert(context);
+    {
+      // HARDEN (review, r2): lock-free dead-marking (see the member
+      // declaration). Writers are serialized by uni_batchqkt_mutex_ (both
+      // sites hold it), so slot n is untouched and the CAS cannot fail; a
+      // failure would mean that invariant broke -- fall to the overflow
+      // (safe) side rather than trusting a corrupt state.
+      const size_t n = uni_batchqkt_dead_n_.load(std::memory_order_relaxed);
+      bool placed = false;
+      if (n < kBatchQktDeadSlots) {
+        ze_context_handle_t expect = nullptr;
+        placed = uni_batchqkt_dead_ctx_[n].compare_exchange_strong(
+            expect, context, std::memory_order_release, std::memory_order_relaxed);
+      }
+      if (placed) {
+        uni_batchqkt_dead_n_.store(n + 1, std::memory_order_release);
+      }
+      else {
+        uni_batchqkt_dead_overflow_.store(true, std::memory_order_release);
+        std::cerr << "[BATCHQKT] dead-context slots exhausted (" << kBatchQktDeadSlots
+                  << " destroyed contexts) -- BATCHQKT degrades to the legacy per-event path"
+                  << std::endl;
+      }
+    }
     uni_batchqkt_ctx_releases_.fetch_add(1, std::memory_order_relaxed);
     std::cerr << "[BATCHQKT] context 0x" << std::hex << context << std::dec
               << " released: " << freed << " list/buffer resources freed";
@@ -6485,7 +6594,29 @@ class ZeCollector {
     uni_batchqkt_buf_caps_.erase(context);
     uni_batchqkt_poll_bufs_.erase(context);
     uni_batchqkt_poll_buf_caps_.erase(context);
-    uni_batchqkt_dead_contexts_.insert(context);
+    {
+      // HARDEN (review, r2): lock-free dead-marking (see the member
+      // declaration). Writers are serialized by uni_batchqkt_mutex_ (both
+      // sites hold it), so slot n is untouched and the CAS cannot fail; a
+      // failure would mean that invariant broke -- fall to the overflow
+      // (safe) side rather than trusting a corrupt state.
+      const size_t n = uni_batchqkt_dead_n_.load(std::memory_order_relaxed);
+      bool placed = false;
+      if (n < kBatchQktDeadSlots) {
+        ze_context_handle_t expect = nullptr;
+        placed = uni_batchqkt_dead_ctx_[n].compare_exchange_strong(
+            expect, context, std::memory_order_release, std::memory_order_relaxed);
+      }
+      if (placed) {
+        uni_batchqkt_dead_n_.store(n + 1, std::memory_order_release);
+      }
+      else {
+        uni_batchqkt_dead_overflow_.store(true, std::memory_order_release);
+        std::cerr << "[BATCHQKT] dead-context slots exhausted (" << kBatchQktDeadSlots
+                  << " destroyed contexts) -- BATCHQKT degrades to the legacy per-event path"
+                  << std::endl;
+      }
+    }
   }
 
   // Releases the collector-owned batch resources. Called at the end of
@@ -6546,6 +6677,9 @@ class ZeCollector {
     // contexts), then destroy every shadow W pool/event the cache still owns.
     // Best effort: the contexts may be gone; a failed destroy carries its own
     // [WARNING] and ReleaseAll drops the tracking either way.
+    // (review) uni_batchqkt_mutex_ is HELD here -- taken at the top of
+    // ReleaseBatchQktResources; this is also single-threaded by construction
+    // (finalize runs after the tracer is gone and every sweep has returned).
     for (auto &entry : uni_batchqkt_pending_ws_) {
       uni_batchqkt_ws_to_free_.push_back(entry.second);
     }
@@ -6683,7 +6817,7 @@ class ZeCollector {
               timestamp.global.kernelStart, timestamp.global.kernelEnd,
               command->submit_time_, command->submit_time_device_,
               command->device_timer_frequency_, command->device_timer_mask_);
-          TsDiagWrite(buf, static_cast<size_t>(len));
+          TsDiagWrite(buf, TsDiagClamp(len, sizeof(buf)));
         }
       }
     }
@@ -6703,7 +6837,7 @@ class ZeCollector {
             static_cast<int>(command->graph_command_),
             command->submit_time_device_, timestamp.global.kernelStart,
             timestamp.global.kernelEnd);
-        TsDiagWrite(buf, static_cast<size_t>(len));
+        TsDiagWrite(buf, TsDiagClamp(len, sizeof(buf)));
       }
     }
     else {
@@ -6814,7 +6948,12 @@ class ZeCollector {
         // clone staging loop re-signals it; the gate off keeps the inline
         // reset below byte-identical.
         if (command->graph_command_ && BatchQktResetBatchActive()) {
-          EventHistoryDeferGraphEventReset(command->context_, command->event_);
+          // BQ-S2 (review, design §13): W mode -- the shared events stay
+          // latched by design, no reset, no residual capture-generation
+          // batch (same reasoning as ReleaseGraphCommandEvent).
+          if (!BatchQktShadowWActive()) {
+            EventHistoryDeferGraphEventReset(command->context_, command->event_);
+          }
         }
         else {
           event_cache_.ResetEvent(command->event_);
@@ -9002,6 +9141,7 @@ class ZeCollector {
                  ", \"pk_gts_n\": " + std::to_string(uni_pk_gts_n_.exchange(0, std::memory_order_relaxed)) +
                  ", \"pk_interp_n\": " + std::to_string(uni_pk_interp_n_.exchange(0, std::memory_order_relaxed)) +
                  ", \"pk_gts_err_n\": " + std::to_string(uni_pk_gts_err_n_.exchange(0, std::memory_order_relaxed)) +
+                 ", \"pk_gts_lost_n\": " + std::to_string(uni_pk_gts_lost_n_.exchange(0, std::memory_order_relaxed)) +
                  ", \"d_flush1_us\": " + std::to_string(uni_pd_flush1_us_.exchange(0, std::memory_order_relaxed)) +
                  ", \"d_lock_us\": " + std::to_string(uni_pd_lock_us_.exchange(0, std::memory_order_relaxed)) +
                  ", \"d_consume_us\": " + std::to_string(uni_pd_consume_us_.exchange(0, std::memory_order_relaxed)) +
@@ -10642,6 +10782,18 @@ typedef struct _zex_kernel_register_file_size_exp_t {
   std::atomic<bool> uni_batchqkt_ts2_notice_{false};  // one-shot TS2/DEBUG_TS2 forced-off notice
   // Serializes the shared immediate command list + staging buffer (batch steps
   // are once-per-replay, so contention is a non-issue).
+  // LOCK LEDGER (review, r2): the per-submission hot path acquires this mutex
+  // 2-3x (InjectShadowW push, drain BatchQktExecute, poll arm) plus the
+  // command_lists_ shared lock and 1-2 event-cache shared locks -- all short
+  // map/vector critical sections. Estimated well under 1us/step against a
+  // ~37ms step, and already inside the measured +2.4% bench tax. vLLM
+  // submits from a single engine thread, so these are uncontended in the
+  // steady state; the drain/sweeps take the same mutexes once per step. The
+  // one check that COULD have become a cross-thread bottleneck -- the
+  // dead-context guard on every submission -- is lock-free (atomic slot
+  // array above, zero RMW on the healthy path). If multi-writer submission
+  // ever appears, the identified next step is a bounded MPMC ring for the W
+  // push, dropping the InjectShadowW acquisition.
   std::mutex uni_batchqkt_mutex_;
   std::map<ze_context_handle_t, ze_command_list_handle_t> uni_batchqkt_imm_lists_;  // nullptr = creation failed (sticky fallback)
   std::map<ze_context_handle_t, void *> uni_batchqkt_bufs_;      // per-context host staging buffer
@@ -10651,7 +10803,24 @@ typedef struct _zex_kernel_register_file_size_exp_t {
   // A value here is NEVER trusted again -- L0 heap-reuses handles, so a new
   // context can land on the same address; refusing it only costs a graceful
   // fallback, trusting it puts device work on a dead context (CCS fault).
-  std::set<ze_context_handle_t> uni_batchqkt_dead_contexts_;
+  // HARDEN (review, r2): the dead-context check sits on the per-submission
+  // hot path (BatchQktGetShadowW + the three Ensure* guards), so it must not
+  // cost a lock -- a shared_mutex is still one RMW word ping-ponged across
+  // submit threads, exactly the "new bottleneck" class. Lock-free shape
+  // (replaces the previous std::set + leaf shared_mutex draft entirely):
+  // fixed array of atomic handle slots + published count. Writers (both
+  // under uni_batchqkt_mutex_, hence serialized) CAS the next free slot and
+  // then publish the count; readers load the count (acquire) and scan only
+  // the published slots -- one acquire-load total on the healthy path
+  // (dead_n_ == 0, no loop iterations, no RMW, no cache-line ping-pong).
+  // Overflow (kBatchQktDeadSlots destroyed contexts in one process) sets
+  // uni_batchqkt_dead_overflow_: every context is then treated as dead, so
+  // BATCHQKT degrades entirely to the legacy per-event path -- the SAFE side
+  // (never serve a recycled handle); only the tax optimization switches off.
+  static constexpr size_t kBatchQktDeadSlots = 16;
+  std::atomic<ze_context_handle_t> uni_batchqkt_dead_ctx_[kBatchQktDeadSlots] = {};
+  std::atomic<size_t> uni_batchqkt_dead_n_{0};
+  std::atomic<bool> uni_batchqkt_dead_overflow_{false};
   // HARDEN: pairing/retry accounting -- per-context resource releases (the
   // paired frees at zeContextDestroy enter) and requests refused because the
   // context handle was already destroyed.
@@ -10777,6 +10946,10 @@ typedef struct _zex_kernel_register_file_size_exp_t {
   std::atomic<uint64_t> uni_batchqkt_w_abandoned_{0};    // W's dropped WITHOUT pool return (device-lost class)
   std::atomic<bool> uni_batchqkt_notice_w_latched_{false};
   std::atomic<bool> uni_batchqkt_notice_w_ooo_{false};
+  // HARDEN (review): the W signal-append failure has its own one-shot notice
+  // -- reusing uni_batchqkt_notice_pollappend_ made the two failure modes
+  // suppress each other's line.
+  std::atomic<bool> uni_batchqkt_notice_w_append_{false};
 
 };
 

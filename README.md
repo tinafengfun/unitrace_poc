@@ -1,6 +1,9 @@
 # Profiling Tools Interfaces for GPU (PTI for GPU)
 
-
+> **Fork provenance:** this is a unitrace working fork. Commit `bbe5e6b` (#1)
+> is a squashed root imported from upstream base `23bbd18f`; later commits are
+> self-contained changes on top. Build/artifact anchors live in
+> `delivery/BUILD_AND_SWITCHES.md`.
 
 ## Overview
 This repository describes the ways of collecting performance data for Intel(R) Processor Graphics and provides a set of samples that help to start.
