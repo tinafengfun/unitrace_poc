@@ -1242,6 +1242,16 @@ typedef void (*OnZeFunctionFinishCallback)(std::vector<uint64_t> *kids, FLOW_DIR
 // sample. See IMPL_NOTES_meta.md for the record table.
 typedef void (*OnZeMetaRecordCallback)(const char* name, uint64_t start_ns, uint64_t end_ns, const char* args_json, double counter_ms);
 
+// META=2 (C layer, delivery/META2_DEVICE_MARKS_DESIGN.md): device-track
+// self-annotation marks for the collection ops the collector itself injects
+// (shadow-W signal, batched QKT read). |ts_ns| is the device-side anchor
+// DERIVED from the batch's already-read qkt packets (host-ns, same conversion
+// as the kernel slices -- GetHostTime; max end over the valid packets), so a
+// mark adds zero GPU ops and zero ioctls. |device|/|engine_ordinal|/
+// |engine_index| place the mark on the same device track as the step's
+// kernel slices. Wired to ChromeLogger::MetaDeviceLoggingCallback by tracer.h.
+typedef void (*OnZeDeviceMetaRecordCallback)(const char* name, uint64_t ts_ns, const char* args_json, const ze_device_handle_t device, uint32_t engine_ordinal, uint32_t engine_index);
+
 typedef void (*OnZeKernelFinishCallback)(uint64_t kid, uint64_t tid, uint64_t start, uint64_t end, uint32_t ordinal, uint32_t index, int32_t tile, const ze_device_handle_t device, const uint64_t kernel_command_id, bool implicit_scaling, const ze_group_count_t& group_count, size_t mem_size);
 
 ze_result_t (*ZexKernelGetBaseAddress)(ze_kernel_handle_t hKernel, uint64_t *baseAddress) = nullptr;
@@ -1507,7 +1517,8 @@ class ZeCollector {
       OnZeKernelFinishCallback kcallback = nullptr,
       OnZeFunctionFinishCallback fcallback = nullptr,
       void* callback_data = nullptr,
-      OnZeMetaRecordCallback mcallback = nullptr) {
+      OnZeMetaRecordCallback mcallback = nullptr,
+      OnZeDeviceMetaRecordCallback mdevcallback = nullptr) {
     ze_api_version_t version = GetZeVersion();
     PTI_ASSERT(
         ZE_MAJOR_VERSION(version) >= 1 &&
@@ -1549,7 +1560,7 @@ class ZeCollector {
     );
 
     ZeCollector* collector = new ZeCollector(
-      options, kcallback, fcallback, mcallback, callback_data, data_dir_name, reset_event_on_device, include_kernels_vec, exclude_kernels_vec);
+      options, kcallback, fcallback, mcallback, callback_data, data_dir_name, reset_event_on_device, include_kernels_vec, exclude_kernels_vec, mdevcallback);
 
     UniMemory::ExitIfOutOfMemory((void *)(collector));
 
@@ -1655,11 +1666,18 @@ class ZeCollector {
     // TakeContainedMetaDebtUs.
     if (MetaOn()) {
       const uint64_t mt = UniTimer::GetHostTimestamp();
-      MetaRecord("unitrace.overhead_total", mt, mt,
-                 "\"collector_total_us\": " +
-                     std::to_string(uni_meta_debt_total_us_.load(std::memory_order_relaxed)) +
-                 ", \"meta_records_n\": " +
-                     std::to_string(uni_meta_records_n_.load(std::memory_order_relaxed)));
+      // META=2: the device mark count rides the args -- gated so the META=0/1
+      // lines stay byte-identical (count only; device cost is never folded
+      // into the host-us debt).
+      std::string args = "\"collector_total_us\": " +
+                         std::to_string(uni_meta_debt_total_us_.load(std::memory_order_relaxed)) +
+                         ", \"meta_records_n\": " +
+                         std::to_string(uni_meta_records_n_.load(std::memory_order_relaxed));
+      if (MetaDeviceMarks()) {
+        args += ", \"device_marks_n\": " +
+                std::to_string(uni_device_marks_n_.load(std::memory_order_relaxed));
+      }
+      MetaRecord("unitrace.overhead_total", mt, mt, args);
     }
 
     // T6'/E6: release the collector-owned immediate command list and staging
@@ -2291,12 +2309,14 @@ class ZeCollector {
       std::string& data_dir_name,
       bool reset_event_on_device,
       const std::vector<std::string>& include_kernels = {},
-      const std::vector<std::string>& exclude_kernels = {})
+      const std::vector<std::string>& exclude_kernels = {},
+      OnZeDeviceMetaRecordCallback mdevcallback = nullptr)
       : logger_factory_(LoggerFactory::Create()),
         options_(options),
         kcallback_(kcallback),
         fcallback_(fcallback),
         mcallback_(mcallback),
+        mdevcallback_(mdevcallback),
         reset_event_on_device_(reset_event_on_device),
         event_cache_(ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP),
         include_kernels_(include_kernels),
@@ -3373,7 +3393,13 @@ class ZeCollector {
     return duration;
   }
 
-  inline void GetHostTime(const ZeCommand *command, const ze_kernel_timestamp_result_t& ts, uint64_t& start, uint64_t& end) {
+  // emit_diag=false suppresses the [TSCONV] diagnostic line: used by the
+  // C-layer anchor loop, which re-converts packets ALREADY converted by the
+  // normal completion path. Without this, UNITRACE_DEBUG_TS=1 re-emits one
+  // diag line per packet per step (measured: +121,572 lines = 396 steps x
+  // 307 packets, +20.5MB tslog writes under uni_batchqkt_mutex_ -- the
+  // m2tax STOP root cause). Arithmetic is identical either way.
+  inline void GetHostTime(const ZeCommand *command, const ze_kernel_timestamp_result_t& ts, uint64_t& start, uint64_t& end, bool emit_diag = true) {
     uint64_t device_freq = command->device_timer_frequency_;
     uint64_t device_mask = command->device_timer_mask_;
     double ns_per_cycle = command->device_ns_per_cycle_;
@@ -3398,7 +3424,7 @@ class ZeCollector {
     start = command->submit_time_ + time_shift;
     end = start + duration;
 
-    if (TsDiagEnabled()) {
+    if (emit_diag && TsDiagEnabled()) {
       char buf[384];
       int len = std::snprintf(buf, sizeof(buf),
           "[TSCONV] inst=%" PRIu64 " dev_start=%" PRIu64 " dev_end=%" PRIu64
@@ -4368,6 +4394,20 @@ class ZeCollector {
     return TraceMetaEnvEnabled() && (mcallback_ != nullptr);
   }
 
+  // META=2 (C layer, delivery/META2_DEVICE_MARKS_DESIGN.md): device-track
+  // marks ON TOP of the host layer (implies MetaOn()). Only the explicit
+  // string "2" enables it, so META=0 and META=1 keep their byte-identical
+  // behavior. The marks are derived from already-read qkt packets (zero new
+  // GPU ops, zero new ioctls); the C-3 host window reuses the MetaRecord
+  // path. Requires the device callback to be wired.
+  inline bool MetaDeviceMarks(void) const {
+    static const bool enabled = []() {
+      const char *e = std::getenv("UNITRACE_TRACE_META");
+      return (e != nullptr && e[0] == '2' && e[1] == '\0');
+    }();
+    return enabled && TraceMetaEnvEnabled() && (mdevcallback_ != nullptr);
+  }
+
   // One meta record. |name| is the full record name; |mt0|/|mt1| are the
   // UniTimer::GetHostTimestamp() bounds of the measured window (an instant
   // when equal); |args| is the JSON object body; |counter_ms| >= 0 additionally
@@ -4399,6 +4439,10 @@ class ZeCollector {
   // caliber; this is the in-trace, per-run attribution.
   std::atomic<uint64_t> uni_meta_records_n_{0};
   std::atomic<uint64_t> uni_meta_debt_total_us_{0};
+  // META=2 (C layer): lifetime device-track mark count, rendered in the
+  // overhead_total args (count only -- device cost is NOT folded into the
+  // host-us debt; different clocks, different semantics).
+  std::atomic<uint64_t> uni_device_marks_n_{0};
 
   // TAX-OPT (enqueue-phase attribution): the exposed tax lives in the
   // urEnqueueGraphExp enqueue phase (node3 trim24L: 1.53ms/step in the device
@@ -5445,6 +5489,10 @@ class ZeCollector {
     batch.ts.resize(n);
     std::memcpy(batch.ts.data(), dst, n * sizeof(ze_kernel_timestamp_result_t));
     // BQ-S2: the drain read consumed this window's packets — release the W's.
+    // META=2: capture the W count BEFORE the release -- the read resolved,
+    // so a nonzero count means this step's W op rode the device timeline and
+    // C-1 must fire for it (counting after the release would swallow it).
+    const size_t w_pending = BatchQktCountPendingWs(context);
     BatchQktReleaseShadowWsLocked(context, /*device_ok=*/true);
     uint64_t batch_us = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
@@ -5465,6 +5513,12 @@ class ZeCollector {
                  ", \"us\": " + std::to_string(batch_us) +
                  ", \"at\": \"drain\"");
     }
+    // META=2: C-2 fires here too (this path also runs a device-side QKT op).
+    // The W count was captured BEFORE this path's release (see w_pending
+    // below) -- for a degraded step it is 0 (no W was ever injected) and
+    // C-1 stays silent; for a sync-failed-then-drain step the W's were
+    // abandoned (device_ok=false), also 0.
+    EmitDeviceMetaMarks(batch, w_pending);
     if (BatchQktDiagEnabled()) {
       char buf[128];
       int len = std::snprintf(buf, sizeof(buf),
@@ -5790,8 +5844,87 @@ class ZeCollector {
     }
     // BQ-S2: the read resolved (the wait on the shadow W's completed), so the
     // W's are done — host-destroy/recreate them back into the pool.
+    // META=2: the marks go out BEFORE the release -- C-1 fires only while
+    // this step's W's are still pending (see EmitDeviceMetaMarks).
+    EmitDeviceMetaMarks(batch, BatchQktCountPendingWs(pr.context));
     BatchQktReleaseShadowWsLocked(pr.context, /*device_ok=*/true);
     return true;
+  }
+
+  // -----------------------------------------------------------------------
+  // META=2 (C layer): device-track instant marks for the collection ops this
+  // step carried, derived from the batch's already-read packets -- zero new
+  // GPU ops, zero new ioctls (delivery/META2_DEVICE_MARKS_DESIGN.md §2/§3).
+  //   C-1 unitrace.shadow_w_signal -- only when this step's shadow W's are
+  //       still pending at read resolve (a degraded step has none and gets
+  //       no mark -- an honest absence).
+  //   C-2 unitrace.qkt_read_device -- every successful batch read, the arm
+  //       path and the v4b drain path alike (the device executes the QKT op
+  //       in both).
+  // |w_pending| is counted by the CALLER before this step's W release (the
+  // drain path releases its W's before batch.ok -- counting at the emit
+  // anchor would see 0 and swallow C-1 for every drain-read step; POC smoke
+  // caught exactly that: shadow_w_signal=8 vs shadow_w_append=32).
+  // Anchor = max(end) over the VALID packets (in-order list order is not
+  // time order across engines, so the last command in list order may end
+  // earlier than the last kernel in time -- the design-doc §11 reflection
+  // fix). TSBAD-class packets (start==end or end==0) are excluded; with no
+  // valid packet left there is no honest anchor and no mark is emitted.
+  // Track = the max-end command's (device, engine): the in-order replay list
+  // is single-engine, so this is the engine the W/QKT ops ride.
+  // Called with uni_batchqkt_mutex_ held (both callers hold it).
+  // -----------------------------------------------------------------------
+  void EmitDeviceMetaMarks(const ZeBatchQkt &batch, size_t w_pending) {
+    if (!MetaDeviceMarks() || !batch.ok || batch.cmds.empty() ||
+        batch.ts.size() != batch.cmds.size()) {
+      return;
+    }
+    uint64_t anchor_ns = 0;
+    const ZeCommand *anchor_cmd = nullptr;
+    for (size_t i = 0; i < batch.cmds.size(); i++) {
+      const ZeCommand *command = batch.cmds[i];
+      const ze_kernel_timestamp_result_t &ts = batch.ts[i];
+      if (command == nullptr || ts.global.kernelStart == ts.global.kernelEnd ||
+          ts.global.kernelEnd == 0) {
+        continue;  // TSBAD-class packet: excluded from the anchor
+      }
+      uint64_t s = 0, e = 0;
+      GetHostTime(command, ts, s, e, /*emit_diag=*/false);
+      if (anchor_cmd == nullptr || e > anchor_ns) {
+        anchor_ns = e;
+        anchor_cmd = command;
+      }
+    }
+    if (anchor_cmd == nullptr) {
+      return;  // no valid packet -- no honest anchor
+    }
+    // C-1 first, then C-2 (design §3 order); both at the same instant,
+    // distinct names keep them independently filterable.
+    if (w_pending > 0) {
+      std::string args = "\"w_pops_step\": " + std::to_string(w_pending);
+      mdevcallback_("unitrace.shadow_w_signal", anchor_ns, args.c_str(),
+                    anchor_cmd->device_, anchor_cmd->engine_ordinal_,
+                    anchor_cmd->engine_index_);
+      uni_device_marks_n_.fetch_add(1, std::memory_order_relaxed);
+    }
+    {
+      std::string args = "\"n\": " + std::to_string(batch.cmds.size());
+      mdevcallback_("unitrace.qkt_read_device", anchor_ns, args.c_str(),
+                    anchor_cmd->device_, anchor_cmd->engine_ordinal_,
+                    anchor_cmd->engine_index_);
+      uni_device_marks_n_.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
+  // Caller must hold uni_batchqkt_mutex_ (both emit anchors do).
+  size_t BatchQktCountPendingWs(ze_context_handle_t context) {
+    size_t n = 0;
+    for (auto &entry : uni_batchqkt_pending_ws_) {
+      if (entry.first == context) {
+        n++;
+      }
+    }
+    return n;
   }
 
   // -----------------------------------------------------------------------
@@ -6012,7 +6145,18 @@ class ZeCollector {
       uni_batchqkt_w_degrade_.fetch_add(1, std::memory_order_relaxed);
       return;
     }
+    // META=2 (C-3): self-admit the W append's host cost as a meta window --
+    // the B layer attributes it to the containing graph host slice
+    // (TakeContainedMetaDebtUs, direct-parent semantics). Closes the S1 host
+    // gap; same shape as the unitrace.qkt_batch windows. META=0/1 stay
+    // byte-identical (this block is MetaDeviceMarks()-gated).
+    const bool meta_dev = MetaDeviceMarks();
+    const uint64_t mt0 = meta_dev ? UniTimer::GetHostTimestamp() : 0;
     ze_result_t status = ZE_FUNC(zeCommandListAppendSignalEvent)(command_list, w);
+    const uint64_t mt1 = meta_dev ? UniTimer::GetHostTimestamp() : 0;
+    if (meta_dev && status == ZE_RESULT_SUCCESS) {
+      MetaRecord("unitrace.shadow_w_append", mt0, mt1, "\"at\": \"graph_onexit\"");
+    }
     if (status != ZE_RESULT_SUCCESS) {
       // Nothing was enqueued: return the W (clean NOT_READY back in the pool)
       // and leave this submission without a W.
@@ -10746,6 +10890,7 @@ typedef struct _zex_kernel_register_file_size_exp_t {
   OnZeKernelFinishCallback kcallback_ = nullptr;
   OnZeFunctionFinishCallback fcallback_ = nullptr;
   OnZeMetaRecordCallback mcallback_ = nullptr;  // T14/A5 self-annotation
+  OnZeDeviceMetaRecordCallback mdevcallback_ = nullptr;  // META=2 device-track marks
   bool reset_event_on_device_; // support event reset on device
   ZeEventCache event_cache_;
 
