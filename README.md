@@ -4,6 +4,16 @@
 > is a squashed root imported from upstream base `23bbd18f`; later commits are
 > self-contained changes on top. Build/artifact anchors live in
 > `delivery/BUILD_AND_SWITCHES.md`.
+>
+> **vLLM XPU collection improvements (#1–#8, HEAD `ffac356`):** graph-replay
+> timestamp fix, batched QKT collection (AT_POLL), shipping-default switches,
+> TS_INTERP + tslog write-path fix, shadow completion event W (reset batch
+> eliminated), B+D overhead annotation (`collector_us`/`api_net_us` +
+> `unitrace.overhead_total`), and META=2 device-side marks
+> (`UNITRACE_TRACE_META=2`, zero new GPU ops). Acceptance criteria, test
+> results, and first-wave validation guide:
+> **`delivery/ENGINEERING_HANDOFF.md`** (entry point for engineering
+> validation).
 
 ## Overview
 This repository describes the ways of collecting performance data for Intel(R) Processor Graphics and provides a set of samples that help to start.
