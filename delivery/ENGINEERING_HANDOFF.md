@@ -2,6 +2,7 @@
 
 > 2026-10-22。适用代码状态：`ffac356`（master HEAD）。
 > 本文档 = 交付验收入口：改进清单 / 验收标准 / 已有测试结果 / 第一波验证指南。
+> **用户手册（构建→部署→开新功能→profile→读结果全流程）= `USER_MANUAL.md`**。
 > 细节文档索引：构建与开关 = `BUILD_AND_SWITCHES.md`；时间戳修复 = `TSLOG_FIX_NODE1.md`；
 > 影子完成事件 = `BQ_S2_DESIGN.md`；开销标注设计 = `META2_DEVICE_MARKS_DESIGN.md`。
 

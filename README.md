@@ -13,7 +13,9 @@
 > (`UNITRACE_TRACE_META=2`, zero new GPU ops). Acceptance criteria, test
 > results, and first-wave validation guide:
 > **`delivery/ENGINEERING_HANDOFF.md`** (entry point for engineering
-> validation).
+> validation). Full user manual — build, deploy, enabling the new features,
+> profiling workflow, reading the results:
+> **`delivery/USER_MANUAL.md`**.
 
 ## Overview
 This repository describes the ways of collecting performance data for Intel(R) Processor Graphics and provides a set of samples that help to start.
