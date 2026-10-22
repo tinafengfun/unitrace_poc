@@ -126,8 +126,9 @@ vLLM 自家 profiler 在 bench 中段插 kernel）；`EnableImplicitConvertionTo
 
 ## 6. 已知边界与未结项（如实声明）
 
-1. **protobuf 输出的设备 mark 路径为 no-op**（JSON 路径已闭环；protobuf 渲染形态
-   待真实 trace 裁决后补，设计稿 §10.4）
+1. **protobuf 设备 mark = instant 形态已实现**（2026-10-22：`--output-format=protobuf`
+   下 shadow_w_signal/qkt_read_device 落 device track，实迹 wire 解析验证通过；
+   UI 视觉渲染待复核——若渲染不佳回退 1µs thin slice，设计稿 §5/§10.4）
 2. 驱动在 graph 内部对物理事件每代 re-signal（S3）**无锚点可标**——属驱动侧改进项
 3. shadow-W 的真实设备执行时长不可直接测（测它需要注入新设备 op，违反零新增原则），
    instant 是诚实的下界表达
@@ -145,5 +146,5 @@ vLLM 自家 profiler 在 bench 中段插 kernel）；`EnableImplicitConvertionTo
 | V3 | 税复测（同 §5.3 命令形态，META=2 ×2 vs META=0 ×2 + bare 锚，§3.6 判据） | 高 |
 | V4 | 跨机型（非 node1 的研发/生产机型）税与稳定性 | 高 |
 | V5 | Perfetto UI 上 mark 可读性（设备 track instant 与 kernel 切片同 track 渲染） | 中 |
-| V6 | protobuf 输出形态（当前 no-op，需 UI 裁决回退方案） | 中 |
+| V6 | protobuf 输出复验（instant 已实现并 wire 验证；UI 视觉渲染确认，不佳则 thin slice 回退） | 中 |
 | V7 | 长跑 soak（trace 体积、drift、round-27 停顿是否复现） | 中 |

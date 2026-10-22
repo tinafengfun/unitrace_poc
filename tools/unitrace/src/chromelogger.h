@@ -1644,17 +1644,36 @@ class TraceBuffer {
     // counting, no host-slice pollution). The record rides this thread's
     // meta_records_ like any meta record (the emitter is the drain/poll
     // thread, whose buffer is alive here).
-    // Protobuf: deferred by design (§10.4 of the design doc) -- device-track
-    // instant rendering in the protobuf path is decided at the POC with a
-    // real trace; JSON is the canonical profile format and the acceptance
-    // target. Nothing is emitted on this branch for now.
+    // Protobuf: mirrors the host meta proto branch (args as a raw "args"
+    // string annotation) but on the DEVICE track -- uuid MakeUuid(device_pid,
+    // device_tid), the same uuid PerfettoEmitDeviceSlice and
+    // EmitDeviceThreadMetadata use, so the descriptor already exists (kernels
+    // resolved this track first; a mark-resolved-first track gets its
+    // descriptor from GetDevicePidTid's miss branch). Instant form first
+    // (design §3/§10.4): zero-dur is the honest shape -- a thin slice would
+    // render device idle as cost; fall back to a 1us slice only if the UI
+    // renders this badly on a real trace.
     // -----------------------------------------------------------------------
     void EmitDeviceMetaRecord(const char* name, uint64_t ts_ns,
                               const char* args_json, ze_device_handle_t device,
                               uint32_t engine_ordinal, uint32_t engine_index) {
 #if BUILD_WITH_PERFETTO
       if (UseProtobufOutput()) {
-        return;  // see comment above -- POC decides the protobuf shape
+        auto& rdt = GetRecentDeviceTimestamps(device, engine_ordinal, engine_index);
+        uint32_t track = GetDeviceEventTrack(rdt, ts_ns, ts_ns);
+        auto [pid, tid, device_id] = GetDevicePidTid(device, engine_ordinal,
+                                                     engine_index, pid_, tid_,
+                                                     track);
+        (void)device_id;
+        perfetto_emit::SliceOptions opts;
+        opts.category = "unitrace_meta";
+        opts.name = name;
+        if (args_json != nullptr) {
+          opts.annotations.push_back(perfetto_emit::Annotation::Str("args", args_json));
+        }
+        perfetto_emit::EmitInstant(seq_id_, perfetto_emit::MakeUuid(pid, tid),
+                                   UniTimer::GetEpochTime(ts_ns), opts);
+        return;
       }
 #endif /* BUILD_WITH_PERFETTO */
       meta_records_.push_back(DeviceMetaLineResolved(name, ts_ns, args_json,

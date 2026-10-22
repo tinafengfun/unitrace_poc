@@ -98,6 +98,12 @@ C 层所有设备侧 mark 都是**既有数据的重新表达**，不为标注�
 - **protobuf**：`PerfettoEmitDeviceSlice` 旁新增 zero-dur instant 发射（cat=unitrace_meta）；
   若 Perfetto 视图对 device track instant 渲染不佳，回退形态 = 1µs thin slice（实现期
   用真实 trace 在 UI 里裁决，POC 阶段定稿）。
+  **✅ 已实现并验证（2026-10-22，Tina 裁决"做"）**：instant 形态先行（与 JSON 同形，
+  不先做 thin slice）；node1 mt2p 冒烟（META=2 + `--output-format=protobuf`）实迹
+  wire 解析验证：shadow_w_signal/qkt_read_device 各 32 = replay 数精确，track_uuid
+  与 kernel slice 同轨（2,765 slice 同轨），descriptor 由既有 EmitDeviceThreadMetadata
+  覆盖。teardown fallback 在 protobuf 下保持丢弃（与 host meta 回调同构：stream 按写
+  线程序列化，late packet 无处落）。UI 视觉渲染交工程团队 V5 复核。
 
 ## 6. 税分析与判据
 
