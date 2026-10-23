@@ -210,6 +210,10 @@ UNITRACE_OutputFormat=protobuf <标准 SERVER 命令>
 | `unitrace.shadow_w_append` | host track | 切片窗 | W 注入的 host 成本，自动归属进包含它的 graph host 切片的 `collector_us` |
 
 设计要点（读数时勿误判）：
+- mark 的 ts 是**设备锚点时间**（本步成功包 max kernel end），不是 host drain 时刻。
+  因此收尾 drain（如 pause 时的最后一条 `qkt_batch` at=poll_sync）发出的 mark 在
+  trace 里落在最后一个 kernel end 处，而不是 drain 记录旁边。对账口径：设备读总数
+  （`at=drain` + `at=poll_sync` 记录数）= mark 数，逐位精确；勿按位置配对。
 - instant 是**诚实的下界表达**——W signal 设备执行真实成本 sub-µs，但"测它需要注入新
   设备 op"违反零新增原则；instant 不表达时长、不把设备 idle 画成开销。
 - 设备侧成本**不折算**进 `collector_total_us`（host µs）；它的表达就是 mark 本身
@@ -259,6 +263,9 @@ ui.perfetto.dev。设备 mark 与 kernel 同轨（同 track_id），在设备时
 | tslog 粘行/丢行 | 本版已修（行级锁+单 fwrite）；若复现请带 tslog 文件回报 |
 | GPU 楔死前兆 | dmesg 地址越界/非法访问 → 立即停手并回报（勿继续跑） |
 | vLLM 启动 onecclCommInitRank code 11 | 容器需 `-v /dev/dri/by-path:/dev/dri/by-path`（`--device /dev/dri` 不带 symlink 不够） |
+| trace 尾部有一大段空白（最后活动之后到 trace 结束） | 真实空闲，非丢数据：负载结束后引擎待命，直到 pause/退出才收尾（最后一批 QKT 读的 drain 落在此刻）。判据：空白区三 track 零事件、未闭合切片 0、读/mark 对账精确 |
+| protobuf trace 在 Perfetto UI 里 Start 显示 1970-01-01 时刻 | 显示约定，非数据错误：trace_processor 把 proto trace 归一到 BOOTTIME 主时钟（无纪元锚点），UI 按 time-of-day 渲染。事件本身携带 epoch ns + REALTIME 声明 + ClockSnapshot（数据正确）；相对时序不受影响 |
+| `.pftrace` 无法当文本读取/上传工具报"无法处理" | 正常：pftrace 是 protobuf 二进制流（单包 Trace 逐包拼接）。用 ui.perfetto.dev 拖入、trace_processor SQL（§5.3）或二进制解析脚本查看；校验可用 trace_processor 正常加载为准 |
 
 ## 8. 税预算与当前实测（node1 card1 / 内部测试机 A/B，Qwen 形态）
 
