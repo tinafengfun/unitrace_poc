@@ -1531,41 +1531,6 @@ class TraceBuffer {
       return str;
     }
 
-    // -----------------------------------------------------------------------
-    // META=2 (C layer, delivery/META2_DEVICE_MARKS_DESIGN.md §3/§5): the
-    // device-track twin of MetaRecordJsonLine. A device-track instant
-    // (ph=R, no dur) placed on the SAME (pid, tid, deviceid) track the
-    // kernel slices use, so the collection ops the collector injects render
-    // between the kernels they ride behind. |ts_ns| is the anchor the
-    // collector derived from the already-read qkt packets (host-ns; the
-    // conversion is the kernel slices' own GetHostTime, so the mark is on
-    // the timeline's time base by construction). Field order mirrors
-    // StringifyDeviceEvent (tid, pid, name, cat, ts, args) with the meta
-    // cat/grey cname. No meta window: a device instant is not a host window
-    // and must never feed TakeContainedMetaDebtUs.
-    // -----------------------------------------------------------------------
-    static std::string DeviceMetaJsonLine(const char* name, uint64_t ts_ns,
-                                          const char* args_json,
-                                          uint32_t tid, uint32_t pid) {
-      std::string str = ",\n{";
-      str += "\"ph\": \"R\"";
-      str += ", \"tid\": " + std::to_string(tid);
-      str += ", \"pid\": " + std::to_string(pid);
-      str += ", \"name\": \"" + std::string(name) + "\"";
-      str += ", \"cat\": \"unitrace_meta\"";
-      str += ", \"cname\": \"grey\"";
-      str += ", \"ts\": " + std::to_string(UniTimer::GetEpochTimeInUs(ts_ns));
-      std::string str_args;
-      if (args_json != nullptr) {
-        str_args = args_json;
-      }
-      if (!str_args.empty()) {
-        str += ", \"args\": {" + str_args + "}";
-      }
-      str += "}";
-      return str;
-    }
-
     void EmitMetaRecord(const char* name, uint64_t start_ns, uint64_t end_ns,
                         const char* args_json, double counter_ms) {
       if (end_ns > start_ns) {
@@ -1616,69 +1581,6 @@ class TraceBuffer {
 #endif /* BUILD_WITH_PERFETTO */
       meta_records_.push_back(MetaRecordJsonLine(name, start_ns, end_ns,
                                                  args_json, counter_ms, tid_, pid_));
-    }
-
-    // -----------------------------------------------------------------------
-    // META=2 (C layer): resolve the device track (the same helpers the
-    // device events use, so the mark lands on the kernel slice's track) and
-    // build the device meta line. Shared by the buffered path
-    // (EmitDeviceMetaRecord) and the teardown fallback
-    // (MetaDeviceLoggingCallback) so both produce the identical line.
-    // -----------------------------------------------------------------------
-    std::string DeviceMetaLineResolved(const char* name, uint64_t ts_ns,
-                                       const char* args_json,
-                                       ze_device_handle_t device,
-                                       uint32_t engine_ordinal,
-                                       uint32_t engine_index) {
-      auto& rdt = GetRecentDeviceTimestamps(device, engine_ordinal, engine_index);
-      uint32_t track = GetDeviceEventTrack(rdt, ts_ns, ts_ns);
-      auto [pid, tid, device_id] = GetDevicePidTid(device, engine_ordinal, engine_index, pid_, tid_, track);
-      (void)device_id;
-      return DeviceMetaJsonLine(name, ts_ns, args_json, tid, pid);
-    }
-
-    // -----------------------------------------------------------------------
-    // META=2 (C layer): the device-track twin of EmitMetaRecord. Unlike
-    // EmitMetaRecord this registers NO meta window: a device instant is not
-    // host work and must never feed TakeContainedMetaDebtUs (no double
-    // counting, no host-slice pollution). The record rides this thread's
-    // meta_records_ like any meta record (the emitter is the drain/poll
-    // thread, whose buffer is alive here).
-    // Protobuf: mirrors the host meta proto branch (args as a raw "args"
-    // string annotation) but on the DEVICE track -- uuid MakeUuid(device_pid,
-    // device_tid), the same uuid PerfettoEmitDeviceSlice and
-    // EmitDeviceThreadMetadata use, so the descriptor already exists (kernels
-    // resolved this track first; a mark-resolved-first track gets its
-    // descriptor from GetDevicePidTid's miss branch). Instant form first
-    // (design §3/§10.4): zero-dur is the honest shape -- a thin slice would
-    // render device idle as cost; fall back to a 1us slice only if the UI
-    // renders this badly on a real trace.
-    // -----------------------------------------------------------------------
-    void EmitDeviceMetaRecord(const char* name, uint64_t ts_ns,
-                              const char* args_json, ze_device_handle_t device,
-                              uint32_t engine_ordinal, uint32_t engine_index) {
-#if BUILD_WITH_PERFETTO
-      if (UseProtobufOutput()) {
-        auto& rdt = GetRecentDeviceTimestamps(device, engine_ordinal, engine_index);
-        uint32_t track = GetDeviceEventTrack(rdt, ts_ns, ts_ns);
-        auto [pid, tid, device_id] = GetDevicePidTid(device, engine_ordinal,
-                                                     engine_index, pid_, tid_,
-                                                     track);
-        (void)device_id;
-        perfetto_emit::SliceOptions opts;
-        opts.category = "unitrace_meta";
-        opts.name = name;
-        if (args_json != nullptr) {
-          opts.annotations.push_back(perfetto_emit::Annotation::Str("args", args_json));
-        }
-        perfetto_emit::EmitInstant(seq_id_, perfetto_emit::MakeUuid(pid, tid),
-                                   UniTimer::GetEpochTime(ts_ns), opts);
-        return;
-      }
-#endif /* BUILD_WITH_PERFETTO */
-      meta_records_.push_back(DeviceMetaLineResolved(name, ts_ns, args_json,
-                                                     device, engine_ordinal,
-                                                     engine_index));
     }
 
     // File-write half: called by Finalize(), by the destructor and by
@@ -3127,42 +3029,6 @@ class ChromeLogger {
         return;
       }
       thread_local_buffer_.EmitMetaRecord(name, start_ns, end_ns, args_json, counter_ms);
-    }
-
-    // -----------------------------------------------------------------------
-    // META=2 (C layer, delivery/META2_DEVICE_MARKS_DESIGN.md): the
-    // device-track twin of MetaLoggingCallback, wired as the ZeCollector
-    // mdevcallback_ by tracer.h. Same teardown-trap handling as the meta
-    // callback: if this thread's buffer is already finalized (thread exit),
-    // the identical device line is written directly to the trace logger
-    // under the same lock (valid while the file is open; the bracket writer
-    // runs after every collector teardown step). No finalized-buffer drop:
-    // a missing device mark would silently falsify the C-layer visibility.
-    // -----------------------------------------------------------------------
-    static void MetaDeviceLoggingCallback(const char* name, uint64_t ts_ns,
-                                          const char* args_json,
-                                          ze_device_handle_t device,
-                                          uint32_t engine_ordinal,
-                                          uint32_t engine_index) {
-      if (!TraceMetaEnabled()) {
-        return;
-      }
-      if (thread_local_buffer_.IsFinalized()) {
-        if (UseProtobufOutput() || logger_ == nullptr ||
-            chrome_json_closed_.load(std::memory_order_acquire)) {
-          return;
-        }
-        // Track resolution included: the TraceBuffer object outlives its
-        // finalized state, so the mark lands on the device track even here
-        // (a raw host tid/pid line would silently put it on a thread track).
-        std::string str = thread_local_buffer_.DeviceMetaLineResolved(
-            name, ts_ns, args_json, device, engine_ordinal, engine_index);
-        std::lock_guard<std::recursive_mutex> lock(logger_lock_);
-        logger_->Log(str);
-        return;
-      }
-      thread_local_buffer_.EmitDeviceMetaRecord(name, ts_ns, args_json, device,
-                                                engine_ordinal, engine_index);
     }
 
     static void ChromeCallLoggingCallback(std::vector<uint64_t> *kids, FLOW_DIR flow_dir, API_TRACING_ID api_id,

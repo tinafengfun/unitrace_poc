@@ -168,11 +168,8 @@ class UniTracer {
 #if BUILD_WITH_L0
       // T14/A5: the meta callback is always wired -- ChromeLogger checks the
       // UNITRACE_TRACE_META gate (default ON, "0" disables).
-      // META=2: the device-mark callback rides along the same way; the
-      // collector's MetaDeviceMarks() gate decides whether it ever fires.
       ze_collector = ZeCollector::Create(options, ze_kcallback, ze_fcallback, tracer,
-                                         ChromeLogger::MetaLoggingCallback,
-                                         ChromeLogger::MetaDeviceLoggingCallback);
+                                         ChromeLogger::MetaLoggingCallback);
       tracer->ze_collector_ = ze_collector;
 #endif /* BUILD_WITH_L0 */
     }

@@ -811,6 +811,11 @@ struct ZeCommand {
   // the packet is already safely buffered and this command must not be
   // re-collected, re-queried or reset until its emit ran.
   const ze_kernel_timestamp_result_t *deferred_ts_;
+  // tsbadfix: shadow-W reference this clone carries (0 = none). Attached at
+  // the replay staging loop; terminated exactly once (bqkt_w_done_ guards
+  // double-termination) when the clone terminates.
+  uint64_t bqkt_w_token_;
+  bool bqkt_w_done_;
   bool implicit_scaling_;
   bool immediate_;
   bool graph_command_;  // true if this command is part of a graph execution (event is owned by graph)
@@ -956,6 +961,8 @@ struct ZeDeviceSubmissions {
     command->index_timestamps_on_event_reset_ = nullptr;
     command->signal_gen_ = 0;
     command->deferred_ts_ = nullptr;  // E6-v4b: never inherit a recycled emit slot
+    command->bqkt_w_token_ = 0;       // tsbadfix: no W reference until staged
+    command->bqkt_w_done_ = false;
     command->graph_command_ = false;
 
     return command;
@@ -1242,16 +1249,6 @@ typedef void (*OnZeFunctionFinishCallback)(std::vector<uint64_t> *kids, FLOW_DIR
 // sample. See IMPL_NOTES_meta.md for the record table.
 typedef void (*OnZeMetaRecordCallback)(const char* name, uint64_t start_ns, uint64_t end_ns, const char* args_json, double counter_ms);
 
-// META=2 (C layer, delivery/META2_DEVICE_MARKS_DESIGN.md): device-track
-// self-annotation marks for the collection ops the collector itself injects
-// (shadow-W signal, batched QKT read). |ts_ns| is the device-side anchor
-// DERIVED from the batch's already-read qkt packets (host-ns, same conversion
-// as the kernel slices -- GetHostTime; max end over the valid packets), so a
-// mark adds zero GPU ops and zero ioctls. |device|/|engine_ordinal|/
-// |engine_index| place the mark on the same device track as the step's
-// kernel slices. Wired to ChromeLogger::MetaDeviceLoggingCallback by tracer.h.
-typedef void (*OnZeDeviceMetaRecordCallback)(const char* name, uint64_t ts_ns, const char* args_json, const ze_device_handle_t device, uint32_t engine_ordinal, uint32_t engine_index);
-
 typedef void (*OnZeKernelFinishCallback)(uint64_t kid, uint64_t tid, uint64_t start, uint64_t end, uint32_t ordinal, uint32_t index, int32_t tile, const ze_device_handle_t device, const uint64_t kernel_command_id, bool implicit_scaling, const ze_group_count_t& group_count, size_t mem_size);
 
 ze_result_t (*ZexKernelGetBaseAddress)(ze_kernel_handle_t hKernel, uint64_t *baseAddress) = nullptr;
@@ -1517,8 +1514,7 @@ class ZeCollector {
       OnZeKernelFinishCallback kcallback = nullptr,
       OnZeFunctionFinishCallback fcallback = nullptr,
       void* callback_data = nullptr,
-      OnZeMetaRecordCallback mcallback = nullptr,
-      OnZeDeviceMetaRecordCallback mdevcallback = nullptr) {
+      OnZeMetaRecordCallback mcallback = nullptr) {
     ze_api_version_t version = GetZeVersion();
     PTI_ASSERT(
         ZE_MAJOR_VERSION(version) >= 1 &&
@@ -1560,7 +1556,7 @@ class ZeCollector {
     );
 
     ZeCollector* collector = new ZeCollector(
-      options, kcallback, fcallback, mcallback, callback_data, data_dir_name, reset_event_on_device, include_kernels_vec, exclude_kernels_vec, mdevcallback);
+      options, kcallback, fcallback, mcallback, callback_data, data_dir_name, reset_event_on_device, include_kernels_vec, exclude_kernels_vec);
 
     UniMemory::ExitIfOutOfMemory((void *)(collector));
 
@@ -1666,18 +1662,11 @@ class ZeCollector {
     // TakeContainedMetaDebtUs.
     if (MetaOn()) {
       const uint64_t mt = UniTimer::GetHostTimestamp();
-      // META=2: the device mark count rides the args -- gated so the META=0/1
-      // lines stay byte-identical (count only; device cost is never folded
-      // into the host-us debt).
-      std::string args = "\"collector_total_us\": " +
-                         std::to_string(uni_meta_debt_total_us_.load(std::memory_order_relaxed)) +
-                         ", \"meta_records_n\": " +
-                         std::to_string(uni_meta_records_n_.load(std::memory_order_relaxed));
-      if (MetaDeviceMarks()) {
-        args += ", \"device_marks_n\": " +
-                std::to_string(uni_device_marks_n_.load(std::memory_order_relaxed));
-      }
-      MetaRecord("unitrace.overhead_total", mt, mt, args);
+      MetaRecord("unitrace.overhead_total", mt, mt,
+                 "\"collector_total_us\": " +
+                     std::to_string(uni_meta_debt_total_us_.load(std::memory_order_relaxed)) +
+                 ", \"meta_records_n\": " +
+                     std::to_string(uni_meta_records_n_.load(std::memory_order_relaxed)));
     }
 
     // T6'/E6: release the collector-owned immediate command list and staging
@@ -2309,14 +2298,12 @@ class ZeCollector {
       std::string& data_dir_name,
       bool reset_event_on_device,
       const std::vector<std::string>& include_kernels = {},
-      const std::vector<std::string>& exclude_kernels = {},
-      OnZeDeviceMetaRecordCallback mdevcallback = nullptr)
+      const std::vector<std::string>& exclude_kernels = {})
       : logger_factory_(LoggerFactory::Create()),
         options_(options),
         kcallback_(kcallback),
         fcallback_(fcallback),
         mcallback_(mcallback),
-        mdevcallback_(mdevcallback),
         reset_event_on_device_(reset_event_on_device),
         event_cache_(ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP),
         include_kernels_(include_kernels),
@@ -3393,13 +3380,7 @@ class ZeCollector {
     return duration;
   }
 
-  // emit_diag=false suppresses the [TSCONV] diagnostic line: used by the
-  // C-layer anchor loop, which re-converts packets ALREADY converted by the
-  // normal completion path. Without this, UNITRACE_DEBUG_TS=1 re-emits one
-  // diag line per packet per step (measured: +121,572 lines = 396 steps x
-  // 307 packets, +20.5MB tslog writes under uni_batchqkt_mutex_ -- the
-  // m2tax STOP root cause). Arithmetic is identical either way.
-  inline void GetHostTime(const ZeCommand *command, const ze_kernel_timestamp_result_t& ts, uint64_t& start, uint64_t& end, bool emit_diag = true) {
+  inline void GetHostTime(const ZeCommand *command, const ze_kernel_timestamp_result_t& ts, uint64_t& start, uint64_t& end) {
     uint64_t device_freq = command->device_timer_frequency_;
     uint64_t device_mask = command->device_timer_mask_;
     double ns_per_cycle = command->device_ns_per_cycle_;
@@ -3424,7 +3405,7 @@ class ZeCollector {
     start = command->submit_time_ + time_shift;
     end = start + duration;
 
-    if (emit_diag && TsDiagEnabled()) {
+    if (TsDiagEnabled()) {
       char buf[384];
       int len = std::snprintf(buf, sizeof(buf),
           "[TSCONV] inst=%" PRIu64 " dev_start=%" PRIu64 " dev_end=%" PRIu64
@@ -4394,20 +4375,6 @@ class ZeCollector {
     return TraceMetaEnvEnabled() && (mcallback_ != nullptr);
   }
 
-  // META=2 (C layer, delivery/META2_DEVICE_MARKS_DESIGN.md): device-track
-  // marks ON TOP of the host layer (implies MetaOn()). Only the explicit
-  // string "2" enables it, so META=0 and META=1 keep their byte-identical
-  // behavior. The marks are derived from already-read qkt packets (zero new
-  // GPU ops, zero new ioctls); the C-3 host window reuses the MetaRecord
-  // path. Requires the device callback to be wired.
-  inline bool MetaDeviceMarks(void) const {
-    static const bool enabled = []() {
-      const char *e = std::getenv("UNITRACE_TRACE_META");
-      return (e != nullptr && e[0] == '2' && e[1] == '\0');
-    }();
-    return enabled && TraceMetaEnvEnabled() && (mdevcallback_ != nullptr);
-  }
-
   // One meta record. |name| is the full record name; |mt0|/|mt1| are the
   // UniTimer::GetHostTimestamp() bounds of the measured window (an instant
   // when equal); |args| is the JSON object body; |counter_ms| >= 0 additionally
@@ -4439,10 +4406,6 @@ class ZeCollector {
   // caliber; this is the in-trace, per-run attribution.
   std::atomic<uint64_t> uni_meta_records_n_{0};
   std::atomic<uint64_t> uni_meta_debt_total_us_{0};
-  // META=2 (C layer): lifetime device-track mark count, rendered in the
-  // overhead_total args (count only -- device cost is NOT folded into the
-  // host-us debt; different clocks, different semantics).
-  std::atomic<uint64_t> uni_device_marks_n_{0};
 
   // TAX-OPT (enqueue-phase attribution): the exposed tax lives in the
   // urEnqueueGraphExp enqueue phase (node3 trim24L: 1.53ms/step in the device
@@ -5413,7 +5376,6 @@ class ZeCollector {
           std::cerr << "[BATCHQKT] skip: mixed context/device in one sweep" << std::endl;
         }
         batch.cmds.clear();
-        BatchQktReleaseShadowWs(context, /*device_ok=*/true);
         return false;
       }
       // HARDEN: a null event handle must never reach
@@ -5424,7 +5386,6 @@ class ZeCollector {
       if (batch.cmds[i]->event_ == nullptr) {
         uni_batchqkt_alloc_fail_.fetch_add(1, std::memory_order_relaxed);
         batch.cmds.clear();
-        BatchQktReleaseShadowWs(context, /*device_ok=*/true);
         return false;
       }
       events[i] = batch.cmds[i]->event_;
@@ -5437,7 +5398,6 @@ class ZeCollector {
     if (BatchQktCaptureHold()) {
       uni_batchqkt_capture_skip_.fetch_add(1, std::memory_order_relaxed);
       batch.cmds.clear();
-      BatchQktReleaseShadowWs(context, /*device_ok=*/true);
       return false;
     }
 
@@ -5452,7 +5412,6 @@ class ZeCollector {
     if (imm == nullptr || dst == nullptr) {
       batch.cmds.clear();
       uni_batchqkt_fallback_count_.fetch_add(1, std::memory_order_relaxed);
-      BatchQktReleaseShadowWsLocked(context, /*device_ok=*/true);
       return false;
     }
 
@@ -5480,20 +5439,20 @@ class ZeCollector {
                   << "), this step falls back to the per-event path" << std::endl;
       }
       batch.cmds.clear();
-      // BQ-S2: no device op of this read referenced the W's (the drain read
-      // waits on nothing), so they can be returned to the pool even here.
-      BatchQktReleaseShadowWsLocked(context, /*device_ok=*/true);
-      return false;
+      // BQ-S2: no device op of this read referenced the W's. tsbadfix B: the
+      // W's stay pending -- their clones were NOT consumed by the failed
+      // read (the drain falls back to the per-event path for the same
+      // clones), so releasing here would strand them without a gate; the
+      // tails terminate the references instead.
     }
 
     batch.ts.resize(n);
     std::memcpy(batch.ts.data(), dst, n * sizeof(ze_kernel_timestamp_result_t));
-    // BQ-S2: the drain read consumed this window's packets — release the W's.
-    // META=2: capture the W count BEFORE the release -- the read resolved,
-    // so a nonzero count means this step's W op rode the device timeline and
-    // C-1 must fire for it (counting after the release would swallow it).
-    const size_t w_pending = BatchQktCountPendingWs(context);
-    BatchQktReleaseShadowWsLocked(context, /*device_ok=*/true);
+    // BQ-S2: the drain read consumed this window's packets. tsbadfix B: the
+    // W's are NOT released here -- the consuming loop below runs the tail of
+    // every batched clone, and each tail decrements its submission's W
+    // reference; the W is staged for destruction when its last clone is
+    // done (release aligned with consumption, not with the read).
     uint64_t batch_us = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
     uint64_t prev = uni_batchqkt_max_batch_us_.load(std::memory_order_relaxed);
@@ -5513,12 +5472,6 @@ class ZeCollector {
                  ", \"us\": " + std::to_string(batch_us) +
                  ", \"at\": \"drain\"");
     }
-    // META=2: C-2 fires here too (this path also runs a device-side QKT op).
-    // The W count was captured BEFORE this path's release (see w_pending
-    // below) -- for a degraded step it is 0 (no W was ever injected) and
-    // C-1 stays silent; for a sync-failed-then-drain step the W's were
-    // abandoned (device_ok=false), also 0.
-    EmitDeviceMetaMarks(batch, w_pending);
     if (BatchQktDiagEnabled()) {
       char buf[128];
       int len = std::snprintf(buf, sizeof(buf),
@@ -5630,12 +5583,47 @@ class ZeCollector {
     std::vector<ze_event_handle_t> shadow_ws;
     if (BatchQktShadowWActive()) {
       for (auto &entry : uni_batchqkt_pending_ws_) {
-        if (entry.first == pr.context) {
-          shadow_ws.push_back(entry.second);
+        if (entry.context == pr.context) {
+          shadow_ws.push_back(entry.w);
         }
       }
       if (shadow_ws.empty()) {
         uni_batchqkt_w_degrade_.fetch_add(1, std::memory_order_relaxed);
+        return;
+      }
+      // tsbadfix A (fail-closed guard): every clone in the batch must carry a
+      // token that still has a pending W for this context. A missing entry
+      // means the clone's submission stranded (its W was released by an
+      // unbalanced path, or the W push never happened): arming would park on
+      // W's that do not gate this batch's clones and read them mid-flight
+      // (the pre-fix ~86-TSBAD/round smoke loss). Degrade the WHOLE batch to
+      // the drain's readiness-gated read -- never arm a partially-covered
+      // batch, never silently skip single clones.
+      size_t uncovered = 0;
+      for (ZeCommand *command : pr.cmds) {
+        if (command->bqkt_w_token_ == 0) {
+          uncovered++;
+          continue;
+        }
+        bool covered = false;
+        for (auto &entry : uni_batchqkt_pending_ws_) {
+          if (entry.context == pr.context && entry.token == command->bqkt_w_token_) {
+            covered = true;
+            break;
+          }
+        }
+        if (!covered) {
+          uncovered++;
+        }
+      }
+      if (uncovered != 0) {
+        uni_batchqkt_w_degrade_.fetch_add(1, std::memory_order_relaxed);
+        if (!uni_batchqkt_notice_arm_guard_.exchange(true, std::memory_order_relaxed) &&
+            BatchQktDiagEnabled()) {
+          std::cerr << "[BATCHQKT] arm guard: " << uncovered << "/" << n
+                    << " batch clones lack a pending W, degrading to the drain read"
+                    << std::endl;
+        }
         return;
       }
     }
@@ -5745,8 +5733,10 @@ class ZeCollector {
       // Cannot happen by construction; never let a desynchronized descriptor
       // reach the memcpy or the cursor match.
       uni_batchqkt_poll_read_ = ZeBatchQktPollRead();
-      // BQ-S2: the armed read never ran — release this context's W's safely.
-      BatchQktReleaseShadowWsLocked(pr.context, /*device_ok=*/true);
+      // BQ-S2: the armed read never ran. tsbadfix B: the W's stay pending --
+      // their clones are still live and were not consumed (the caller falls
+      // back to the drain read for the same clones).
+
       if (!uni_batchqkt_notice_invariant_.exchange(true, std::memory_order_relaxed) &&
           BatchQktDiagEnabled()) {
         std::cerr << "[BATCHQKT] poll descriptor desynchronized (n=" << pr.n
@@ -5760,8 +5750,8 @@ class ZeCollector {
       if (pr.cmds[i] == nullptr || pr.events[i] == nullptr) {
         batch.cmds.clear();
         batch.ts.clear();
-        // BQ-S2: the armed read never ran — release this context's W's safely.
-        BatchQktReleaseShadowWsLocked(pr.context, /*device_ok=*/true);
+        // BQ-S2: the armed read never ran. tsbadfix B: the W's stay pending
+        // -- their clones are still live and were not consumed.
         if (!uni_batchqkt_notice_invariant_.exchange(true, std::memory_order_relaxed) &&
             BatchQktDiagEnabled()) {
           std::cerr << "[BATCHQKT] poll descriptor has a null element (i=" << i
@@ -5842,89 +5832,12 @@ class ZeCollector {
           static_cast<uint64_t>(n), batch_us);
       TsDiagWrite(buf, TsDiagClamp(len, sizeof(buf)));
     }
-    // BQ-S2: the read resolved (the wait on the shadow W's completed), so the
-    // W's are done — host-destroy/recreate them back into the pool.
-    // META=2: the marks go out BEFORE the release -- C-1 fires only while
-    // this step's W's are still pending (see EmitDeviceMetaMarks).
-    EmitDeviceMetaMarks(batch, BatchQktCountPendingWs(pr.context));
-    BatchQktReleaseShadowWsLocked(pr.context, /*device_ok=*/true);
+    // BQ-S2: the read resolved (the wait on the shadow W's completed).
+    // tsbadfix B: the W's are NOT released here -- the caller's consuming
+    // loop runs the tail of every batched clone; each tail decrements its
+    // submission's W reference, and the W is staged for destruction when its
+    // last clone is done (release aligned with consumption).
     return true;
-  }
-
-  // -----------------------------------------------------------------------
-  // META=2 (C layer): device-track instant marks for the collection ops this
-  // step carried, derived from the batch's already-read packets -- zero new
-  // GPU ops, zero new ioctls (delivery/META2_DEVICE_MARKS_DESIGN.md §2/§3).
-  //   C-1 unitrace.shadow_w_signal -- only when this step's shadow W's are
-  //       still pending at read resolve (a degraded step has none and gets
-  //       no mark -- an honest absence).
-  //   C-2 unitrace.qkt_read_device -- every successful batch read, the arm
-  //       path and the v4b drain path alike (the device executes the QKT op
-  //       in both).
-  // |w_pending| is counted by the CALLER before this step's W release (the
-  // drain path releases its W's before batch.ok -- counting at the emit
-  // anchor would see 0 and swallow C-1 for every drain-read step; POC smoke
-  // caught exactly that: shadow_w_signal=8 vs shadow_w_append=32).
-  // Anchor = max(end) over the VALID packets (in-order list order is not
-  // time order across engines, so the last command in list order may end
-  // earlier than the last kernel in time -- the design-doc §11 reflection
-  // fix). TSBAD-class packets (start==end or end==0) are excluded; with no
-  // valid packet left there is no honest anchor and no mark is emitted.
-  // Track = the max-end command's (device, engine): the in-order replay list
-  // is single-engine, so this is the engine the W/QKT ops ride.
-  // Called with uni_batchqkt_mutex_ held (both callers hold it).
-  // -----------------------------------------------------------------------
-  void EmitDeviceMetaMarks(const ZeBatchQkt &batch, size_t w_pending) {
-    if (!MetaDeviceMarks() || !batch.ok || batch.cmds.empty() ||
-        batch.ts.size() != batch.cmds.size()) {
-      return;
-    }
-    uint64_t anchor_ns = 0;
-    const ZeCommand *anchor_cmd = nullptr;
-    for (size_t i = 0; i < batch.cmds.size(); i++) {
-      const ZeCommand *command = batch.cmds[i];
-      const ze_kernel_timestamp_result_t &ts = batch.ts[i];
-      if (command == nullptr || ts.global.kernelStart == ts.global.kernelEnd ||
-          ts.global.kernelEnd == 0) {
-        continue;  // TSBAD-class packet: excluded from the anchor
-      }
-      uint64_t s = 0, e = 0;
-      GetHostTime(command, ts, s, e, /*emit_diag=*/false);
-      if (anchor_cmd == nullptr || e > anchor_ns) {
-        anchor_ns = e;
-        anchor_cmd = command;
-      }
-    }
-    if (anchor_cmd == nullptr) {
-      return;  // no valid packet -- no honest anchor
-    }
-    // C-1 first, then C-2 (design §3 order); both at the same instant,
-    // distinct names keep them independently filterable.
-    if (w_pending > 0) {
-      std::string args = "\"w_pops_step\": " + std::to_string(w_pending);
-      mdevcallback_("unitrace.shadow_w_signal", anchor_ns, args.c_str(),
-                    anchor_cmd->device_, anchor_cmd->engine_ordinal_,
-                    anchor_cmd->engine_index_);
-      uni_device_marks_n_.fetch_add(1, std::memory_order_relaxed);
-    }
-    {
-      std::string args = "\"n\": " + std::to_string(batch.cmds.size());
-      mdevcallback_("unitrace.qkt_read_device", anchor_ns, args.c_str(),
-                    anchor_cmd->device_, anchor_cmd->engine_ordinal_,
-                    anchor_cmd->engine_index_);
-      uni_device_marks_n_.fetch_add(1, std::memory_order_relaxed);
-    }
-  }
-
-  // Caller must hold uni_batchqkt_mutex_ (both emit anchors do).
-  size_t BatchQktCountPendingWs(ze_context_handle_t context) {
-    size_t n = 0;
-    for (auto &entry : uni_batchqkt_pending_ws_) {
-      if (entry.first == context) {
-        n++;
-      }
-    }
-    return n;
   }
 
   // -----------------------------------------------------------------------
@@ -6145,18 +6058,7 @@ class ZeCollector {
       uni_batchqkt_w_degrade_.fetch_add(1, std::memory_order_relaxed);
       return;
     }
-    // META=2 (C-3): self-admit the W append's host cost as a meta window --
-    // the B layer attributes it to the containing graph host slice
-    // (TakeContainedMetaDebtUs, direct-parent semantics). Closes the S1 host
-    // gap; same shape as the unitrace.qkt_batch windows. META=0/1 stay
-    // byte-identical (this block is MetaDeviceMarks()-gated).
-    const bool meta_dev = MetaDeviceMarks();
-    const uint64_t mt0 = meta_dev ? UniTimer::GetHostTimestamp() : 0;
     ze_result_t status = ZE_FUNC(zeCommandListAppendSignalEvent)(command_list, w);
-    const uint64_t mt1 = meta_dev ? UniTimer::GetHostTimestamp() : 0;
-    if (meta_dev && status == ZE_RESULT_SUCCESS) {
-      MetaRecord("unitrace.shadow_w_append", mt0, mt1, "\"at\": \"graph_onexit\"");
-    }
     if (status != ZE_RESULT_SUCCESS) {
       // Nothing was enqueued: return the W (clean NOT_READY back in the pool)
       // and leave this submission without a W.
@@ -6175,11 +6077,21 @@ class ZeCollector {
       // The context died between the successful graph append and this push
       // (another thread's teardown released the W's and marked the handle
       // dead): abandon the W — never push a dead context's event into the
-      // window, the arm could park on it.
+      // window, the arm could park on it. The clones staged under this token
+      // terminate through their own paths; their tails will decref a token
+      // that is no longer pending (counters only, no device calls).
       uni_batchqkt_w_abandoned_.fetch_add(1, std::memory_order_relaxed);
       return;
     }
-    uni_batchqkt_pending_ws_.push_back({context, w});
+    // tsbadfix B: the W gates exactly the clones staged in this replay's
+    // window. A window with no clones (refs == 0: an early-returning prepare
+    // or an empty graph) has nothing to gate -- stage the W for the pool
+    // return at the next flush instead of pushing a zero-reference entry.
+    if (TlBqktStg().refs == 0) {
+      uni_batchqkt_ws_to_free_.push_back(w);
+      return;
+    }
+    uni_batchqkt_pending_ws_.push_back({context, w, TlBqktStg().token, TlBqktStg().refs});
   }
 
   // Core release (uni_batchqkt_mutex_ already held): erase this context's
@@ -6201,9 +6113,9 @@ class ZeCollector {
     }
     auto it = uni_batchqkt_pending_ws_.begin();
     while (it != uni_batchqkt_pending_ws_.end()) {
-      if (it->first == context) {
+      if (it->context == context) {
         if (device_ok) {
-          uni_batchqkt_ws_to_free_.push_back(it->second);
+          uni_batchqkt_ws_to_free_.push_back(it->w);
         }
         else {
           uni_batchqkt_w_abandoned_.fetch_add(1, std::memory_order_relaxed);
@@ -6254,8 +6166,8 @@ class ZeCollector {
     std::vector<ze_event_handle_t> dead;
     auto it = uni_batchqkt_pending_ws_.begin();
     while (it != uni_batchqkt_pending_ws_.end()) {
-      if (it->first == context) {
-        dead.push_back(it->second);
+      if (it->context == context) {
+        dead.push_back(it->w);
         it = uni_batchqkt_pending_ws_.erase(it);
       }
       else {
@@ -6270,6 +6182,70 @@ class ZeCollector {
         uni_batchqkt_w_abandoned_.fetch_add(1, std::memory_order_relaxed);
       }
       uni_batchqkt_w_released_.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // tsbadfix B: per-submission W reference closure. States (Tina's ruling):
+  // Create W -> clone attached (staging, token+refs) -> clone completed
+  // (tail funnel) / clone abandoned (revert, event-destroy discard, teardown)
+  // -> live_refs == 0 -> release W (staged destruction, pool return at the
+  // flush). The W stays pending while any of its clones is live -- that is
+  // exactly the invariant the pre-fix code violated by releasing W's at the
+  // drain while gate-skipped clones stranded across the release.
+  // -----------------------------------------------------------------------
+
+  // Terminal accounting of one clone's W reference. Idempotent via
+  // bqkt_w_done_ (path 6: double completion / repeated callbacks decref
+  // once). Lock order: caller holds the submission lock (any mode) -> we
+  // take uni_batchqkt_mutex_ (same direction as every existing sweep; never
+  // the reverse). Safe for W-less clones (token not pending: counters only).
+  void BatchQktCloneTerminate(ZeCommand *command, bool completed) {
+    if (command == nullptr || command->bqkt_w_token_ == 0 || command->bqkt_w_done_) {
+      return;
+    }
+    command->bqkt_w_done_ = true;
+    if (completed) {
+      uni_batchqkt_clone_completed_.fetch_add(1, std::memory_order_relaxed);
+    }
+    else {
+      uni_batchqkt_clone_abandoned_.fetch_add(1, std::memory_order_relaxed);
+    }
+    std::lock_guard<std::mutex> lk(uni_batchqkt_mutex_);
+    for (auto it = uni_batchqkt_pending_ws_.begin(); it != uni_batchqkt_pending_ws_.end(); ++it) {
+      if (it->context == command->context_ && it->token == command->bqkt_w_token_) {
+        if (--it->live_refs == 0) {
+          // The submission's last live clone terminated: the W is done.
+          // Staged destruction (see BatchQktReleaseShadowWsLocked) -- the
+          // pool return runs in BatchQktFreeStagedShadowWs at the flush,
+          // outside the submission locks.
+          uni_batchqkt_ws_to_free_.push_back(it->w);
+          uni_batchqkt_pending_ws_.erase(it);
+        }
+        break;
+      }
+    }
+  }
+
+  // Path 5 (partial-build rollback): the caller is about to revert every
+  // staged clone back to the pool -- terminate their W references first.
+  // Same thread that staged them (the thread-local list is unguarded here by
+  // design, exactly like the Revert that follows).
+  void BatchQktAbandonStagedClones(void) {
+    for (ZeCommand *cmd : local_device_submissions_.commands_staged_) {
+      if (cmd != nullptr) {
+        BatchQktCloneTerminate(cmd, /*completed=*/false);
+      }
+    }
+  }
+
+  // Path 2 (event-destroy discard, staged subset): abandon only the staged
+  // clones bound to the event being destroyed.
+  void BatchQktAbandonStagedClonesForEvent(ze_event_handle_t event) {
+    for (ZeCommand *cmd : local_device_submissions_.commands_staged_) {
+      if (cmd != nullptr && cmd->event_ == event) {
+        BatchQktCloneTerminate(cmd, /*completed=*/false);
+      }
     }
   }
 
@@ -6431,6 +6407,19 @@ class ZeCollector {
               << " w_degrade=" << uni_batchqkt_w_degrade_.load(std::memory_order_relaxed)
               << " w_released=" << uni_batchqkt_w_released_.load(std::memory_order_relaxed)
               << " w_abandoned=" << uni_batchqkt_w_abandoned_.load(std::memory_order_relaxed)
+              // tsbadfix B: W/clone lifecycle closure. Invariants (any
+              // summary): clone_attached == clone_completed +
+              // clone_abandoned; after teardown w_pending == 0 and
+              // clone_live == 0; w_degrade > 0 on the healthy path = the A
+              // guard fired (fail-closed, never silent). w_pops ==
+              // w_released + w_abandoned at teardown.
+              << " clone_attached=" << uni_batchqkt_clone_attached_.load(std::memory_order_relaxed)
+              << " clone_completed=" << uni_batchqkt_clone_completed_.load(std::memory_order_relaxed)
+              << " clone_abandoned=" << uni_batchqkt_clone_abandoned_.load(std::memory_order_relaxed)
+              << " clone_live=" << (uni_batchqkt_clone_attached_.load(std::memory_order_relaxed) -
+                                    uni_batchqkt_clone_completed_.load(std::memory_order_relaxed) -
+                                    uni_batchqkt_clone_abandoned_.load(std::memory_order_relaxed))
+              << " w_pending=" << uni_batchqkt_pending_ws_.size()
               << std::endl;
   }
 
@@ -6856,7 +6845,7 @@ class ZeCollector {
     // ReleaseBatchQktResources; this is also single-threaded by construction
     // (finalize runs after the tracer is gone and every sweep has returned).
     for (auto &entry : uni_batchqkt_pending_ws_) {
-      uni_batchqkt_ws_to_free_.push_back(entry.second);
+      uni_batchqkt_ws_to_free_.push_back(entry.w);
     }
     uni_batchqkt_pending_ws_.clear();
     for (ze_event_handle_t w : uni_batchqkt_ws_to_free_) {
@@ -6908,6 +6897,14 @@ class ZeCollector {
   void ProcessCommandSubmittedTail(ZeDeviceSubmissions& submissions, ZeCommand *command, bool on_event,
                                    const ze_kernel_timestamp_result_t *pre_ts = nullptr,
                                    bool deferred_emit = false) {
+
+    // tsbadfix B (path 1): this tail is the single terminal funnel for every
+    // consumed clone (drain read, armed read, deferred emit, fence/event
+    // sweeps -- every caller verified C3). Terminate the clone's W reference
+    // here, BEFORE any early return: even a dropped (TSBAD) or query-failed
+    // record consumed the clone, so its reference must go. completed = the
+    // clone's record was accounted (emitted or fail-loud dropped).
+    BatchQktCloneTerminate(command, /*completed=*/true);
 
     ze_kernel_timestamp_result_t timestamp;
     bool bad_read = false;
@@ -7602,6 +7599,8 @@ class ZeCollector {
         // Event is not signaled on destroy, removing associated commands
         global_device_submissions_mutex_.lock_shared();
         // discard event associated staged commands
+        // tsbadfix B (path 2): abandon the staged clones' W references first.
+        collector->BatchQktAbandonStagedClonesForEvent(*(params->phEvent));
         local_device_submissions_.RevertStagedKernelCommandAndMetricQueriesForEvent(*(params->phEvent));
         // discard event associated submitted commands
         auto it_cmd = local_device_submissions_.commands_submitted_.begin();
@@ -7609,6 +7608,8 @@ class ZeCollector {
           ZeCommand *command = *it_cmd;
           if (command->event_ == *(params->phEvent)) {
             std::cerr << "[INFO] Remove command from submitted commands on event destroy" << std::endl;
+            // tsbadfix B (path 2): abandon this clone's W reference.
+            collector->BatchQktCloneTerminate(command, /*completed=*/false);
             local_device_submissions_.commands_free_pool_.push_back(command);
             it_cmd = local_device_submissions_.commands_submitted_.erase(it_cmd);
             continue;
@@ -9101,6 +9102,11 @@ class ZeCollector {
       ze_command_list_handle_t command_list,
       ze_executable_graph_handle_t exec_graph) {
 
+    // tsbadfix: fresh staging window for every replay. A previous window
+    // whose submit failed or degraded (W-less) must not leak its token/refs
+    // into this one.
+    TlBqktStg() = BqktStaging{};
+
     if (local_device_submissions_.IsFinalized()) {
       return;
     }
@@ -9269,6 +9275,18 @@ class ZeCollector {
       // read its packet — never while a same-generation clone still needs it,
       // and never left latched into the next replay's wait.
       EventHistoryAddPending(cmd->event_);
+      // tsbadfix: attach the staging token and count the live reference.
+      // The W itself is pushed at OnExit (BatchQktInjectShadowW) with the
+      // final reference count; between OnEnter and OnExit the token exists
+      // without a pending W -- an arm in that window hits the A guard and
+      // degrades to the drain read (fail-closed, never mid-flight).
+      if (TlBqktStg().token == 0) {
+        TlBqktStg().token = BqktTokenNext().fetch_add(1, std::memory_order_relaxed);
+      }
+      cmd->bqkt_w_token_ = TlBqktStg().token;
+      cmd->bqkt_w_done_ = false;
+      TlBqktStg().refs++;
+      uni_batchqkt_clone_attached_.fetch_add(1, std::memory_order_relaxed);
       cmd->engine_ordinal_ = engine_ordinal;
       cmd->engine_index_ = engine_index;
       cmd->submit_time_ = host_timestamp;		//in ns
@@ -10277,6 +10295,9 @@ class ZeCollector {
       }
     }
     else {
+      // tsbadfix B (path 5): the staged clones are rolled back -- terminate
+      // their W references before they return to the pool (no tail will run).
+      reinterpret_cast<ZeCollector*>(global_data)->BatchQktAbandonStagedClones();
       local_device_submissions_.RevertStagedKernelCommandAndMetricQueries();
     }
   }
@@ -10387,6 +10408,8 @@ class ZeCollector {
            local_device_submissions_.SubmitStagedKernelCommandAndMetricQueries(collector->event_cache_, kids);
         }
         else {
+           // tsbadfix B (path 5): rollback -- terminate the W references.
+           collector->BatchQktAbandonStagedClones();
            local_device_submissions_.RevertStagedKernelCommandAndMetricQueries();
         }
     }
@@ -10679,6 +10702,9 @@ typedef struct _zex_kernel_register_file_size_exp_t {
                                    std::vector<uint64_t> *kids,
                                    ze_command_list_handle_t command_list) {
     if (result != ZE_RESULT_SUCCESS || !UniController::IsCollectionEnabled()) {
+      // tsbadfix B (path 5): rollback -- terminate the staged clones' W
+      // references before they return to the pool.
+      reinterpret_cast<ZeCollector*>(global_data)->BatchQktAbandonStagedClones();
       local_device_submissions_.RevertStagedKernelCommandAndMetricQueries();
       return;
     }
@@ -10890,7 +10916,6 @@ typedef struct _zex_kernel_register_file_size_exp_t {
   OnZeKernelFinishCallback kcallback_ = nullptr;
   OnZeFunctionFinishCallback fcallback_ = nullptr;
   OnZeMetaRecordCallback mcallback_ = nullptr;  // T14/A5 self-annotation
-  OnZeDeviceMetaRecordCallback mdevcallback_ = nullptr;  // META=2 device-track marks
   bool reset_event_on_device_; // support event reset on device
   ZeEventCache event_cache_;
 
@@ -11100,13 +11125,40 @@ typedef struct _zex_kernel_register_file_size_exp_t {
   // waits on {W} instead of the shared events, which are deliberately left
   // latched across replays under this mode.
   ZeEventCache shadow_w_cache_{0};
-  // W's staged since the last drain of their context (the current window).
-  // Written at the OnExit graph submit, read by the arm, released at the
-  // drain/teardown -- all under uni_batchqkt_mutex_. Cleared per context by
-  // BatchQktReleaseShadowWs; the drain runs before the next submission's W is
-  // pushed, so the window correlation with the pending clones is by
-  // construction.
-  std::vector<std::pair<ze_context_handle_t, ze_event_handle_t>> uni_batchqkt_pending_ws_;
+  // tsbadfix: per-thread staging window (OnEnter..OnExit of one graph
+  // append): the token handed to every clone staged in the window and the
+  // number of live references accumulated. Reset at the head of every
+  // PrepareGraphExecution.
+  struct BqktStaging {
+    uint64_t token = 0;
+    uint64_t refs = 0;
+  };
+  static BqktStaging &TlBqktStg(void) {
+    static thread_local BqktStaging stg;
+    return stg;
+  }
+  // Token allocator; 0 means "no token" (eager commands, un-staged clones).
+  static std::atomic<uint64_t> &BqktTokenNext(void) {
+    static std::atomic<uint64_t> next{1};
+    return next;
+  }
+  // tsbadfix B: one pending W entry per graph submission whose clones are
+  // still being consumed. live_refs = clones of this submission's token not
+  // yet terminated (completed via the tail funnel, or abandoned via
+  // revert/event-destroy discard); the W is staged for destruction exactly
+  // when live_refs reaches 0 -- release aligned with consumption, never
+  // "when the drain ends" (the pre-fix unbalanced release). Written under
+  // uni_batchqkt_mutex_ (push at the OnExit submit with the staging
+  // window's final ref count; decremented by the tails). The window
+  // correlation the arm relies on ("every batch clone's token has a pending
+  // W") is now enforced by this refcount + the A guard, not assumed.
+  struct BqktPendingW {
+    ze_context_handle_t context;
+    ze_event_handle_t w;
+    uint64_t token;      // staging token of the submission this W gates
+    uint64_t live_refs;  // clones of that token not yet terminated
+  };
+  std::vector<BqktPendingW> uni_batchqkt_pending_ws_;
   // W's whose entries were released but whose destruction is deferred to the
   // post-unlock flush (FlushGraphEventResets -> BatchQktFreeStagedShadowWs):
   // destroying an event re-enters OnEnterEventDestroy, which can take the
@@ -11120,6 +11172,13 @@ typedef struct _zex_kernel_register_file_size_exp_t {
   std::atomic<uint64_t> uni_batchqkt_w_degrade_{0};      // steps that skipped the arm for lack of a W (v4b drain read)
   std::atomic<uint64_t> uni_batchqkt_w_released_{0};     // W's returned to the pool
   std::atomic<uint64_t> uni_batchqkt_w_abandoned_{0};    // W's dropped WITHOUT pool return (device-lost class)
+  // tsbadfix B: clone/W lifecycle counters (see the [BATCHQKT] summary line
+  // for the invariants). clone_attached arrives with the A-guard commit; the
+  // terminal counters belong to the reference-closure commit.
+  std::atomic<uint64_t> uni_batchqkt_clone_attached_{0};
+  std::atomic<uint64_t> uni_batchqkt_clone_completed_{0};
+  std::atomic<uint64_t> uni_batchqkt_clone_abandoned_{0};
+  std::atomic<bool> uni_batchqkt_notice_arm_guard_{false};  // A-guard one-shot diag
   std::atomic<bool> uni_batchqkt_notice_w_latched_{false};
   std::atomic<bool> uni_batchqkt_notice_w_ooo_{false};
   // HARDEN (review): the W signal-append failure has its own one-shot notice
